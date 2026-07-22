@@ -1,0 +1,471 @@
+use crate::ast::*;
+use std::collections::HashMap;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Type {
+    I64,
+    F64,
+    Bool,
+    Str,
+    Unit,
+    Arr(Box<Type>),
+    Rec(usize),
+}
+
+pub struct Checker<'a> {
+    p: &'a Program,
+    type_ids: HashMap<String, usize>,
+    sigs: HashMap<String, (Vec<Type>, Type)>,
+}
+
+type Scope = HashMap<String, (Type, bool)>; // type, is-mutable
+
+impl<'a> Checker<'a> {
+    pub fn check(p: &'a Program) -> Result<(), String> {
+        let mut type_ids = HashMap::new();
+        for (i, t) in p.types.iter().enumerate() {
+            type_ids.insert(t.name.clone(), i);
+        }
+        let mut c = Checker { p, type_ids, sigs: HashMap::new() };
+        for f in &p.fns {
+            let params: Result<Vec<Type>, String> =
+                f.params.iter().map(|(_, t)| c.resolve(t)).collect();
+            c.sigs.insert(f.name.clone(), (params?, c.resolve(&f.ret)?));
+        }
+        for f in &p.fns {
+            c.check_fn(f)?;
+        }
+        for prop in &p.props {
+            let ret = c.check_fn_body(prop, &Type::Bool)?;
+            if ret != Type::Bool {
+                return Err(format!("property `{}` body must be bool, got {}", prop.name, c.name(&ret)));
+            }
+        }
+        if let Some(main) = &p.main {
+            let mut scopes: Vec<Scope> = vec![HashMap::new()];
+            c.check_block(main, &mut scopes, &Type::Unit)?;
+        }
+        Ok(())
+    }
+
+    fn resolve(&self, s: &str) -> Result<Type, String> {
+        match s {
+            "f64" | "f32" => Ok(Type::F64),
+            "i64" | "i32" => Ok(Type::I64),
+            "bool" => Ok(Type::Bool),
+            "str" => Ok(Type::Str),
+            _ => {
+                if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+                    Ok(Type::Arr(Box::new(self.resolve(inner)?)))
+                } else {
+                    self.type_ids
+                        .get(s)
+                        .map(|&i| Type::Rec(i))
+                        .ok_or(format!("unknown type `{}`", s))
+                }
+            }
+        }
+    }
+
+    fn name(&self, t: &Type) -> String {
+        match t {
+            Type::I64 => "i64".into(),
+            Type::F64 => "f64".into(),
+            Type::Bool => "bool".into(),
+            Type::Str => "str".into(),
+            Type::Unit => "()".into(),
+            Type::Arr(t) => format!("[{}]", self.name(t)),
+            Type::Rec(i) => self.p.types[*i].name.clone(),
+        }
+    }
+
+    fn compat(expected: &Type, actual: &Type) -> bool {
+        expected == actual || (*expected == Type::F64 && *actual == Type::I64)
+    }
+
+    fn check_fn(&self, f: &FnDecl) -> Result<(), String> {
+        let ret = self.resolve(&f.ret)?;
+        let last = self.check_fn_body(f, &ret)?;
+        if ret != Type::Unit && !Self::compat(&ret, &last) {
+            return Err(format!(
+                "function `{}` declares return type {} but its body produces {}",
+                f.name,
+                self.name(&ret),
+                self.name(&last)
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_fn_body(&self, f: &FnDecl, ret: &Type) -> Result<Type, String> {
+        let mut scope = HashMap::new();
+        for (n, t) in &f.params {
+            scope.insert(n.clone(), (self.resolve(t)?, false));
+        }
+        let mut scopes = vec![scope];
+        self.check_block(&f.body, &mut scopes, ret)
+    }
+
+    fn check_block(&self, stmts: &[StmtId], scopes: &mut Vec<Scope>, ret: &Type) -> Result<Type, String> {
+        scopes.push(HashMap::new());
+        let mut last = Type::Unit;
+        for &sid in stmts {
+            last = self.check_stmt(sid, scopes, ret)?;
+        }
+        scopes.pop();
+        Ok(last)
+    }
+
+    fn lookup(&self, scopes: &[Scope], n: &str) -> Option<(Type, bool)> {
+        scopes.iter().rev().find_map(|s| s.get(n).cloned())
+    }
+
+    fn check_stmt(&self, sid: StmtId, scopes: &mut Vec<Scope>, ret: &Type) -> Result<Type, String> {
+        match self.p.stmt(sid) {
+            Stmt::Let(n, e) | Stmt::Var(n, e) => {
+                let t = self.check_expr(*e, scopes)?;
+                if t == Type::Unit {
+                    return Err(format!("cannot bind `{}` to a unit value", n));
+                }
+                let mutable = matches!(self.p.stmt(sid), Stmt::Var(_, _));
+                scopes.last_mut().unwrap().insert(n.clone(), (t, mutable));
+                Ok(Type::Unit)
+            }
+            Stmt::Assign(target, e) => {
+                let vt = self.check_expr(*e, scopes)?;
+                match self.p.expr(*target) {
+                    Expr::Ident(n) => {
+                        let (t, mutable) =
+                            self.lookup(scopes, n).ok_or(format!("unknown variable `{}`", n))?;
+                        if !mutable {
+                            return Err(format!("cannot assign to immutable binding `{}` (use `var`)", n));
+                        }
+                        if !Self::compat(&t, &vt) {
+                            return Err(format!(
+                                "cannot assign {} to `{}: {}`",
+                                self.name(&vt),
+                                n,
+                                self.name(&t)
+                            ));
+                        }
+                    }
+                    Expr::Index(a, i) => {
+                        if self.check_expr(*i, scopes)? != Type::I64 {
+                            return Err("array index must be i64".into());
+                        }
+                        match self.check_expr(*a, scopes)? {
+                            Type::Arr(el) => {
+                                if !Self::compat(&el, &vt) {
+                                    return Err(format!(
+                                        "cannot store {} in [{}]",
+                                        self.name(&vt),
+                                        self.name(&el)
+                                    ));
+                                }
+                            }
+                            t => return Err(format!("cannot index into {}", self.name(&t))),
+                        }
+                        if let Expr::Ident(n) = self.p.expr(*a) {
+                            let (_, mutable) =
+                                self.lookup(scopes, n).ok_or(format!("unknown variable `{}`", n))?;
+                            if !mutable {
+                                return Err(format!("cannot write through immutable binding `{}`", n));
+                            }
+                        }
+                    }
+                    _ => return Err("invalid assignment target".into()),
+                }
+                Ok(Type::Unit)
+            }
+            Stmt::If(c, then, els) => {
+                if self.check_expr(*c, scopes)? != Type::Bool {
+                    return Err("`if` condition must be bool".into());
+                }
+                self.check_block(then, scopes, ret)?;
+                self.check_block(els, scopes, ret)?;
+                Ok(Type::Unit)
+            }
+            Stmt::For(v, lo, hi, body) => {
+                if self.check_expr(*lo, scopes)? != Type::I64
+                    || self.check_expr(*hi, scopes)? != Type::I64
+                {
+                    return Err("`for` bounds must be i64".into());
+                }
+                scopes.push(HashMap::new());
+                scopes.last_mut().unwrap().insert(v.clone(), (Type::I64, false));
+                self.check_block(body, scopes, ret)?;
+                scopes.pop();
+                Ok(Type::Unit)
+            }
+            Stmt::Return(e) => {
+                let t = match e {
+                    Some(e) => self.check_expr(*e, scopes)?,
+                    None => Type::Unit,
+                };
+                if !Self::compat(ret, &t) {
+                    return Err(format!(
+                        "return type mismatch: expected {}, got {}",
+                        self.name(ret),
+                        self.name(&t)
+                    ));
+                }
+                Ok(ret.clone())
+            }
+            Stmt::Expr(e) => self.check_expr(*e, scopes),
+        }
+    }
+
+    fn numeric(&self, t: &Type) -> bool {
+        matches!(t, Type::I64 | Type::F64)
+    }
+
+    fn check_expr(&self, eid: ExprId, scopes: &mut Vec<Scope>) -> Result<Type, String> {
+        match self.p.expr(eid) {
+            Expr::Int(_) => Ok(Type::I64),
+            Expr::Float(_) => Ok(Type::F64),
+            Expr::Str(_) => Ok(Type::Str),
+            Expr::Bool(_) => Ok(Type::Bool),
+            Expr::Ident(n) => self
+                .lookup(scopes, n)
+                .map(|(t, _)| t)
+                .ok_or(format!("unknown variable `{}`", n)),
+            Expr::Un(op, e) => {
+                let t = self.check_expr(*e, scopes)?;
+                match op.as_str() {
+                    "-" if self.numeric(&t) => Ok(t),
+                    "not" if t == Type::Bool => Ok(Type::Bool),
+                    op => Err(format!("cannot apply `{}` to {}", op, self.name(&t))),
+                }
+            }
+            Expr::Bin(op, l, r) => {
+                let lt = self.check_expr(*l, scopes)?;
+                let rt = self.check_expr(*r, scopes)?;
+                if let Some(fname) = self.p.infix_ops.get(op) {
+                    let (params, ret) = self.sigs.get(fname).ok_or(format!("unknown op `{}`", op))?;
+                    if !Self::compat(&params[0], &lt) || !Self::compat(&params[1], &rt) {
+                        return Err(format!(
+                            "operator `{}` expects ({}, {}), got ({}, {})",
+                            op,
+                            self.name(&params[0]),
+                            self.name(&params[1]),
+                            self.name(&lt),
+                            self.name(&rt)
+                        ));
+                    }
+                    return Ok(ret.clone());
+                }
+                match op.as_str() {
+                    "and" | "or" => {
+                        if lt == Type::Bool && rt == Type::Bool {
+                            Ok(Type::Bool)
+                        } else {
+                            Err(format!("`{}` needs bool operands", op))
+                        }
+                    }
+                    "+" | "-" | "*" | "/" | "%" => {
+                        if !self.numeric(&lt) || !self.numeric(&rt) {
+                            return Err(format!(
+                                "cannot apply `{}` to {} and {}",
+                                op,
+                                self.name(&lt),
+                                self.name(&rt)
+                            ));
+                        }
+                        Ok(if lt == Type::F64 || rt == Type::F64 { Type::F64 } else { Type::I64 })
+                    }
+                    "==" | "!=" => {
+                        if lt == rt || (self.numeric(&lt) && self.numeric(&rt)) {
+                            Ok(Type::Bool)
+                        } else {
+                            Err(format!("cannot compare {} with {}", self.name(&lt), self.name(&rt)))
+                        }
+                    }
+                    "<" | "<=" | ">" | ">=" | "~=" | "\u{2248}" => {
+                        if self.numeric(&lt) && self.numeric(&rt) {
+                            Ok(Type::Bool)
+                        } else {
+                            Err(format!("cannot compare {} with {}", self.name(&lt), self.name(&rt)))
+                        }
+                    }
+                    op => Err(format!("unknown operator `{}`", op)),
+                }
+            }
+            Expr::Circum(open, e) => {
+                let t = self.check_expr(*e, scopes)?;
+                let (close, fname) = &self.p.circum_ops[open];
+                let (params, ret) = self.sigs.get(fname).ok_or(format!("unknown op `{}…{}`", open, close))?;
+                if !Self::compat(&params[0], &t) {
+                    return Err(format!(
+                        "operator `{}…{}` expects {}, got {}",
+                        open,
+                        close,
+                        self.name(&params[0]),
+                        self.name(&t)
+                    ));
+                }
+                Ok(ret.clone())
+            }
+            Expr::Field(e, f) => match self.check_expr(*e, scopes)? {
+                Type::Rec(ti) => self.p.types[ti]
+                    .fields
+                    .iter()
+                    .find(|(n, _)| n == f)
+                    .map(|(_, t)| self.resolve(t))
+                    .transpose()?
+                    .ok_or(format!("type `{}` has no field `{}`", self.p.types[ti].name, f)),
+                t => Err(format!("cannot access field `{}` on {}", f, self.name(&t))),
+            },
+            Expr::Index(a, i) => {
+                if self.check_expr(*i, scopes)? != Type::I64 {
+                    return Err("array index must be i64".into());
+                }
+                match self.check_expr(*a, scopes)? {
+                    Type::Arr(el) => Ok(*el),
+                    t => Err(format!("cannot index into {}", self.name(&t))),
+                }
+            }
+            Expr::Array(items) => {
+                let mut it = items.iter();
+                let first = match it.next() {
+                    Some(&e) => self.check_expr(e, scopes)?,
+                    None => return Err("cannot infer element type of empty array literal".into()),
+                };
+                for &e in it {
+                    let t = self.check_expr(e, scopes)?;
+                    if t != first {
+                        return Err(format!(
+                            "mixed array literal: {} and {}",
+                            self.name(&first),
+                            self.name(&t)
+                        ));
+                    }
+                }
+                Ok(Type::Arr(Box::new(first)))
+            }
+            Expr::Record(name, inits) => {
+                let ti = *self.type_ids.get(name).ok_or(format!("unknown type `{}`", name))?;
+                let decl = &self.p.types[ti];
+                if inits.len() != decl.fields.len() {
+                    return Err(format!(
+                        "`{}` has {} fields, literal provides {}",
+                        name,
+                        decl.fields.len(),
+                        inits.len()
+                    ));
+                }
+                for (pos, (fname, e)) in inits.iter().enumerate() {
+                    let idx = match fname {
+                        Some(f) => decl
+                            .fields
+                            .iter()
+                            .position(|(n, _)| n == f)
+                            .ok_or(format!("type `{}` has no field `{}`", name, f))?,
+                        None => pos,
+                    };
+                    let expect = self.resolve(&decl.fields[idx].1)?;
+                    let got = self.check_expr(*e, scopes)?;
+                    if !Self::compat(&expect, &got) {
+                        return Err(format!(
+                            "field `{}` of `{}` is {}, got {}",
+                            decl.fields[idx].0,
+                            name,
+                            self.name(&expect),
+                            self.name(&got)
+                        ));
+                    }
+                }
+                Ok(Type::Rec(ti))
+            }
+            Expr::Sum { var, lo, hi, body } => {
+                if self.check_expr(*lo, scopes)? != Type::I64
+                    || self.check_expr(*hi, scopes)? != Type::I64
+                {
+                    return Err("`sum` bounds must be i64".into());
+                }
+                scopes.push(HashMap::new());
+                scopes.last_mut().unwrap().insert(var.clone(), (Type::I64, false));
+                let t = self.check_expr(*body, scopes)?;
+                scopes.pop();
+                if !self.numeric(&t) {
+                    return Err(format!("`sum` body must be numeric, got {}", self.name(&t)));
+                }
+                Ok(t)
+            }
+            Expr::Call(name, args) => {
+                let ats: Result<Vec<Type>, String> =
+                    args.iter().map(|&e| self.check_expr(e, scopes)).collect();
+                let ats = ats?;
+                let need = |n: usize| -> Result<(), String> {
+                    if ats.len() == n {
+                        Ok(())
+                    } else {
+                        Err(format!("`{}` expects {} args, got {}", name, n, ats.len()))
+                    }
+                };
+                match name.as_str() {
+                    "print" => Ok(Type::Unit),
+                    "sqrt" | "sin" | "cos" | "acos" | "abs" | "floor" => {
+                        need(1)?;
+                        if !self.numeric(&ats[0]) {
+                            return Err(format!("`{}` needs a numeric arg", name));
+                        }
+                        Ok(Type::F64)
+                    }
+                    "min" | "max" | "pow" | "atan2" => {
+                        need(2)?;
+                        if !self.numeric(&ats[0]) || !self.numeric(&ats[1]) {
+                            return Err(format!("`{}` needs numeric args", name));
+                        }
+                        Ok(Type::F64)
+                    }
+                    "float" => {
+                        need(1)?;
+                        Ok(Type::F64)
+                    }
+                    "int" => {
+                        need(1)?;
+                        Ok(Type::I64)
+                    }
+                    "len" => {
+                        need(1)?;
+                        match &ats[0] {
+                            Type::Arr(_) => Ok(Type::I64),
+                            t => Err(format!("`len` expects an array, got {}", self.name(t))),
+                        }
+                    }
+                    "arr" => {
+                        need(2)?;
+                        if ats[0] != Type::I64 {
+                            return Err("`arr` length must be i64".into());
+                        }
+                        Ok(Type::Arr(Box::new(ats[1].clone())))
+                    }
+                    _ => {
+                        let (params, ret) =
+                            self.sigs.get(name).ok_or(format!("unknown function `{}`", name))?;
+                        if params.len() != ats.len() {
+                            return Err(format!(
+                                "`{}` expects {} args, got {}",
+                                name,
+                                params.len(),
+                                ats.len()
+                            ));
+                        }
+                        for (i, (p, a)) in params.iter().zip(ats.iter()).enumerate() {
+                            if !Self::compat(p, a) {
+                                return Err(format!(
+                                    "arg {} of `{}`: expected {}, got {}",
+                                    i + 1,
+                                    name,
+                                    self.name(p),
+                                    self.name(a)
+                                ));
+                            }
+                        }
+                        Ok(ret.clone())
+                    }
+                }
+            }
+        }
+    }
+}

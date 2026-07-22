@@ -1,4 +1,5 @@
 mod ast;
+mod check;
 mod interp;
 mod lexer;
 mod parser;
@@ -28,6 +29,7 @@ fn main() -> ExitCode {
         let toks = lexer::lex(&src)?;
         let mut p = parser::Parser::new(toks);
         p.parse()?;
+        check::Checker::check(&p.prog)?;
         let it = interp::Interp::new(&p.prog);
         match mode {
             "run" => {
