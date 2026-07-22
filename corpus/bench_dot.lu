@@ -1,0 +1,20 @@
+// bench_dot.lu — 2M-element dot product, 20 repetitions, whole-process benchmark.
+
+fn dot(a: [f64], b: [f64], n: i64): f64 {
+  return sum(i in 0..n) a[i] * b[i]
+}
+
+main {
+  let n = 2000000
+  var a = arr(n, 0.0)
+  var b = arr(n, 0.0)
+  for i in 0..n {
+    a[i] = float(i) * 0.000001
+    b[i] = float(i) * 0.000002
+  }
+  var acc = 0.0
+  for r in 0..20 {
+    acc = acc + dot(a, b, n)
+  }
+  print("acc:", acc)
+}

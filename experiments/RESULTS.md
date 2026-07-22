@@ -76,3 +76,34 @@ The hypothesis survives contact with measurement:
   the "beats Rust too" claim.
 - A `main`-to-exit wall-clock harness (their alcubierre measures whole-process,
   including startup — our numbers are kernel-only).
+
+---
+
+# Experiment 2 — lulang JIT (M2) vs Bun, whole process
+
+*2026-07-22, hyperfine, Apple M4 Pro. lu = Cranelift JIT with codegen inlining,
+4-accumulator `sum`, and loop-hoisted bounds checks.*
+
+| Workload | lu run | bun | ratio |
+|---|---|---|---|
+| dot 2M×20 (startup-dominated) | 26.5 ms | 39.9 ms | **1.50× lu** |
+| slerp 2M (startup-dominated) | 36.9 ms | 32.1 ms | 0.87× |
+| dot 2M×200 (steady state) | 213.5 ms | 270.9 ms | **1.27× lu** |
+| slerp 20M (steady state) | 341.3 ms | 157.0 ms | 0.46× |
+
+Findings:
+
+1. **Bounds-check hoisting was worth 2.9×** on dot (75.7→26.5 ms): one range check
+   per loop instead of a length-load + compare + branch per access. Safety
+   preserved (out-of-range loops still trap with a clean error).
+2. **Codegen inlining fixed the operator-chain tax**: before it, slerp lost to Bun
+   even at small n because every `·`/`‖·‖`/`scale` was a real call.
+3. **The slerp steady-state loss is missing LICM over pure calls**: `acos(d)` and
+   `sin(th)` are loop-invariant but our backend re-executes them every iteration,
+   while JSC hoists them (it knows Math.sin is pure). Next middle-end pass:
+   purity-annotated math builtins + loop-invariant code motion.
+4. Startup: lu ≈ 8 ms (parse+check+Cranelift), Bun ≈ 25 ms — the dev-loop win AE
+   markets is real and cheap to get.
+
+The ≥3× spec gate vs Bun is **not yet met**; consistent with the AE architecture
+model, the naive tier buys rough parity and each middle-end pass buys a multiple.

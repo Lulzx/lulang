@@ -12,6 +12,26 @@ pub enum Type {
     Rec(usize),
 }
 
+pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
+    match s {
+        "f64" | "f32" => Ok(Type::F64),
+        "i64" | "i32" => Ok(Type::I64),
+        "bool" => Ok(Type::Bool),
+        "str" => Ok(Type::Str),
+        _ => {
+            if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+                Ok(Type::Arr(Box::new(resolve_type(p, inner)?)))
+            } else {
+                p.types
+                    .iter()
+                    .position(|t| t.name == s)
+                    .map(Type::Rec)
+                    .ok_or(format!("unknown type `{}`", s))
+            }
+        }
+    }
+}
+
 pub struct Checker<'a> {
     p: &'a Program,
     type_ids: HashMap<String, usize>,

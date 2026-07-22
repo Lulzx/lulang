@@ -1,8 +1,10 @@
 mod ast;
 mod check;
 mod interp;
+mod jit;
 mod lexer;
 mod parser;
+mod runtime;
 
 use std::process::ExitCode;
 
@@ -30,13 +32,16 @@ fn main() -> ExitCode {
         let mut p = parser::Parser::new(toks);
         p.parse()?;
         check::Checker::check(&p.prog)?;
-        let it = interp::Interp::new(&p.prog);
         match mode {
             "run" => {
-                it.run_main()?;
+                jit::Jit::run(&p.prog)?;
                 Ok(true)
             }
-            "test" => it.run_properties(100),
+            "interp" => {
+                interp::Interp::new(&p.prog).run_main()?;
+                Ok(true)
+            }
+            "test" => interp::Interp::new(&p.prog).run_properties(100),
             m => Err(format!("unknown mode `{}`", m)),
         }
     })();

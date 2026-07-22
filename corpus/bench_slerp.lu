@@ -1,0 +1,49 @@
+// bench_slerp.lu — 2M quaternion slerps through user-defined operators.
+
+type Quat { w: f64, x: f64, y: f64, z: f64 }
+
+operator* (a: Quat) · (b: Quat): f64 {
+  return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+operator ‖(q: Quat)‖: f64 { return sqrt(q · q) }
+
+fn scale(q: Quat, s: f64): Quat {
+  return Quat { w: q.w * s, x: q.x * s, y: q.y * s, z: q.z * s }
+}
+
+fn add(a: Quat, b: Quat): Quat {
+  return Quat { w: a.w + b.w, x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+}
+
+fn normalize(q: Quat): Quat { return scale(q, 1.0 / ‖q‖) }
+
+fn slerp(a: Quat, b: Quat, t: f64): Quat {
+  var d = a · b
+  var bb = b
+  if d < 0.0 {
+    d = -d
+    bb = scale(b, -1.0)
+  }
+  var wa = 1.0 - t
+  var wb = t
+  if d < 0.9995 {
+    let th = acos(d)
+    let s = sin(th)
+    wa = sin((1.0 - t) * th) / s
+    wb = sin(t * th) / s
+  }
+  return normalize(add(scale(a, wa), scale(bb, wb)))
+}
+
+main {
+  let a = normalize(Quat { 1.0, 2.0, 3.0, 4.0 })
+  let b = normalize(Quat { 4.0, 3.0, 2.0, 1.0 })
+  let n = 2000000
+  var acc = 0.0
+  for i in 0..n {
+    let t = float(i) / float(n)
+    acc = acc + ‖slerp(a, b, t)‖
+  }
+  print("acc:", acc)
+}

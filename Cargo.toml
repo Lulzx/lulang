@@ -9,3 +9,9 @@ path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
+
+[dependencies]
+cranelift-codegen = "0.131.3"
+cranelift-frontend = "0.131.3"
+cranelift-jit = "0.131.3"
+cranelift-module = "0.131.3"
