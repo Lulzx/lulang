@@ -62,8 +62,14 @@ pub struct Jit<'a> {
 
 impl<'a> Jit<'a> {
     pub fn run(p: &'a Program) -> Result<(), String> {
-        let mut jb = JITBuilder::new(cranelift_module::default_libcall_names())
+        use cranelift_codegen::settings::Configurable as _;
+        let mut flags = cranelift_codegen::settings::builder();
+        flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
+        let isa = cranelift_native::builder()
+            .map_err(|e| e.to_string())?
+            .finish(cranelift_codegen::settings::Flags::new(flags))
             .map_err(|e| e.to_string())?;
+        let mut jb = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         let syms: &[(&str, *const u8)] = &[
             ("lu_print_f64", runtime::lu_print_f64 as *const u8),
             ("lu_print_i64", runtime::lu_print_i64 as *const u8),

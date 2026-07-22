@@ -155,3 +155,11 @@ compile claim lives in.
 | JIT ~5× vs js | dot 1.27×, slerp 0.46× — needs middle-end LICM |
 | compile ~10× vs C++ (large) | 3.7× on one header-heavy file; scales with headers |
 | JIT 5-6× slower than AOT | 3.8× observed — architecture reading confirmed |
+
+## Addendum: Cranelift opt_level=speed (post-M3)
+
+Enabling Cranelift's egraph optimizer (GVN/LICM over pure instructions) in the
+JIT tier: dot 213.5→102.9 ms (**2.63× faster than Bun**), slerp 341→308 ms.
+The remaining slerp gap is extern sin/acos calls per iteration, which Cranelift
+cannot hoist (no pure-call attribute) — the planned middle-end fix is inline
+polynomial math kernels, which double as the M5 vectorizable math library.

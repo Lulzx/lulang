@@ -101,7 +101,11 @@ impl<'a> Interp<'a> {
                 None => println!("property {} ... ok ({} runs)", prop.name, runs),
                 Some(args) => {
                     all_ok = false;
-                    println!("property {} ... FAIL", prop.name);
+                    let (args, steps) = self.shrink(prop, args)?;
+                    println!(
+                        "property {} ... FAIL (counterexample shrunk {} steps)",
+                        prop.name, steps
+                    );
                     for ((name, ty), v) in prop.params.iter().zip(args.iter()) {
                         println!("  {}: {} = {}", name, ty, self.display(v));
                     }
@@ -109,6 +113,70 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(all_ok)
+    }
+
+    /// Greedy shrink: repeatedly try simpler variants of each argument, keeping
+    /// any that still falsify the property. Returns the final args + step count.
+    fn shrink(&self, prop: &FnDecl, mut args: Vec<Value>) -> Result<(Vec<Value>, u32), String> {
+        let mut steps = 0u32;
+        let mut budget = 500u32; // max property evaluations while shrinking
+        'outer: loop {
+            for i in 0..args.len() {
+                for cand in Self::simpler(&args[i]) {
+                    if budget == 0 {
+                        break 'outer;
+                    }
+                    budget -= 1;
+                    let mut trial = args.clone();
+                    trial[i] = cand;
+                    if matches!(self.call_decl(prop, trial.clone())?, Value::Bool(false)) {
+                        args = trial;
+                        steps += 1;
+                        continue 'outer;
+                    }
+                }
+            }
+            break;
+        }
+        Ok((args, steps))
+    }
+
+    /// Candidate simplifications of a value, most aggressive first.
+    fn simpler(v: &Value) -> Vec<Value> {
+        match v {
+            Value::Float(f) => {
+                let mut out = Vec::new();
+                for c in [0.0, 1.0, -1.0, f.trunc(), f / 2.0] {
+                    let simpler_mag = c == 0.0 || c.abs() < f.abs() || (c == c.trunc() && *f != f.trunc());
+                    if c != *f && c.is_finite() && simpler_mag {
+                        out.push(Value::Float(c));
+                    }
+                }
+                out
+            }
+            Value::Int(i) => {
+                let mut out = Vec::new();
+                for c in [0, i / 2] {
+                    if c != *i {
+                        out.push(Value::Int(c));
+                    }
+                }
+                out
+            }
+            Value::Bool(true) => vec![Value::Bool(false)],
+            Value::Rec(ti, fields) => {
+                let mut out = Vec::new();
+                for (i, f) in fields.iter().enumerate() {
+                    for cand in Self::simpler(f) {
+                        let mut fs = fields.as_ref().clone();
+                        fs[i] = cand;
+                        out.push(Value::Rec(*ti, std::rc::Rc::new(fs)));
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn gen_value(&self, ty: &str, rng: &mut u64) -> Result<Value, String> {
