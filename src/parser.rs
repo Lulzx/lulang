@@ -8,7 +8,9 @@ pub struct Parser {
     pub prog: Program,
     prec: HashMap<String, u8>,
     type_names: HashSet<String>,
+    enum_names: HashSet<String>,
     circum_close: HashSet<String>,
+    match_ct: u32,
 }
 
 impl Parser {
@@ -28,7 +30,9 @@ impl Parser {
             prog: Program::default(),
             prec,
             type_names: HashSet::new(),
+            enum_names: HashSet::new(),
             circum_close: HashSet::new(),
+            match_ct: 0,
         }
     }
 
@@ -92,6 +96,7 @@ impl Parser {
                     self.prog.fns.push(f);
                 }
                 Tok::Ident(k) if k == "type" => self.parse_type()?,
+                Tok::Ident(k) if k == "enum" => self.parse_enum()?,
                 Tok::Ident(k) if k == "operator" => self.parse_operator()?,
                 Tok::Ident(k) if k == "property" => {
                     let f = self.parse_fn(false)?;
@@ -134,6 +139,28 @@ impl Parser {
         Ok(())
     }
 
+    fn parse_enum(&mut self) -> Result<(), String> {
+        self.eat_kw("enum")?;
+        let name = self.ident()?;
+        self.eat_sym("{")?;
+        self.skip_nl();
+        let mut variants = Vec::new();
+        while !self.is_sym("}") {
+            variants.push(self.ident()?);
+            if self.is_sym(",") {
+                self.next();
+            }
+            self.skip_nl();
+        }
+        self.eat_sym("}")?;
+        if variants.is_empty() {
+            return Err(format!("enum `{}` has no variants", name));
+        }
+        self.enum_names.insert(name.clone());
+        self.prog.enums.push(EnumDecl { name, variants });
+        Ok(())
+    }
+
     fn parse_type_str(&mut self) -> Result<String, String> {
         if self.is_sym("[") {
             self.next();
@@ -145,36 +172,45 @@ impl Parser {
         }
     }
 
-    fn parse_params(&mut self) -> Result<Vec<(String, String)>, String> {
+    fn parse_params(&mut self) -> Result<(Vec<(String, String)>, Vec<bool>), String> {
         self.eat_sym("(")?;
         self.skip_nl();
         let mut ps = Vec::new();
+        let mut inouts = Vec::new();
         while !self.is_sym(")") {
-            let n = self.ident()?;
+            let mut n = self.ident()?;
+            let mut io = false;
+            if n == "inout" {
+                io = true;
+                n = self.ident()?;
+            }
             self.eat_sym(":")?;
             let t = self.parse_type_str()?;
             ps.push((n, t));
+            inouts.push(io);
             if self.is_sym(",") {
                 self.next();
                 self.skip_nl();
             }
         }
         self.eat_sym(")")?;
-        Ok(ps)
+        Ok((ps, inouts))
     }
 
     fn parse_fn(&mut self, has_kw_fn: bool) -> Result<FnDecl, String> {
         self.eat_kw(if has_kw_fn { "fn" } else { "property" })?;
         let name = self.ident()?;
-        let params = self.parse_params()?;
+        let (params, inouts) = self.parse_params()?;
         let ret = if self.is_sym(":") {
             self.next();
             self.parse_type_str()?
+        } else if has_kw_fn {
+            "()".into() // fn with no annotation returns unit
         } else {
-            "bool".into()
+            "bool".into() // property bodies are predicates
         };
         let body = self.parse_block()?;
-        Ok(FnDecl { name, params, ret, body })
+        Ok(FnDecl { name, params, inouts, ret, body })
     }
 
     fn parse_operator(&mut self) -> Result<(), String> {
@@ -206,7 +242,13 @@ impl Parser {
             self.prec.insert(glyph.clone(), anchor_prec);
             self.prog.infix_ops.insert(glyph, fname.clone());
             let body = self.parse_block()?;
-            self.prog.fns.push(FnDecl { name: fname, params: vec![a, b], ret, body });
+            self.prog.fns.push(FnDecl {
+                name: fname,
+                params: vec![a, b],
+                inouts: vec![false, false],
+                ret,
+                body,
+            });
             Ok(())
         } else {
             let open = first;
@@ -222,15 +264,24 @@ impl Parser {
             self.circum_close.insert(close.clone());
             self.prog.circum_ops.insert(open, (close, fname.clone()));
             let body = self.parse_block()?;
-            self.prog.fns.push(FnDecl { name: fname, params: vec![v], ret, body });
+            self.prog.fns.push(FnDecl {
+                name: fname,
+                params: vec![v],
+                inouts: vec![false],
+                ret,
+                body,
+            });
             Ok(())
         }
     }
 
     fn parse_params_single(&mut self) -> Result<Vec<(String, String)>, String> {
-        let ps = self.parse_params()?;
+        let (ps, inouts) = self.parse_params()?;
         if ps.len() != 1 {
             return Err("operator parameter list must have exactly one parameter".into());
+        }
+        if inouts[0] {
+            return Err("operator parameters cannot be `inout`".into());
         }
         Ok(ps)
     }
@@ -248,19 +299,19 @@ impl Parser {
             if matches!(self.peek(), Tok::Eof) {
                 return Err("unexpected EOF in block".into());
             }
-            let s = self.parse_stmt()?;
-            out.push(s);
+            self.parse_stmt(&mut out)?;
         }
     }
 
-    fn parse_stmt(&mut self) -> Result<StmtId, String> {
+    fn parse_stmt(&mut self, out: &mut Vec<StmtId>) -> Result<(), String> {
         match self.peek().clone() {
             Tok::Ident(k) if k == "let" || k == "var" => {
                 self.next();
                 let name = self.ident()?;
                 self.eat_sym("=")?;
                 let e = self.parse_expr(0)?;
-                Ok(self.alloc_stmt(if k == "let" { Stmt::Let(name, e) } else { Stmt::Var(name, e) }))
+                out.push(self.alloc_stmt(if k == "let" { Stmt::Let(name, e) } else { Stmt::Var(name, e) }));
+                Ok(())
             }
             Tok::Ident(k) if k == "if" => {
                 self.next();
@@ -272,7 +323,8 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
-                Ok(self.alloc_stmt(Stmt::If(c, then, els)))
+                out.push(self.alloc_stmt(Stmt::If(c, then, els)));
+                Ok(())
             }
             Tok::Ident(k) if k == "for" => {
                 self.next();
@@ -282,16 +334,100 @@ impl Parser {
                 self.eat_sym("..")?;
                 let hi = self.parse_expr(4)?;
                 let body = self.parse_block()?;
-                Ok(self.alloc_stmt(Stmt::For(v, lo, hi, body)))
+                out.push(self.alloc_stmt(Stmt::For(v, lo, hi, body)));
+                Ok(())
+            }
+            Tok::Ident(k) if k == "while" => {
+                self.next();
+                let c = self.parse_expr(0)?;
+                let body = self.parse_block()?;
+                out.push(self.alloc_stmt(Stmt::While(c, body)));
+                Ok(())
+            }
+            Tok::Ident(k) if k == "match" => {
+                self.next();
+                let scrut = self.parse_expr(0)?;
+                // bind the scrutinee once, then desugar arms to an `==` chain
+                // (exhaustiveness is checked here, where the enum decl is known)
+                let tmp = format!("__match{}", self.match_ct);
+                self.match_ct += 1;
+                self.skip_nl();
+                self.eat_sym("{")?;
+                let mut arms: Vec<(String, String, Vec<StmtId>)> = Vec::new();
+                let mut else_arm: Option<Vec<StmtId>> = None;
+                loop {
+                    self.skip_nl();
+                    if self.is_sym("}") {
+                        self.next();
+                        break;
+                    }
+                    if matches!(self.peek(), Tok::Ident(s) if s == "else") {
+                        self.next();
+                        else_arm = Some(self.parse_block()?);
+                        continue;
+                    }
+                    let ename = self.ident()?;
+                    self.eat_sym(".")?;
+                    let vname = self.ident()?;
+                    let body = self.parse_block()?;
+                    arms.push((ename, vname, body));
+                }
+                if arms.is_empty() {
+                    return Err("`match` needs at least one enum arm".into());
+                }
+                let ename = arms[0].0.clone();
+                let decl = self
+                    .prog
+                    .enums
+                    .iter()
+                    .find(|e| e.name == ename)
+                    .ok_or(format!("unknown enum `{}` in match", ename))?
+                    .clone();
+                let mut seen = Vec::new();
+                for (en, vn, _) in &arms {
+                    if *en != ename {
+                        return Err(format!("match arms mix enums `{}` and `{}`", ename, en));
+                    }
+                    if !decl.variants.contains(vn) {
+                        return Err(format!("enum `{}` has no variant `{}`", ename, vn));
+                    }
+                    if seen.contains(vn) {
+                        return Err(format!("duplicate match arm `{}.{}`", ename, vn));
+                    }
+                    seen.push(vn.clone());
+                }
+                if else_arm.is_none() {
+                    for v in &decl.variants {
+                        if !seen.contains(v) {
+                            return Err(format!(
+                                "non-exhaustive match: missing `{}.{}` (or add `else`)",
+                                ename, v
+                            ));
+                        }
+                    }
+                }
+                let let_id = self.alloc_stmt(Stmt::Let(tmp.clone(), scrut));
+                out.push(let_id);
+                let mut chain = else_arm.unwrap_or_default();
+                for (en, vn, body) in arms.into_iter().rev() {
+                    let sv = self.alloc(Expr::Ident(tmp.clone()));
+                    let pat = self.alloc(Expr::EnumVal(en, vn));
+                    let cond = self.alloc(Expr::Bin("==".into(), sv, pat));
+                    let if_id = self.alloc_stmt(Stmt::If(cond, body, chain));
+                    chain = vec![if_id];
+                }
+                out.push(chain[0]);
+                Ok(())
             }
             Tok::Ident(k) if k == "return" => {
                 self.next();
                 if matches!(self.peek(), Tok::Newline | Tok::Eof) || self.is_sym("}") {
-                    Ok(self.alloc_stmt(Stmt::Return(None)))
+                    out.push(self.alloc_stmt(Stmt::Return(None)));
                 } else {
                     let e = self.parse_expr(0)?;
-                    Ok(self.alloc_stmt(Stmt::Return(Some(e))))
+                    out.push(self.alloc_stmt(Stmt::Return(Some(e))));
                 }
+                Ok(())
             }
             _ => {
                 let e = self.parse_expr(0)?;
@@ -302,10 +438,11 @@ impl Parser {
                         Expr::Ident(_) | Expr::Index(_, _) | Expr::Field(_, _) => {}
                         _ => return Err("invalid assignment target".into()),
                     }
-                    Ok(self.alloc_stmt(Stmt::Assign(e, v)))
+                    out.push(self.alloc_stmt(Stmt::Assign(e, v)));
                 } else {
-                    Ok(self.alloc_stmt(Stmt::Expr(e)))
+                    out.push(self.alloc_stmt(Stmt::Expr(e)));
                 }
+                Ok(())
             }
         }
     }
@@ -366,6 +503,13 @@ impl Parser {
             if self.is_sym(".") {
                 self.next();
                 let f = self.ident()?;
+                if let Expr::Ident(n) = self.prog.expr(e) {
+                    if self.enum_names.contains(n) {
+                        let n = n.clone();
+                        e = self.alloc(Expr::EnumVal(n, f));
+                        continue;
+                    }
+                }
                 e = self.alloc(Expr::Field(e, f));
             } else if self.is_sym("[") {
                 self.next();

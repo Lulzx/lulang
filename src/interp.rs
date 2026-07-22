@@ -14,6 +14,7 @@ pub enum Value {
     Str(Rc<String>),
     Arr(Rc<RefCell<Vec<Value>>>),
     Rec(usize, Rc<Vec<Value>>),
+    Enum(usize, i64),
     Unit,
 }
 
@@ -51,6 +52,25 @@ fn as_i64(v: &Value) -> Result<i64, String> {
     match v {
         Value::Int(i) => Ok(*i),
         v => Err(format!("expected integer, got {:?}", v)),
+    }
+}
+
+fn set_field(p: &Program, slot: &mut Value, path: &[String], v: Value) -> Result<(), String> {
+    let Some(f) = path.first() else {
+        *slot = v;
+        return Ok(());
+    };
+    match slot {
+        Value::Rec(ti, fields) => {
+            let idx = p.types[*ti]
+                .fields
+                .iter()
+                .position(|(n, _)| n == f)
+                .ok_or(format!("type `{}` has no field `{}`", p.types[*ti].name, f))?;
+            let fields = Rc::make_mut(fields);
+            set_field(p, &mut fields[idx], &path[1..], v)
+        }
+        v => Err(format!("cannot assign field `{}` on {:?}", f, v)),
     }
 }
 
@@ -164,6 +184,7 @@ impl<'a> Interp<'a> {
                 out
             }
             Value::Bool(true) => vec![Value::Bool(false)],
+            Value::Enum(ei, tag) if *tag != 0 => vec![Value::Enum(*ei, 0)],
             Value::Rec(ti, fields) => {
                 let mut out = Vec::new();
                 for (i, f) in fields.iter().enumerate() {
@@ -193,6 +214,11 @@ impl<'a> Interp<'a> {
             }
             "i64" => Ok(Value::Int((next(rng) % 32) as i64)),
             "bool" => Ok(Value::Bool(next(rng) & 1 == 1)),
+            t if self.p.enums.iter().any(|e| e.name == t) => {
+                let ei = self.p.enums.iter().position(|e| e.name == t).unwrap();
+                let n = self.p.enums[ei].variants.len() as u64;
+                Ok(Value::Enum(ei, (next(rng) % n) as i64))
+            }
             t => {
                 let ti = *self.types.get(t).ok_or(format!("cannot generate values of type `{}`", t))?;
                 let fields: Result<Vec<Value>, String> =
@@ -200,6 +226,35 @@ impl<'a> Interp<'a> {
                 Ok(Value::Rec(ti, Rc::new(fields?)))
             }
         }
+    }
+
+    /// Call with copy-in/copy-out `inout` params: after the body runs, the
+    /// final parameter values are written back to the caller's variables.
+    fn call_inout(
+        &self,
+        f: &FnDecl,
+        args: Vec<Value>,
+        arg_es: &[ExprId],
+        env: &mut Env,
+    ) -> Result<Value, String> {
+        let mut scope = HashMap::new();
+        for ((name, _), v) in f.params.iter().zip(args) {
+            scope.insert(name.clone(), v);
+        }
+        let mut cenv: Env = vec![scope];
+        let ret = match self.exec_block(&f.body, &mut cenv)? {
+            Flow::Return(v) | Flow::Normal(v) => v,
+        };
+        for (i, (pname, _)) in f.params.iter().enumerate() {
+            if f.inouts[i] {
+                let out = cenv[0][pname].clone();
+                let Expr::Ident(n) = self.p.expr(arg_es[i]) else {
+                    return Err("inout arg must be a variable".into());
+                };
+                *lookup(env, n).ok_or(format!("unknown variable `{}`", n))? = out;
+            }
+        }
+        Ok(ret)
     }
 
     fn call_decl(&self, f: &FnDecl, args: Vec<Value>) -> Result<Value, String> {
@@ -260,7 +315,26 @@ impl<'a> Interp<'a> {
                             v => return Err(format!("cannot index into {:?}", v)),
                         }
                     }
-                    Expr::Field(_, _) => return Err("field assignment is not supported in v0.1".into()),
+                    Expr::Field(_, _) => {
+                        // x.f = v (possibly nested): copy-on-write into the
+                        // variable's record value — pure value semantics
+                        let mut path = Vec::new();
+                        let mut cur = *target;
+                        let root = loop {
+                            match self.p.expr(cur) {
+                                Expr::Field(b, f) => {
+                                    path.push(f.clone());
+                                    cur = *b;
+                                }
+                                Expr::Ident(n) => break n.clone(),
+                                _ => return Err("field assignment root must be a variable".into()),
+                            }
+                        };
+                        path.reverse();
+                        let slot =
+                            lookup(env, &root).ok_or(format!("unknown variable `{}`", root))?;
+                        set_field(self.p, slot, &path, v)?;
+                    }
                     _ => return Err("invalid assignment target".into()),
                 }
                 Ok(Flow::Normal(Value::Unit))
@@ -275,6 +349,17 @@ impl<'a> Interp<'a> {
                 } else {
                     Ok(Flow::Normal(Value::Unit))
                 }
+            }
+            Stmt::While(c, body) => {
+                loop {
+                    if !matches!(self.eval(*c, env)?, Value::Bool(true)) {
+                        break;
+                    }
+                    if let Flow::Return(rv) = self.exec_block(body, env)? {
+                        return Ok(Flow::Return(rv));
+                    }
+                }
+                Ok(Flow::Normal(Value::Unit))
             }
             Stmt::For(v, lo, hi, body) => {
                 let lo = as_i64(&self.eval(*lo, env)?)?;
@@ -346,6 +431,11 @@ impl<'a> Interp<'a> {
                         .get(idx as usize)
                         .cloned()
                         .ok_or(format!("index {} out of bounds", idx)),
+                    Value::Str(s) => s
+                        .as_bytes()
+                        .get(idx as usize)
+                        .map(|&b| Value::Int(b as i64))
+                        .ok_or(format!("index {} out of bounds (length {})", idx, s.len())),
                     v => Err(format!("cannot index into {:?}", v)),
                 }
             }
@@ -378,6 +468,13 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Rec(ti, Rc::new(fields)))
             }
+            Expr::EnumVal(en, vn) => {
+                let (ei, tag) = self
+                    .p
+                    .enum_tag(en, vn)
+                    .ok_or(format!("unknown enum value `{}.{}`", en, vn))?;
+                Ok(Value::Enum(ei, tag))
+            }
             Expr::Sum { var, lo, hi, body } => {
                 let lo = as_i64(&self.eval(*lo, env)?)?;
                 let hi = as_i64(&self.eval(*hi, env)?)?;
@@ -409,7 +506,13 @@ impl<'a> Interp<'a> {
             }
             Expr::Call(name, args) => {
                 let vs: Result<Vec<Value>, String> = args.iter().map(|&e| self.eval(e, env)).collect();
-                self.call(name, vs?)
+                let vs = vs?;
+                if let Some(&fi) = self.fns.get(name.as_str()) {
+                    if self.p.fns[fi].has_inout() {
+                        return self.call_inout(&self.p.fns[fi], vs, args, env);
+                    }
+                }
+                self.call(name, vs)
             }
         }
     }
@@ -463,6 +566,7 @@ impl<'a> Interp<'a> {
                     (Value::Int(a), Value::Int(b)) => a == b,
                     (Value::Bool(a), Value::Bool(b)) => a == b,
                     (Value::Str(a), Value::Str(b)) => a == b,
+                    (Value::Enum(_, a), Value::Enum(_, b)) => a == b,
                     _ => as_f64(&lv)? == as_f64(&rv)?,
                 };
                 Ok(Value::Bool(if op == "==" { eq } else { !eq }))
@@ -512,10 +616,24 @@ impl<'a> Interp<'a> {
                 }))
             }
             "float" => Ok(Value::Float(as_f64(&args[0])?)),
-            "int" => Ok(Value::Int(as_f64(&args[0])? as i64)),
+            "int" => match &args[0] {
+                Value::Enum(_, tag) => Ok(Value::Int(*tag)),
+                v => Ok(Value::Int(as_f64(v)? as i64)),
+            },
             "len" => match &args[0] {
                 Value::Arr(cells) => Ok(Value::Int(cells.borrow().len() as i64)),
-                v => Err(format!("`len` expects array, got {:?}", v)),
+                Value::Str(s) => Ok(Value::Int(s.len() as i64)),
+                v => Err(format!("`len` expects array or str, got {:?}", v)),
+            },
+            "substr" => match (&args[0], as_i64(&args[1])?, as_i64(&args[2])?) {
+                (Value::Str(s), lo, hi) => {
+                    if lo < 0 || hi < lo || hi as usize > s.len() {
+                        return Err(format!("substr {}..{} out of bounds (length {})", lo, hi, s.len()));
+                    }
+                    let bytes = &s.as_bytes()[lo as usize..hi as usize];
+                    Ok(Value::Str(Rc::new(String::from_utf8_lossy(bytes).into_owned())))
+                }
+                _ => Err("`substr` expects (str, i64, i64)".into()),
             },
             "arr" => {
                 let n = as_i64(&args[0])?;
@@ -549,6 +667,10 @@ impl<'a> Interp<'a> {
                     .map(|((n, _), v)| format!("{}: {}", n, self.display(v)))
                     .collect();
                 format!("{} {{ {} }}", decl.name, parts.join(", "))
+            }
+            Value::Enum(ei, tag) => {
+                let decl = &self.p.enums[*ei];
+                format!("{}.{}", decl.name, decl.variants[*tag as usize])
             }
         }
     }

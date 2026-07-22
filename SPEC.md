@@ -141,3 +141,39 @@ FP mode, property-driven optimizer assumptions, AI/LLM-call runtime, self-hostin
 semantics, law of exclusivity) — required for growable collections, and eventually
 self-hosting; and the first middle-end passes (SoA layout selection, reduction
 vectorization) as lulang IR transforms rather than clang flags.
+
+---
+
+# v0.2 additions (M6 — the self-hosting surface)
+
+Implemented in all three tiers (interpreter, Cranelift JIT, LLVM AOT):
+
+- **`enum`** — C-like sum tags: `enum Kind { Ident, Int, Eof }`. Values are
+  written `Kind.Ident`, compare with `==`/`!=`, convert to their tag with
+  `int(k)`, and may be stored in fields and arrays. Runtime representation is
+  an `i64` tag.
+- **`match`** — statement form over enum values with block arms and optional
+  `else`. Without `else` the match must be exhaustive (checked at parse time,
+  where the declaration is in scope — a single-pass constraint, by design).
+  Desugars to an `==` chain, so pure arms if-convert in the JIT like any
+  other branch.
+- **`inout` parameters** — `fn step(inout lx: Lexer)`. Copy-in/copy-out value
+  semantics: the callee works on its own copy; on return the final value is
+  written back to the caller's variable. Arguments must be mutable variables
+  of the exact type; operators and properties cannot take `inout`. In the
+  outlined-call ABI the copy-out travels as extra return values; inlined
+  calls write the SSA values back directly. No aliasing is ever created.
+- **Field assignment** — `lx.pos = e`, including nested paths, on mutable
+  record variables. Pure value semantics (copy-on-write in the interpreter,
+  per-component SSA/alloca writes in the back ends).
+- **`while`** — `while cond { … }`. The first unbounded loop; `for` remains
+  the bounded range loop.
+- **Strings** — `s[i]` yields the byte at `i` as `i64` (bounds-checked),
+  `len(s)` the byte length, `substr(s, lo, hi)` a checked view (no copy in
+  the compiled tiers), `==`/`!=` compare contents. Byte-char literals `'a'`,
+  `'\n'`, `'\''` are `i64` literals.
+- **`fn` with no return annotation** returns unit (previously an accidental
+  `bool` default; `property` bodies remain predicates).
+
+First artifact: [selfhost/lexer.lu](selfhost/lexer.lu) — the lulang lexer
+written in lulang, producing identical output under all three tiers.

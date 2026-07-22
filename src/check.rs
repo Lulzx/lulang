@@ -10,6 +10,7 @@ pub enum Type {
     Unit,
     Arr(Box<Type>),
     Rec(usize),
+    Enum(usize),
 }
 
 pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
@@ -18,9 +19,12 @@ pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
         "i64" | "i32" => Ok(Type::I64),
         "bool" => Ok(Type::Bool),
         "str" => Ok(Type::Str),
+        "()" => Ok(Type::Unit),
         _ => {
             if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
                 Ok(Type::Arr(Box::new(resolve_type(p, inner)?)))
+            } else if let Some(ei) = p.enums.iter().position(|e| e.name == s) {
+                Ok(Type::Enum(ei))
             } else {
                 p.types
                     .iter()
@@ -35,7 +39,7 @@ pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
 pub struct Checker<'a> {
     p: &'a Program,
     type_ids: HashMap<String, usize>,
-    sigs: HashMap<String, (Vec<Type>, Type)>,
+    sigs: HashMap<String, (Vec<Type>, Vec<bool>, Type)>,
 }
 
 type Scope = HashMap<String, (Type, bool)>; // type, is-mutable
@@ -50,7 +54,13 @@ impl<'a> Checker<'a> {
         for f in &p.fns {
             let params: Result<Vec<Type>, String> =
                 f.params.iter().map(|(_, t)| c.resolve(t)).collect();
-            c.sigs.insert(f.name.clone(), (params?, c.resolve(&f.ret)?));
+            c.sigs
+                .insert(f.name.clone(), (params?, f.inouts.clone(), c.resolve(&f.ret)?));
+        }
+        for prop in &p.props {
+            if prop.has_inout() {
+                return Err(format!("property `{}` cannot take `inout` parameters", prop.name));
+            }
         }
         for f in &p.fns {
             c.check_fn(f)?;
@@ -74,9 +84,12 @@ impl<'a> Checker<'a> {
             "i64" | "i32" => Ok(Type::I64),
             "bool" => Ok(Type::Bool),
             "str" => Ok(Type::Str),
+            "()" => Ok(Type::Unit),
             _ => {
                 if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
                     Ok(Type::Arr(Box::new(self.resolve(inner)?)))
+                } else if let Some(ei) = self.p.enums.iter().position(|e| e.name == s) {
+                    Ok(Type::Enum(ei))
                 } else {
                     self.type_ids
                         .get(s)
@@ -96,6 +109,7 @@ impl<'a> Checker<'a> {
             Type::Unit => "()".into(),
             Type::Arr(t) => format!("[{}]", self.name(t)),
             Type::Rec(i) => self.p.types[*i].name.clone(),
+            Type::Enum(i) => self.p.enums[*i].name.clone(),
         }
     }
 
@@ -119,8 +133,9 @@ impl<'a> Checker<'a> {
 
     fn check_fn_body(&self, f: &FnDecl, ret: &Type) -> Result<Type, String> {
         let mut scope = HashMap::new();
-        for (n, t) in &f.params {
-            scope.insert(n.clone(), (self.resolve(t)?, false));
+        for (i, (n, t)) in f.params.iter().enumerate() {
+            let mutable = f.inouts.get(i).copied().unwrap_or(false);
+            scope.insert(n.clone(), (self.resolve(t)?, mutable));
         }
         let mut scopes = vec![scope];
         self.check_block(&f.body, &mut scopes, ret)
@@ -193,6 +208,56 @@ impl<'a> Checker<'a> {
                             }
                         }
                     }
+                    Expr::Field(_, _) => {
+                        // x.f (possibly nested) = v — root must be a mutable var
+                        let mut path = Vec::new();
+                        let mut cur = *target;
+                        let root = loop {
+                            match self.p.expr(cur) {
+                                Expr::Field(b, f) => {
+                                    path.push(f.clone());
+                                    cur = *b;
+                                }
+                                Expr::Ident(n) => break n.clone(),
+                                _ => return Err("field assignment root must be a variable".into()),
+                            }
+                        };
+                        path.reverse();
+                        let (mut t, mutable) = self
+                            .lookup(scopes, &root)
+                            .ok_or(format!("unknown variable `{}`", root))?;
+                        if !mutable {
+                            return Err(format!("cannot assign through immutable binding `{}`", root));
+                        }
+                        for f in &path {
+                            t = match t {
+                                Type::Rec(ti) => self.p.types[ti]
+                                    .fields
+                                    .iter()
+                                    .find(|(n, _)| n == f)
+                                    .map(|(_, ft)| self.resolve(ft))
+                                    .transpose()?
+                                    .ok_or(format!(
+                                        "type `{}` has no field `{}`",
+                                        self.p.types[ti].name, f
+                                    ))?,
+                                t => {
+                                    return Err(format!(
+                                        "cannot access field `{}` on {}",
+                                        f,
+                                        self.name(&t)
+                                    ))
+                                }
+                            };
+                        }
+                        if !Self::compat(&t, &vt) {
+                            return Err(format!(
+                                "cannot assign {} to field of type {}",
+                                self.name(&vt),
+                                self.name(&t)
+                            ));
+                        }
+                    }
                     _ => return Err("invalid assignment target".into()),
                 }
                 Ok(Type::Unit)
@@ -203,6 +268,13 @@ impl<'a> Checker<'a> {
                 }
                 self.check_block(then, scopes, ret)?;
                 self.check_block(els, scopes, ret)?;
+                Ok(Type::Unit)
+            }
+            Stmt::While(c, body) => {
+                if self.check_expr(*c, scopes)? != Type::Bool {
+                    return Err("`while` condition must be bool".into());
+                }
+                self.check_block(body, scopes, ret)?;
                 Ok(Type::Unit)
             }
             Stmt::For(v, lo, hi, body) => {
@@ -261,7 +333,7 @@ impl<'a> Checker<'a> {
                 let lt = self.check_expr(*l, scopes)?;
                 let rt = self.check_expr(*r, scopes)?;
                 if let Some(fname) = self.p.infix_ops.get(op) {
-                    let (params, ret) = self.sigs.get(fname).ok_or(format!("unknown op `{}`", op))?;
+                    let (params, _, ret) = self.sigs.get(fname).ok_or(format!("unknown op `{}`", op))?;
                     if !Self::compat(&params[0], &lt) || !Self::compat(&params[1], &rt) {
                         return Err(format!(
                             "operator `{}` expects ({}, {}), got ({}, {})",
@@ -313,7 +385,7 @@ impl<'a> Checker<'a> {
             Expr::Circum(open, e) => {
                 let t = self.check_expr(*e, scopes)?;
                 let (close, fname) = &self.p.circum_ops[open];
-                let (params, ret) = self.sigs.get(fname).ok_or(format!("unknown op `{}…{}`", open, close))?;
+                let (params, _, ret) = self.sigs.get(fname).ok_or(format!("unknown op `{}…{}`", open, close))?;
                 if !Self::compat(&params[0], &t) {
                     return Err(format!(
                         "operator `{}…{}` expects {}, got {}",
@@ -341,6 +413,7 @@ impl<'a> Checker<'a> {
                 }
                 match self.check_expr(*a, scopes)? {
                     Type::Arr(el) => Ok(*el),
+                    Type::Str => Ok(Type::I64), // byte access
                     t => Err(format!("cannot index into {}", self.name(&t))),
                 }
             }
@@ -396,6 +469,13 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Type::Rec(ti))
             }
+            Expr::EnumVal(en, vn) => {
+                let (ei, _) = self
+                    .p
+                    .enum_tag(en, vn)
+                    .ok_or(format!("unknown enum value `{}.{}`", en, vn))?;
+                Ok(Type::Enum(ei))
+            }
             Expr::Sum { var, lo, hi, body } => {
                 if self.check_expr(*lo, scopes)? != Type::I64
                     || self.check_expr(*hi, scopes)? != Type::I64
@@ -449,9 +529,16 @@ impl<'a> Checker<'a> {
                     "len" => {
                         need(1)?;
                         match &ats[0] {
-                            Type::Arr(_) => Ok(Type::I64),
-                            t => Err(format!("`len` expects an array, got {}", self.name(t))),
+                            Type::Arr(_) | Type::Str => Ok(Type::I64),
+                            t => Err(format!("`len` expects an array or str, got {}", self.name(t))),
                         }
+                    }
+                    "substr" => {
+                        need(3)?;
+                        if ats[0] != Type::Str || ats[1] != Type::I64 || ats[2] != Type::I64 {
+                            return Err("`substr` expects (str, i64, i64)".into());
+                        }
+                        Ok(Type::Str)
                     }
                     "arr" => {
                         need(2)?;
@@ -461,7 +548,7 @@ impl<'a> Checker<'a> {
                         Ok(Type::Arr(Box::new(ats[1].clone())))
                     }
                     _ => {
-                        let (params, ret) =
+                        let (params, inouts, ret) =
                             self.sigs.get(name).ok_or(format!("unknown function `{}`", name))?;
                         if params.len() != ats.len() {
                             return Err(format!(
@@ -472,7 +559,35 @@ impl<'a> Checker<'a> {
                             ));
                         }
                         for (i, (p, a)) in params.iter().zip(ats.iter()).enumerate() {
-                            if !Self::compat(p, a) {
+                            if inouts[i] {
+                                // inout: the arg must be a mutable variable of the
+                                // exact type (copy-out has nowhere to widen to)
+                                match self.p.expr(args[i]) {
+                                    Expr::Ident(n) => {
+                                        let (t, mutable) = self
+                                            .lookup(scopes, n)
+                                            .ok_or(format!("unknown variable `{}`", n))?;
+                                        if !mutable {
+                                            return Err(format!(
+                                                "inout arg {} of `{}` needs a `var`, `{}` is immutable",
+                                                i + 1, name, n
+                                            ));
+                                        }
+                                        if t != *p {
+                                            return Err(format!(
+                                                "inout arg {} of `{}` must be exactly {}, got {}",
+                                                i + 1, name, self.name(p), self.name(&t)
+                                            ));
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(format!(
+                                            "inout arg {} of `{}` must be a variable",
+                                            i + 1, name
+                                        ))
+                                    }
+                                }
+                            } else if !Self::compat(p, a) {
                                 return Err(format!(
                                     "arg {} of `{}`: expected {}, got {}",
                                     i + 1,

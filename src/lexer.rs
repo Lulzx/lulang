@@ -46,6 +46,33 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 let t: String = cs[s..i].iter().collect();
                 out.push(Tok::Int(t.parse().map_err(|e| format!("bad int: {e}"))?));
             }
+        } else if c == '\'' {
+            // byte-char literal: 'a', '\n', '\'' — value is the byte as i64
+            i += 1;
+            if i >= cs.len() {
+                return Err("unterminated char literal".into());
+            }
+            let mut ch = cs[i];
+            if ch == '\\' {
+                i += 1;
+                if i >= cs.len() {
+                    return Err("unterminated char literal".into());
+                }
+                ch = match cs[i] {
+                    'n' => '\n',
+                    't' => '\t',
+                    x => x,
+                };
+            }
+            if !ch.is_ascii() {
+                return Err("char literal must be a single byte".into());
+            }
+            i += 1;
+            if i >= cs.len() || cs[i] != '\'' {
+                return Err("unterminated char literal".into());
+            }
+            i += 1;
+            out.push(Tok::Int(ch as i64));
         } else if c == '"' {
             i += 1;
             let mut s = String::new();

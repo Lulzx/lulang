@@ -1,0 +1,168 @@
+// selfhost/lexer.lu — the lulang lexer, written in lulang (M6 self-hosting seed).
+//
+// Tokenizes the ASCII core of the language: identifiers/keywords, integer and
+// float literals, string literals with escapes, comments, one- and two-char
+// symbols. Runs identically under `lu interp`, `lu run` (JIT), and `lu build`
+// (AOT). Multi-byte Unicode operator glyphs lex as one Sym per byte for now —
+// the parser will group them when it lands.
+
+enum Kind { Ident, Int, Float, Str, Sym, Newline, Eof, Error }
+
+type Token { kind: Kind, text: str, num: f64 }
+type Lexer { src: str, pos: i64 }
+
+fn is_digit(c: i64): bool { return c >= '0' and c <= '9' }
+
+fn is_alpha(c: i64): bool {
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'
+}
+
+fn is_ident_char(c: i64): bool { return is_alpha(c) or is_digit(c) }
+
+fn is_two_sym(a: i64, b: i64): bool {
+  if b != '=' {
+    if a == '.' and b == '.' { return true }
+    if a == '|' and b == '>' { return true }
+    return false
+  }
+  return a == '=' or a == '!' or a == '<' or a == '>' or a == '~'
+}
+
+fn skip_space(inout lx: Lexer) {
+  let n = len(lx.src)
+  var going = true
+  while going {
+    going = false
+    if lx.pos < n {
+      let c = lx.src[lx.pos]
+      if c == ' ' or c == '\t' or c == '\r' {
+        lx.pos = lx.pos + 1
+        going = true
+      }
+      if c == '/' and lx.pos + 1 < n {
+        if lx.src[lx.pos + 1] == '/' {
+          while lx.pos < n and lx.src[lx.pos] != '\n' { lx.pos = lx.pos + 1 }
+          going = true
+        }
+      }
+    }
+  }
+}
+
+fn lex_number(inout lx: Lexer): Token {
+  let s = lx.pos
+  let n = len(lx.src)
+  var v = 0.0
+  var isf = false
+  while lx.pos < n and is_digit(lx.src[lx.pos]) {
+    v = v * 10.0 + float(lx.src[lx.pos] - '0')
+    lx.pos = lx.pos + 1
+  }
+  if lx.pos + 1 < n and lx.src[lx.pos] == '.' {
+    if is_digit(lx.src[lx.pos + 1]) {
+      isf = true
+      lx.pos = lx.pos + 1
+      var scale = 0.1
+      while lx.pos < n and is_digit(lx.src[lx.pos]) {
+        v = v + float(lx.src[lx.pos] - '0') * scale
+        scale = scale * 0.1
+        lx.pos = lx.pos + 1
+      }
+    }
+  }
+  var k = Kind.Int
+  if isf { k = Kind.Float }
+  return Token { kind: k, text: substr(lx.src, s, lx.pos), num: v }
+}
+
+fn lex_string(inout lx: Lexer): Token {
+  let n = len(lx.src)
+  lx.pos = lx.pos + 1
+  let s = lx.pos
+  while lx.pos < n and lx.src[lx.pos] != '"' {
+    if lx.src[lx.pos] == '\\' and lx.pos + 1 < n { lx.pos = lx.pos + 1 }
+    lx.pos = lx.pos + 1
+  }
+  if lx.pos >= n {
+    return Token { kind: Kind.Error, text: "unterminated string", num: 0.0 }
+  }
+  let body = substr(lx.src, s, lx.pos)
+  lx.pos = lx.pos + 1
+  return Token { kind: Kind.Str, text: body, num: 0.0 }
+}
+
+fn next_token(inout lx: Lexer): Token {
+  skip_space(lx)
+  let n = len(lx.src)
+  if lx.pos >= n {
+    return Token { kind: Kind.Eof, text: "", num: 0.0 }
+  }
+  let c = lx.src[lx.pos]
+  if c == '\n' {
+    lx.pos = lx.pos + 1
+    return Token { kind: Kind.Newline, text: "", num: 0.0 }
+  }
+  if is_alpha(c) {
+    let s = lx.pos
+    while lx.pos < n and is_ident_char(lx.src[lx.pos]) { lx.pos = lx.pos + 1 }
+    return Token { kind: Kind.Ident, text: substr(lx.src, s, lx.pos), num: 0.0 }
+  }
+  if is_digit(c) { return lex_number(lx) }
+  if c == '"' { return lex_string(lx) }
+  if lx.pos + 1 < n {
+    if is_two_sym(c, lx.src[lx.pos + 1]) {
+      let s = lx.pos
+      lx.pos = lx.pos + 2
+      return Token { kind: Kind.Sym, text: substr(lx.src, s, lx.pos), num: 0.0 }
+    }
+  }
+  let s = lx.pos
+  lx.pos = lx.pos + 1
+  return Token { kind: Kind.Sym, text: substr(lx.src, s, lx.pos), num: 0.0 }
+}
+
+fn kind_name(k: Kind): str {
+  var out = "?"
+  match k {
+    Kind.Ident { out = "ident" }
+    Kind.Int { out = "int" }
+    Kind.Float { out = "float" }
+    Kind.Str { out = "str" }
+    Kind.Sym { out = "sym" }
+    Kind.Newline { out = "nl" }
+    Kind.Eof { out = "eof" }
+    Kind.Error { out = "error" }
+  }
+  return out
+}
+
+main {
+  // a lulang program as input: the dot-product corpus kernel
+  let src = "// bench kernel\nfn dot(a: [f64], b: [f64], n: i64): f64 {\n  return sum(i in 0..n) a[i] * b[i]\n}\n\nmain {\n  let n = 2000000\n  var a = arr(n, 0.0)\n  print(\"acc:\", dot(a, a, n) ~= 0.5, 1.25)\n}\n"
+  var lx = Lexer { src: src, pos: 0 }
+
+  var counts = arr(8, 0)
+  var floatsum = 0.0
+  var going = true
+  var total = 0
+  while going {
+    let t = next_token(lx)
+    let k = int(t.kind)
+    counts[k] = counts[k] + 1
+    total = total + 1
+    if t.kind == Kind.Float { floatsum = floatsum + t.num }
+    if t.kind == Kind.Int { floatsum = floatsum + t.num }
+    if t.kind == Kind.Eof { going = false }
+    if t.kind == Kind.Error {
+      print("lex error:", t.text)
+      going = false
+    }
+    if total < 12 {
+      print(kind_name(t.kind), t.text)
+    }
+  }
+  print("tokens:", total)
+  print("idents:", counts[0], "ints:", counts[1], "floats:", counts[2])
+  print("strs:", counts[3], "syms:", counts[4], "newlines:", counts[5])
+  print("numeric payload sum:", floatsum)
+}

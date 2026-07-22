@@ -19,6 +19,7 @@ pub enum Expr {
     Array(Vec<ExprId>),
     Sum { var: String, lo: ExprId, hi: ExprId, body: ExprId },
     Circum(String, ExprId), // key = open glyph, operand
+    EnumVal(String, String), // EnumName.Variant
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +29,7 @@ pub enum Stmt {
     Assign(ExprId, ExprId),
     If(ExprId, Vec<StmtId>, Vec<StmtId>),
     For(String, ExprId, ExprId, Vec<StmtId>),
+    While(ExprId, Vec<StmtId>),
     Return(Option<ExprId>),
     Expr(ExprId),
 }
@@ -36,8 +38,16 @@ pub enum Stmt {
 pub struct FnDecl {
     pub name: String,
     pub params: Vec<(String, String)>,
+    // parallel to params: true = `inout` (copy-in/copy-out; no aliasing ever)
+    pub inouts: Vec<bool>,
     pub ret: String,
     pub body: Vec<StmtId>,
+}
+
+impl FnDecl {
+    pub fn has_inout(&self) -> bool {
+        self.inouts.iter().any(|&b| b)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,12 +56,19 @@ pub struct TypeDecl {
     pub fields: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: String,
+    pub variants: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct Program {
     pub exprs: Vec<Expr>,
     pub stmts: Vec<Stmt>,
     pub fns: Vec<FnDecl>,
     pub types: Vec<TypeDecl>,
+    pub enums: Vec<EnumDecl>,
     pub props: Vec<FnDecl>,
     pub main: Option<Vec<StmtId>>,
     // glyph -> function name (operators are ordinary functions after parsing)
@@ -66,5 +83,14 @@ impl Program {
     }
     pub fn stmt(&self, id: StmtId) -> &Stmt {
         &self.stmts[id as usize]
+    }
+    /// (enum index, variant tag) for `EnumName.Variant`.
+    pub fn enum_tag(&self, ename: &str, vname: &str) -> Option<(usize, i64)> {
+        let ei = self.enums.iter().position(|e| e.name == ename)?;
+        let tag = self.enums[ei].variants.iter().position(|v| v == vname)? as i64;
+        Some((ei, tag))
+    }
+    pub fn find_fn(&self, name: &str) -> Option<&FnDecl> {
+        self.fns.iter().find(|f| f.name == name)
     }
 }

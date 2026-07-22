@@ -19,7 +19,7 @@ const ATOL: f64 = 7.888609052210118e-31; // 2^-100
 fn lty(p: &Program, t: &CType) -> Result<Vec<&'static str>, String> {
     Ok(match t {
         CType::F64 => vec!["double"],
-        CType::I64 | CType::Bool => vec!["i64"],
+        CType::I64 | CType::Bool | CType::Enum(_) => vec!["i64"],
         CType::Str => vec!["ptr", "i64"],
         CType::Arr(_) => vec!["ptr"],
         CType::Unit => vec![],
@@ -42,6 +42,26 @@ fn ret_ty(p: &Program, t: &CType) -> Result<String, String> {
     })
 }
 
+/// ABI return components of a function: declared return + inout param comps.
+fn abi_ret_comps<'x>(p: &Program, f: &FnDecl) -> Result<Vec<&'x str>, String> {
+    let ret = resolve_type(p, &f.ret)?;
+    let mut c = lty(p, &ret)?;
+    for ((_, tstr), &io) in f.params.iter().zip(f.inouts.iter()) {
+        if io {
+            c.extend(lty(p, &resolve_type(p, tstr)?)?);
+        }
+    }
+    Ok(c)
+}
+
+fn comps_ty(c: &[&str]) -> String {
+    match c.len() {
+        0 => "void".into(),
+        1 => c[0].into(),
+        _ => format!("{{ {} }}", c.join(", ")),
+    }
+}
+
 #[derive(Clone)]
 struct EV {
     ty: CType,
@@ -58,6 +78,9 @@ struct Emit<'a> {
     strings: Vec<String>,
     trusted: Vec<(String, String, String)>,
     soa: bool,
+    // (param name, type) of the current fn's inout params — their final
+    // values are appended to every return (copy-out travels via the ABI)
+    inout_params: Vec<(String, CType)>,
     ret: CType,
     terminated: bool,
 }
@@ -72,6 +95,7 @@ pub fn build(p: &Program, src_path: &str, out_path: Option<&str>) -> Result<Stri
         strings: Vec::new(),
         trusted: Vec::new(),
         soa: std::env::var("LU_LAYOUT").map(|v| v != "aos").unwrap_or(true),
+        inout_params: Vec::new(),
         ret: CType::Unit,
         terminated: false,
     };
@@ -107,6 +131,7 @@ pub fn build(p: &Program, src_path: &str, out_path: Option<&str>) -> Result<Stri
          declare void @lu_print_bool(i64)\ndeclare void @lu_print_str(ptr, i64)\n\
          declare void @lu_print_sep()\ndeclare void @lu_print_nl()\n\
          declare ptr @lu_arr_new_raw(i64)\n\
+         declare i64 @lu_str_eq(ptr, i64, ptr, i64) #0\n\
          declare ptr @lu_arr_new_f64(i64, double)\ndeclare ptr @lu_arr_new_i64(i64, i64)\n\
          declare void @lu_oob(i64, i64) #1\n\
          attributes #0 = { nounwind willreturn memory(none) }\n\
@@ -208,7 +233,14 @@ impl<'a> Emit<'a> {
             }
             binds.push((name.clone(), t, regs));
         }
-        let rt = ret_ty(self.p, &self.ret)?;
+        self.inout_params = f
+            .params
+            .iter()
+            .zip(f.inouts.iter())
+            .filter(|(_, &io)| io)
+            .map(|((n, tstr), _)| Ok((n.clone(), resolve_type(self.p, tstr)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let rt = comps_ty(&abi_ret_comps(self.p, f)?);
         let header = format!("define internal {} @\"{}\"({}) {{\n", rt, f.name, params.join(", "));
         self.label("entry");
         for (name, t, regs) in binds {
@@ -218,7 +250,10 @@ impl<'a> Emit<'a> {
         if !self.terminated {
             match last {
                 Some(v) if v.ty == self.ret => self.emit_ret(&v)?,
-                _ if self.ret == CType::Unit => self.line("ret void".into()),
+                _ if self.ret == CType::Unit => {
+                    let unit = EV { ty: CType::Unit, regs: vec![] };
+                    self.emit_ret(&unit)?;
+                }
                 _ => return Err(format!("function `{}` may end without a value", f.name)),
             }
         }
@@ -233,6 +268,7 @@ impl<'a> Emit<'a> {
         self.trusted.clear();
         self.terminated = false;
         self.ret = CType::Unit;
+        self.inout_params = Vec::new();
         self.label("entry");
         self.emit_block(body)?;
         if !self.terminated {
@@ -242,14 +278,20 @@ impl<'a> Emit<'a> {
     }
 
     fn emit_ret(&mut self, v: &EV) -> Result<(), String> {
-        let comps = lty(self.p, &v.ty)?;
+        let mut comps = lty(self.p, &v.ty)?;
+        let mut regs = v.regs.clone();
+        for (pname, t) in self.inout_params.clone() {
+            let out = self.load_var(&pname)?;
+            comps.extend(lty(self.p, &t)?);
+            regs.extend(out.regs);
+        }
         match comps.len() {
             0 => self.line("ret void".into()),
-            1 => self.line(format!("ret {} {}", comps[0], v.regs[0])),
+            1 => self.line(format!("ret {} {}", comps[0], regs[0])),
             _ => {
-                let sty = ret_ty(self.p, &v.ty)?;
+                let sty = comps_ty(&comps);
                 let mut cur = "undef".to_string();
-                for (i, (c, r)) in comps.iter().zip(v.regs.iter()).enumerate() {
+                for (i, (c, r)) in comps.iter().zip(regs.iter()).enumerate() {
                     let t = self.t();
                     self.line(format!("{} = insertvalue {} {}, {} {}, {}", t, sty, cur, c, r, i));
                     cur = t;
@@ -347,6 +389,41 @@ impl<'a> Emit<'a> {
                             self.line(format!("store {} {}, ptr {}", c, r, ep));
                         }
                     }
+                    Expr::Field(_, _) => {
+                        let mut path = Vec::new();
+                        let mut cur = *target;
+                        let root = loop {
+                            match self.p.expr(cur) {
+                                Expr::Field(b, f) => {
+                                    path.push(f.clone());
+                                    cur = *b;
+                                }
+                                Expr::Ident(n) => break n.clone(),
+                                _ => return Err("field assignment root must be a variable".into()),
+                            }
+                        };
+                        path.reverse();
+                        let (mut t, ptrs) = self
+                            .lookup(&root)
+                            .ok_or(format!("unknown variable `{}`", root))?;
+                        let mut off = 0;
+                        for f in &path {
+                            match t {
+                                CType::Rec(ti) => {
+                                    let (o, ft) = field_offset(self.p, ti, f)?;
+                                    off += o;
+                                    t = ft;
+                                }
+                                t => return Err(format!("cannot assign field on {:?}", t)),
+                            }
+                        }
+                        let comps = lty(self.p, &t)?;
+                        for ((c, r), ptr) in
+                            comps.iter().zip(v.regs.iter()).zip(ptrs[off..].iter())
+                        {
+                            self.line(format!("store {} {}, ptr {}", c, r, ptr));
+                        }
+                    }
                     _ => return Err("invalid assignment target".into()),
                 }
                 Ok(None)
@@ -381,6 +458,25 @@ impl<'a> Emit<'a> {
                     self.terminated = false;
                     Ok(None)
                 }
+            }
+            Stmt::While(c, body) => {
+                let lh = self.l();
+                let lb = self.l();
+                let lx = self.l();
+                self.line(format!("br label %{}", lh));
+                self.label(&lh);
+                let cv = self.emit_expr(*c)?;
+                let cb = self.t();
+                self.line(format!("{} = icmp ne i64 {}, 0", cb, cv.regs[0]));
+                self.line(format!("br i1 {}, label %{}, label %{}", cb, lb, lx));
+                self.label(&lb);
+                self.emit_block(body)?;
+                if !self.terminated {
+                    self.line(format!("br label %{}", lh));
+                }
+                self.terminated = false;
+                self.label(&lx);
+                Ok(None)
             }
             Stmt::For(v, lo, hi, body) => {
                 let lov = self.emit_expr(*lo)?;
@@ -441,8 +537,8 @@ impl<'a> Emit<'a> {
                     }
                     None => {
                         if self.ret == CType::Unit {
-                            self.line("ret void".into());
-                            self.terminated = true;
+                            let unit = EV { ty: CType::Unit, regs: vec![] };
+                            self.emit_ret(&unit)?;
                         }
                     }
                 }
@@ -592,7 +688,7 @@ impl<'a> Emit<'a> {
             Expr::Circum(open, e) => {
                 let fname = self.p.circum_ops[open].1.clone();
                 let v = self.emit_expr(*e)?;
-                self.emit_user_call(&fname, vec![v])
+                self.emit_user_call(&fname, vec![v], None)
             }
             Expr::Field(e, fname) => {
                 let v = self.emit_expr(*e)?;
@@ -609,6 +705,24 @@ impl<'a> Emit<'a> {
                 let trusted = self.is_trusted(*a, *i);
                 let av = self.emit_expr(*a)?;
                 let iv = self.emit_expr(*i)?;
+                if av.ty == CType::Str {
+                    let bad = self.t();
+                    self.line(format!("{} = icmp uge i64 {}, {}", bad, iv.regs[0], av.regs[1]));
+                    let lb = self.l();
+                    let lg = self.l();
+                    self.line(format!("br i1 {}, label %{}, label %{}", bad, lb, lg));
+                    self.label(&lb);
+                    self.line(format!("call void @lu_oob(i64 {}, i64 {})", iv.regs[0], av.regs[1]));
+                    self.line("unreachable".into());
+                    self.label(&lg);
+                    let ep = self.t();
+                    self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", ep, av.regs[0], iv.regs[0]));
+                    let b8 = self.t();
+                    self.line(format!("{} = load i8, ptr {}", b8, ep));
+                    let r = self.t();
+                    self.line(format!("{} = zext i8 {} to i64", r, b8));
+                    return Ok(EV { ty: CType::I64, regs: vec![r] });
+                }
                 let elem = match &av.ty {
                     CType::Arr(e) => e.as_ref().clone(),
                     _ => return Err("cannot index non-array".into()),
@@ -653,6 +767,13 @@ impl<'a> Emit<'a> {
                     regs.extend(s.expect("checker guarantees all fields"));
                 }
                 Ok(EV { ty: CType::Rec(ti), regs })
+            }
+            Expr::EnumVal(en, vn) => {
+                let (ei, tag) = self
+                    .p
+                    .enum_tag(en, vn)
+                    .ok_or(format!("unknown enum value `{}.{}`", en, vn))?;
+                Ok(EV { ty: CType::Enum(ei), regs: vec![tag.to_string()] })
             }
             Expr::Sum { var, lo, hi, body } => {
                 let lov = self.emit_expr(*lo)?;
@@ -722,7 +843,7 @@ impl<'a> Emit<'a> {
             }
             Expr::Call(name, args) => {
                 let vs: Result<Vec<EV>, String> = args.iter().map(|&a| self.emit_expr(a)).collect();
-                self.emit_call(name, vs?)
+                self.emit_call(name, vs?, args)
             }
         }
     }
@@ -732,7 +853,7 @@ impl<'a> Emit<'a> {
             let fname = self.p.infix_ops[&op].clone();
             let lv = self.emit_expr(l)?;
             let rv = self.emit_expr(r)?;
-            return self.emit_user_call(&fname, vec![lv, rv]);
+            return self.emit_user_call(&fname, vec![lv, rv], None);
         }
         let lv = self.emit_expr(l)?;
         let rv = self.emit_expr(r)?;
@@ -770,9 +891,23 @@ impl<'a> Emit<'a> {
                     Ok(EV { ty: CType::F64, regs: vec![t] })
                 }
             }
+            "==" | "!=" if lv.ty == CType::Str && rv.ty == CType::Str => {
+                let eq = self.t();
+                self.line(format!(
+                    "{} = call i64 @lu_str_eq(ptr {}, i64 {}, ptr {}, i64 {})",
+                    eq, lv.regs[0], lv.regs[1], rv.regs[0], rv.regs[1]
+                ));
+                if op == "!=" {
+                    let t = self.t();
+                    self.line(format!("{} = xor i64 {}, 1", t, eq));
+                    Ok(EV { ty: CType::Bool, regs: vec![t] })
+                } else {
+                    Ok(EV { ty: CType::Bool, regs: vec![eq] })
+                }
+            }
             "==" | "!=" | "<" | "<=" | ">" | ">=" => {
-                let both_int = matches!(lv.ty, CType::I64 | CType::Bool)
-                    && matches!(rv.ty, CType::I64 | CType::Bool);
+                let both_int = matches!(lv.ty, CType::I64 | CType::Bool | CType::Enum(_))
+                    && matches!(rv.ty, CType::I64 | CType::Bool | CType::Enum(_));
                 let c1 = self.t();
                 if both_int {
                     let cc = match op.as_str() {
@@ -841,7 +976,12 @@ impl<'a> Emit<'a> {
         }
     }
 
-    fn emit_user_call(&mut self, fname: &str, args: Vec<EV>) -> Result<EV, String> {
+    fn emit_user_call(
+        &mut self,
+        fname: &str,
+        args: Vec<EV>,
+        arg_exprs: Option<&[ExprId]>,
+    ) -> Result<EV, String> {
         let decl = self
             .p
             .fns
@@ -861,28 +1001,47 @@ impl<'a> Emit<'a> {
                 parts.push(format!("{} {}", c, r));
             }
         }
-        let rt = ret_ty(self.p, &ret)?;
-        let comps = lty(self.p, &ret)?;
-        if comps.is_empty() {
+        let abi = abi_ret_comps(self.p, decl)?;
+        let rt = comps_ty(&abi);
+        if abi.is_empty() {
             self.line(format!("call void @\"{}\"({})", fname, parts.join(", ")));
             return Ok(EV { ty: CType::Unit, regs: vec![] });
         }
         let c = self.t();
         self.line(format!("{} = call {} @\"{}\"({})", c, rt, fname, parts.join(", ")));
-        if comps.len() == 1 {
-            Ok(EV { ty: ret, regs: vec![c] })
+        let mut all = Vec::new();
+        if abi.len() == 1 {
+            all.push(c);
         } else {
-            let mut regs = Vec::new();
-            for i in 0..comps.len() {
+            for i in 0..abi.len() {
                 let r = self.t();
                 self.line(format!("{} = extractvalue {} {}, {}", r, rt, c, i));
-                regs.push(r);
+                all.push(r);
             }
-            Ok(EV { ty: ret, regs })
         }
+        let ret_w = lty(self.p, &ret)?.len();
+        let regs = all[..ret_w].to_vec();
+        // copy-out: store the returned inout values back into caller variables
+        let mut cursor = ret_w;
+        for (i, ((_, tstr), &io)) in decl.params.iter().zip(decl.inouts.iter()).enumerate() {
+            if io {
+                let t = resolve_type(self.p, tstr)?;
+                let w = lty(self.p, &t)?.len();
+                let vals = all[cursor..cursor + w].to_vec();
+                cursor += w;
+                let arg_exprs =
+                    arg_exprs.ok_or("inout functions cannot be used as operators")?;
+                let Expr::Ident(n) = self.p.expr(arg_exprs[i]) else {
+                    return Err("inout arg must be a variable".into());
+                };
+                let out = EV { ty: t, regs: vals };
+                self.store_var(n, &out)?;
+            }
+        }
+        Ok(EV { ty: ret, regs })
     }
 
-    fn emit_call(&mut self, name: &str, args: Vec<EV>) -> Result<EV, String> {
+    fn emit_call(&mut self, name: &str, args: Vec<EV>, arg_exprs: &[ExprId]) -> Result<EV, String> {
         match name {
             "print" => {
                 for (i, v) in args.iter().enumerate() {
@@ -948,8 +1107,38 @@ impl<'a> Emit<'a> {
                     self.line(format!("{} = fptosi double {} to i64", t, args[0].regs[0]));
                     Ok(EV { ty: CType::I64, regs: vec![t] })
                 } else {
-                    Ok(args[0].clone())
+                    // i64, bool, enum tag: already an integer register
+                    Ok(EV { ty: CType::I64, regs: args[0].regs.clone() })
                 }
+            }
+            "len" if args[0].ty == CType::Str => {
+                Ok(EV { ty: CType::I64, regs: vec![args[0].regs[1].clone()] })
+            }
+            "substr" => {
+                let (p0, l0) = (args[0].regs[0].clone(), args[0].regs[1].clone());
+                let (lo, hi) = (args[1].regs[0].clone(), args[2].regs[0].clone());
+                let neg = self.t();
+                self.line(format!("{} = icmp slt i64 {}, 0", neg, lo));
+                let inv = self.t();
+                self.line(format!("{} = icmp slt i64 {}, {}", inv, hi, lo));
+                let over = self.t();
+                self.line(format!("{} = icmp sgt i64 {}, {}", over, hi, l0));
+                let b1 = self.t();
+                self.line(format!("{} = or i1 {}, {}", b1, neg, inv));
+                let bad = self.t();
+                self.line(format!("{} = or i1 {}, {}", bad, b1, over));
+                let lb = self.l();
+                let lg = self.l();
+                self.line(format!("br i1 {}, label %{}, label %{}", bad, lb, lg));
+                self.label(&lb);
+                self.line(format!("call void @lu_oob(i64 {}, i64 {})", hi, l0));
+                self.line("unreachable".into());
+                self.label(&lg);
+                let np = self.t();
+                self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", np, p0, lo));
+                let nl = self.t();
+                self.line(format!("{} = sub i64 {}, {}", nl, hi, lo));
+                Ok(EV { ty: CType::Str, regs: vec![np, nl] })
             }
             "len" => {
                 let elem = match &args[0].ty {
@@ -985,7 +1174,16 @@ impl<'a> Emit<'a> {
                         ));
                         Ok(EV { ty: CType::Arr(Box::new(CType::I64)), regs: vec![t] })
                     }
-                    t @ CType::Rec(_) => {
+                    t @ (CType::Bool | CType::Enum(_)) => {
+                        let elem = t.clone();
+                        let r = self.t();
+                        self.line(format!(
+                            "{} = call ptr @lu_arr_new_i64(i64 {}, i64 {})",
+                            r, n, args[1].regs[0]
+                        ));
+                        Ok(EV { ty: CType::Arr(Box::new(elem)), regs: vec![r] })
+                    }
+                    t @ (CType::Rec(_) | CType::Str) => {
                         let elem = t.clone();
                         let stride = lty(self.p, &elem)? .len() as i64;
                         let slots = self.t();
@@ -1023,7 +1221,7 @@ impl<'a> Emit<'a> {
                     t => Err(format!("arr of {:?} unsupported in AOT", t)),
                 }
             }
-            _ => self.emit_user_call(name, args),
+            _ => self.emit_user_call(name, args, Some(arg_exprs)),
         }
     }
 }

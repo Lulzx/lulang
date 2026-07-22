@@ -59,6 +59,15 @@ pub extern "C" fn lu_arr_new_raw(n: i64) -> *mut u8 {
     arr_alloc(n)
 }
 
+pub extern "C" fn lu_str_eq(ap: *const u8, al: i64, bp: *const u8, bl: i64) -> i64 {
+    if al != bl {
+        return 0;
+    }
+    let a = unsafe { std::slice::from_raw_parts(ap, al as usize) };
+    let b = unsafe { std::slice::from_raw_parts(bp, bl as usize) };
+    (a == b) as i64
+}
+
 pub extern "C" fn lu_oob(idx: i64, len: i64) {
     eprintln!("error: index {} out of bounds (length {})", idx, len);
     std::process::exit(1);
