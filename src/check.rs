@@ -479,6 +479,7 @@ impl<'a> Checker<'a> {
                         inits.len()
                     ));
                 }
+                let mut initialized = vec![false; decl.fields.len()];
                 for (pos, (fname, e)) in inits.iter().enumerate() {
                     let idx = match fname {
                         Some(f) => decl
@@ -488,6 +489,13 @@ impl<'a> Checker<'a> {
                             .ok_or(format!("type `{}` has no field `{}`", name, f))?,
                         None => pos,
                     };
+                    if initialized[idx] {
+                        return Err(format!(
+                            "field `{}` of `{}` is initialized more than once",
+                            decl.fields[idx].0, name
+                        ));
+                    }
+                    initialized[idx] = true;
                     let expect = self.resolve(&decl.fields[idx].1)?;
                     let got = self.check_expr(*e, scopes)?;
                     if !Self::compat(&expect, &got) {
@@ -499,6 +507,12 @@ impl<'a> Checker<'a> {
                             self.name(&got)
                         ));
                     }
+                }
+                if let Some((idx, _)) = initialized.iter().enumerate().find(|(_, set)| !**set) {
+                    return Err(format!(
+                        "record literal for `{}` is missing field `{}`",
+                        name, decl.fields[idx].0
+                    ));
                 }
                 Ok(Type::Rec(ti))
             }

@@ -1,6 +1,7 @@
 use crate::ast::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::rc::Rc;
 
 const RTOL: f64 = 9.094947017729282e-13; // 2^-40
@@ -11,7 +12,7 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(Rc<String>),
+    Str(Rc<Vec<u8>>),
     Arr(Rc<RefCell<Vec<Value>>>),
     Rec(usize, Rc<Vec<Value>>),
     Enum(usize, i64),
@@ -390,7 +391,7 @@ impl<'a> Interp<'a> {
         match self.p.expr(eid) {
             Expr::Int(v) => Ok(Value::Int(*v)),
             Expr::Float(v) => Ok(Value::Float(*v)),
-            Expr::Str(s) => Ok(Value::Str(Rc::new(s.clone()))),
+            Expr::Str(s) => Ok(Value::Str(Rc::new(s.as_bytes().to_vec()))),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Ident(n) => lookup(env, n).cloned().ok_or(format!("unknown variable `{}`", n)),
             Expr::Un(op, e) => {
@@ -432,7 +433,7 @@ impl<'a> Interp<'a> {
                         .cloned()
                         .ok_or(format!("index {} out of bounds", idx)),
                     Value::Str(s) => s
-                        .as_bytes()
+                        .as_slice()
                         .get(idx as usize)
                         .map(|&b| Value::Int(b as i64))
                         .ok_or(format!("index {} out of bounds (length {})", idx, s.len())),
@@ -588,11 +589,29 @@ impl<'a> Interp<'a> {
     fn call(&self, name: &str, args: Vec<Value>) -> Result<Value, String> {
         match name {
             "print" => {
-                let parts: Vec<String> = args.iter().map(|v| self.display(v)).collect();
-                println!("{}", parts.join(" "));
+                let mut out = std::io::stdout().lock();
+                for (i, v) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b" ").map_err(|e| e.to_string())?;
+                    }
+                    match v {
+                        Value::Str(s) => out.write_all(s).map_err(|e| e.to_string())?,
+                        _ => out
+                            .write_all(self.display(v).as_bytes())
+                            .map_err(|e| e.to_string())?,
+                    }
+                }
+                out.write_all(b"\n").map_err(|e| e.to_string())?;
                 Ok(Value::Unit)
             }
-            "puti" | "putf" | "putb" | "puts" => {
+            "puts" => {
+                let Some(Value::Str(s)) = args.first() else {
+                    return Err("`puts` expects a str".into());
+                };
+                std::io::stdout().write_all(s).map_err(|e| e.to_string())?;
+                Ok(Value::Unit)
+            }
+            "puti" | "putf" | "putb" => {
                 print!("{}", self.display(args.first().ok_or(format!("`{}` needs 1 arg", name))?));
                 Ok(Value::Unit)
             }
@@ -608,24 +627,29 @@ impl<'a> Interp<'a> {
             "arg" => {
                 let i = as_i64(args.first().ok_or("`arg` needs 1 arg".to_string())?)?;
                 let s = crate::runtime::args().get(i as usize).cloned().unwrap_or_default();
-                Ok(Value::Str(Rc::new(s)))
+                Ok(Value::Str(Rc::new(s.into_bytes())))
             }
             "chr" => {
                 let c = as_i64(args.first().ok_or("`chr` needs 1 arg".to_string())?)?;
-                Ok(Value::Str(Rc::new(String::from_utf8_lossy(&[c as u8]).into_owned())))
+                Ok(Value::Str(Rc::new(vec![c as u8])))
             }
             "concat" => {
                 match (&args[0], &args[1]) {
-                    (Value::Str(a), Value::Str(b)) => Ok(Value::Str(Rc::new(format!("{}{}", a, b)))),
+                    (Value::Str(a), Value::Str(b)) => {
+                        let mut bytes = Vec::with_capacity(a.len() + b.len());
+                        bytes.extend_from_slice(a);
+                        bytes.extend_from_slice(b);
+                        Ok(Value::Str(Rc::new(bytes)))
+                    }
                     _ => Err("`concat` expects two strs".into()),
                 }
             }
             "read_file" => {
                 let p = match args.first() {
-                    Some(Value::Str(s)) => s.to_string(),
+                    Some(Value::Str(s)) => String::from_utf8_lossy(s).into_owned(),
                     _ => return Err("`read_file` expects a str".into()),
                 };
-                match std::fs::read_to_string(&p) {
+                match std::fs::read(&p) {
                     Ok(s) => Ok(Value::Str(Rc::new(s))),
                     Err(e) => {
                         eprintln!("error: cannot read {}: {}", p, e);
@@ -636,8 +660,9 @@ impl<'a> Interp<'a> {
             "write_file" => {
                 match (&args[0], &args[1]) {
                     (Value::Str(p), Value::Str(c)) => {
-                        if let Err(e) = std::fs::write(p.as_str(), c.as_bytes()) {
-                            eprintln!("error: cannot write {}: {}", p, e);
+                        let path = String::from_utf8_lossy(p);
+                        if let Err(e) = std::fs::write(path.as_ref(), c.as_slice()) {
+                            eprintln!("error: cannot write {}: {}", path, e);
                             std::process::exit(1);
                         }
                         Ok(Value::Unit)
@@ -683,8 +708,7 @@ impl<'a> Interp<'a> {
                     if lo < 0 || hi < lo || hi as usize > s.len() {
                         return Err(format!("substr {}..{} out of bounds (length {})", lo, hi, s.len()));
                     }
-                    let bytes = &s.as_bytes()[lo as usize..hi as usize];
-                    Ok(Value::Str(Rc::new(String::from_utf8_lossy(bytes).into_owned())))
+                    Ok(Value::Str(Rc::new(s[lo as usize..hi as usize].to_vec())))
                 }
                 _ => Err("`substr` expects (str, i64, i64)".into()),
             },
@@ -705,7 +729,7 @@ impl<'a> Interp<'a> {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => format!("{}", f),
             Value::Bool(b) => b.to_string(),
-            Value::Str(s) => s.to_string(),
+            Value::Str(s) => String::from_utf8_lossy(s).into_owned(),
             Value::Unit => "()".into(),
             Value::Arr(cells) => {
                 let parts: Vec<String> = cells.borrow().iter().map(|v| self.display(v)).collect();

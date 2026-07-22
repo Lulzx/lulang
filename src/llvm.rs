@@ -33,15 +33,6 @@ fn lty(p: &Program, t: &CType) -> Result<Vec<&'static str>, String> {
     })
 }
 
-fn ret_ty(p: &Program, t: &CType) -> Result<String, String> {
-    let c = lty(p, t)?;
-    Ok(match c.len() {
-        0 => "void".into(),
-        1 => c[0].into(),
-        _ => format!("{{ {} }}", c.join(", ")),
-    })
-}
-
 /// ABI return components of a function: declared return + inout param comps.
 fn abi_ret_comps<'x>(p: &Program, f: &FnDecl) -> Result<Vec<&'x str>, String> {
     let ret = resolve_type(p, &f.ret)?;
@@ -747,7 +738,37 @@ impl<'a> Emit<'a> {
                 }
                 Ok(EV { ty: elem, regs })
             }
-            Expr::Array(_) => Err("array literals are not supported by AOT yet (use arr)".into()),
+            Expr::Array(items) => {
+                let values: Result<Vec<EV>, String> =
+                    items.iter().map(|&item| self.emit_expr(item)).collect();
+                let values = values?;
+                let elem = values
+                    .first()
+                    .map(|v| v.ty.clone())
+                    .ok_or("cannot lower an empty array literal")?;
+                let comps = lty(self.p, &elem)?;
+                let logical = values.len() as i64;
+                let slots = logical * comps.len() as i64;
+                let base = self.t();
+                self.line(format!("{} = call ptr @lu_arr_new_raw(i64 {})", base, slots));
+                for (i, v) in values.into_iter().enumerate() {
+                    let regs = if elem == CType::F64 && v.ty == CType::I64 {
+                        vec![self.to_f64(&v)?]
+                    } else {
+                        v.regs
+                    };
+                    let addrs = self.elem_addrs(
+                        &base,
+                        &i.to_string(),
+                        &elem,
+                        Some(logical.to_string()),
+                    )?;
+                    for ((c, reg), addr) in comps.iter().zip(regs.iter()).zip(addrs.iter()) {
+                        self.line(format!("store {} {}, ptr {}", c, reg, addr));
+                    }
+                }
+                Ok(EV { ty: CType::Arr(Box::new(elem)), regs: vec![base] })
+            }
             Expr::Record(name, inits) => {
                 let ti = self
                     .p
@@ -805,9 +826,12 @@ impl<'a> Emit<'a> {
                 let iptr = self.t();
                 self.line(format!("{} = alloca i64", iptr));
                 self.line(format!("store i64 {}, ptr {}", lov.regs[0], iptr));
-                let accp = self.t();
-                self.line(format!("{} = alloca double", accp));
-                self.line(format!("store double 0.0, ptr {}", accp));
+                let faccp = self.t();
+                self.line(format!("{} = alloca double", faccp));
+                self.line(format!("store double 0.0, ptr {}", faccp));
+                let iaccp = self.t();
+                self.line(format!("{} = alloca i64", iaccp));
+                self.line(format!("store i64 0, ptr {}", iaccp));
                 self.env.push(HashMap::new());
                 self.env
                     .last_mut()
@@ -826,12 +850,17 @@ impl<'a> Emit<'a> {
                 self.label(&lb);
                 let bv = self.emit_expr(*body)?;
                 let bty = bv.ty.clone();
-                let f = self.to_f64(&bv)?;
                 let cur = self.t();
-                self.line(format!("{} = load double, ptr {}", cur, accp));
                 let nx = self.t();
-                self.line(format!("{} = fadd fast double {}, {}", nx, cur, f));
-                self.line(format!("store double {}, ptr {}", nx, accp));
+                if bty == CType::I64 {
+                    self.line(format!("{} = load i64, ptr {}", cur, iaccp));
+                    self.line(format!("{} = add i64 {}, {}", nx, cur, bv.regs[0]));
+                    self.line(format!("store i64 {}, ptr {}", nx, iaccp));
+                } else {
+                    self.line(format!("{} = load double, ptr {}", cur, faccp));
+                    self.line(format!("{} = fadd fast double {}, {}", nx, cur, bv.regs[0]));
+                    self.line(format!("store double {}, ptr {}", nx, faccp));
+                }
                 let iv2 = self.t();
                 self.line(format!("{} = load i64, ptr {}", iv2, iptr));
                 let nxt = self.t();
@@ -841,13 +870,13 @@ impl<'a> Emit<'a> {
                 self.label(&lx);
                 self.env.pop();
                 self.trusted.truncate(self.trusted.len() - pushed);
-                let total = self.t();
-                self.line(format!("{} = load double, ptr {}", total, accp));
                 if bty == CType::I64 {
-                    let ti = self.t();
-                    self.line(format!("{} = fptosi double {} to i64", ti, total));
-                    Ok(EV { ty: CType::I64, regs: vec![ti] })
+                    let total = self.t();
+                    self.line(format!("{} = load i64, ptr {}", total, iaccp));
+                    Ok(EV { ty: CType::I64, regs: vec![total] })
                 } else {
+                    let total = self.t();
+                    self.line(format!("{} = load double, ptr {}", total, faccp));
                     Ok(EV { ty: CType::F64, regs: vec![total] })
                 }
             }
