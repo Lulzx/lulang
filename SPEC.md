@@ -188,8 +188,14 @@ and the callee stores the final value through it before returning — copy-out
 values can exceed what return registers hold (e.g. `inout p: Parser`).
 
 First artifacts: [selfhost/lexer.lu](selfhost/lexer.lu) — the lulang lexer in
-lulang — and [selfhost/parser.lu](selfhost/parser.lu) — a recursive-descent
+lulang — [selfhost/parser.lu](selfhost/parser.lu) — a recursive-descent
 Pratt parser for the core language, building a flat index-based AST out of
 record arrays (the same architecture as the Rust compiler) and printing a
-deterministic pre-order dump. Both produce byte-identical output under
-`lu interp`, `lu run`, and `lu build`.
+deterministic pre-order dump — and [selfhost/checker.lu](selfhost/checker.lu)
+— a typechecker over that flat AST mirroring `src/check.rs`: types are i64
+codes (`i64/f64/bool/str/()` = 0–4, `[T]` = T+8), scopes are a linear symbol
+stack, and the rules match the Rust checker (int→float widening, bool
+conditions, exact-type `var` for `inout` args, fixed builtin signatures). Its
+driver checks 2 well-typed and 10 ill-typed programs, reporting the first
+error. All three produce byte-identical output under `lu interp`, `lu run`,
+and `lu build`.
