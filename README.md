@@ -160,7 +160,7 @@ oracle that catches a bug codegen.lu would faithfully preserve in itself):
 |---|---|
 | M0 — spec + benchmark corpus | done |
 | M1 — lexer, parser, typechecker, interpreter | done |
-| M2 — Cranelift JIT (`lu run`): inlining, 4-acc `sum`, hoisted bounds checks, opt_level=speed | done — 2.6× over Bun on dot; slerp needs pure-call LICM |
+| M2 — Cranelift JIT (`lu run`): inlining, 4-acc `sum`, hoisted bounds checks, opt_level=speed | done — 2.6× over Bun on dot; pure-call LICM hoists invariant math libcalls (slerp's `acos(d)`/`sin(th)` under `LU_MATH=call`: 2.1×, at parity with the inline kernels) |
 | M3 — LLVM AOT (`lu build`): fast-flagged IR via clang | **done — 2.08× geomean over idiomatic C++, inside AE's claimed band** |
 | M4 — property engine with counterexample shrinking | done |
 | M5 — middle-end: inline math kernels, if-conversion + LICM, SIMD `sum`, SoA record arrays | **done — JIT slerp 1.7×, dot 1.3×; record-array kernel beats idiomatic C++ `-O3` by 1.4× in both tiers** |

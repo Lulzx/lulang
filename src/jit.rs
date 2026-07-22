@@ -64,6 +64,7 @@ pub struct Jit<'a> {
     inline_math: bool,
     fns: HashMap<String, FnInfo>,
     imports: HashMap<&'static str, FuncId>,
+    pure_imports: std::collections::HashSet<u32>,
 }
 
 impl<'a> Jit<'a> {
@@ -132,6 +133,7 @@ impl<'a> Jit<'a> {
             inline_math,
             fns: HashMap::new(),
             imports: HashMap::new(),
+            pure_imports: std::collections::HashSet::new(),
         };
         jit.declare_imports()?;
         jit.declare_fns()?;
@@ -173,7 +175,7 @@ impl<'a> Jit<'a> {
             ("lu_chr", 1, &[types::I64], false),
             ("lu_concat", 1, &[types::I64, types::I64, types::I64, types::I64], false),
         ];
-        for (name, kind, params, _) in specs {
+        for (name, kind, params, pure) in specs {
             let mut sig = self.module.make_signature();
             for &t in params.iter() {
                 sig.params.push(AbiParam::new(t));
@@ -188,6 +190,9 @@ impl<'a> Jit<'a> {
                 .declare_function(name, Linkage::Import, &sig)
                 .map_err(|e| e.to_string())?;
             self.imports.insert(name, id);
+            if *pure {
+                self.pure_imports.insert(id.as_u32());
+            }
         }
         Ok(())
     }
@@ -310,7 +315,7 @@ impl<'a> Jit<'a> {
         ctx.optimize(self.opt_isa.as_ref(), &mut Default::default())
             .map_err(|e| e.to_string())?;
         if self.do_licm {
-            licm(&mut ctx.func);
+            licm(&mut ctx.func, &self.pure_imports);
         }
         self.module.define_function(info_id, &mut ctx).map_err(|e| e.to_string())?;
         self.module.clear_context(&mut ctx);
@@ -359,7 +364,7 @@ impl<'a> Jit<'a> {
         ctx.optimize(self.opt_isa.as_ref(), &mut Default::default())
             .map_err(|e| e.to_string())?;
         if self.do_licm {
-            licm(&mut ctx.func);
+            licm(&mut ctx.func, &self.pure_imports);
         }
         if std::env::var("LU_DUMP").is_ok() {
             eprintln!("{}", ctx.func.display());
@@ -378,12 +383,34 @@ impl<'a> Jit<'a> {
 /// preheader at a shallower loop depth, move pure non-trapping instructions
 /// whose operands are all defined outside the loop to the preheader, to a
 /// fixpoint. Speculation is safe by construction — hoisted instructions
-/// cannot trap, load, store, or call.
-fn licm(func: &mut cranelift_codegen::ir::Function) {
+/// cannot trap, load, store, or call, with one exception: calls to the
+/// runtime's pure math imports (`pure_imports`, sin/cos/acos/atan2/pow/fmod —
+/// total over f64, non-trapping, no observable state), which under
+/// `LU_MATH=call` are what keep slerp's invariant `acos(d)`/`sin(th)` chain
+/// pinned inside the loop.
+fn licm(func: &mut cranelift_codegen::ir::Function, pure_imports: &std::collections::HashSet<u32>) {
     use cranelift_codegen::dominator_tree::DominatorTree;
     use cranelift_codegen::flowgraph::ControlFlowGraph;
     use cranelift_codegen::ir::Block;
     use cranelift_codegen::loop_analysis::LoopAnalysis;
+
+    // A call is hoistable iff its target is one of the whitelisted pure
+    // math imports (module namespace 0, FuncId index in `pure_imports`).
+    let pure_call = |func: &cranelift_codegen::ir::Function,
+                     inst: cranelift_codegen::ir::Inst| {
+        use cranelift_codegen::ir::{ExternalName, InstructionData};
+        let InstructionData::Call { func_ref, .. } = func.dfg.insts[inst] else {
+            return false;
+        };
+        match func.dfg.ext_funcs[func_ref].name {
+            ExternalName::User(r) => func
+                .params
+                .user_named_funcs()
+                .get(r)
+                .is_some_and(|n| n.namespace == 0 && pure_imports.contains(&n.index)),
+            _ => false,
+        }
+    };
 
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
@@ -418,14 +445,15 @@ fn licm(func: &mut cranelift_codegen::ir::Function) {
                 while let Some(inst) = next {
                     next = func.layout.next_inst(inst);
                     let op = func.dfg.insts[inst].opcode();
-                    if op.is_branch()
+                    if (op.is_branch()
                         || op.is_call()
                         || op.is_return()
                         || op.is_terminator()
                         || op.can_load()
                         || op.can_store()
                         || op.can_trap()
-                        || op.other_side_effects()
+                        || op.other_side_effects())
+                        && !(op.is_call() && pure_call(func, inst))
                     {
                         continue;
                     }
