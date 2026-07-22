@@ -34,7 +34,7 @@ fn comps(p: &Program, t: &CType) -> Result<Vec<cranelift_codegen::ir::Type>, Str
     })
 }
 
-fn field_offset(p: &Program, ti: usize, field: &str) -> Result<(usize, CType), String> {
+pub fn field_offset(p: &Program, ti: usize, field: &str) -> Result<(usize, CType), String> {
     let mut off = 0;
     for (n, ft) in &p.types[ti].fields {
         let t = resolve_type(p, ft)?;
@@ -287,11 +287,11 @@ struct Gen<'a, 'b> {
 /// Find arrays indexed as `a[i]` (i = the loop variable) in a loop body, so the
 /// bounds check can be hoisted to loop entry. Returns None (trust nothing) if the
 /// body shadows the loop variable or rebinds/reassigns any candidate array.
-fn scan_trusted_expr(p: &Program, e: ExprId, var: &str, arrays: &mut Vec<String>, ok: &mut bool) {
+pub fn scan_trusted_expr(p: &Program, e: ExprId, var: &str, arrays: &mut Vec<String>, ok: &mut bool) {
     walk_e(p, e, var, arrays, ok)
 }
 
-fn scan_trusted(p: &Program, stmts: &[StmtId], var: &str) -> Option<Vec<String>> {
+pub fn scan_trusted(p: &Program, stmts: &[StmtId], var: &str) -> Option<Vec<String>> {
     let mut arrays = Vec::new();
     let mut ok = true;
     walk_s(p, stmts, var, &mut arrays, &mut ok);

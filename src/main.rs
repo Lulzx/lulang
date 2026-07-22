@@ -3,13 +3,14 @@ mod check;
 mod interp;
 mod jit;
 mod lexer;
+mod llvm;
 mod parser;
 mod runtime;
 
 use std::process::ExitCode;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: lu <run|test> <file.lu>");
+    eprintln!("usage: lu <run|build|test|interp> <file.lu>");
     ExitCode::FAILURE
 }
 
@@ -39,6 +40,11 @@ fn main() -> ExitCode {
             }
             "interp" => {
                 interp::Interp::new(&p.prog).run_main()?;
+                Ok(true)
+            }
+            "build" => {
+                let out = llvm::build(&p.prog, path, None)?;
+                eprintln!("built ./{}", out);
                 Ok(true)
             }
             "test" => interp::Interp::new(&p.prog).run_properties(100),
