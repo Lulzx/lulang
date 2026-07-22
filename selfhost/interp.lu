@@ -1855,6 +1855,11 @@ fn eval_call(p: P, inout m: M, e: i64): V {
   if name == "arr" {
     let cnt = eval_expr(p, m, argv[0])
     let init = eval_expr(p, m, argv[1])
+    if cnt.i < 0 or cnt.i > len(m.heap) - m.hp {
+      print("runtime error: invalid array length", cnt.i)
+      m.halt = 1
+      return vunit()
+    }
     let o = m.hp
     m.hp = m.hp + cnt.i
     for j in 0..cnt.i {

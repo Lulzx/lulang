@@ -1,6 +1,8 @@
 mod ast;
+mod backend;
 mod check;
 mod interp;
+mod ir;
 mod jit;
 mod lexer;
 mod llvm;
@@ -57,22 +59,22 @@ fn run_pipeline(mode: &str, path: &str, src: &str) -> Result<bool, String> {
         let toks = lexer::lex(&src)?;
         let mut p = parser::Parser::new(toks);
         p.parse()?;
-        check::Checker::check(&p.prog)?;
+        let ir = ir::TypedProgram::lower(p.prog)?;
         match mode {
             "run" => {
-                jit::Jit::run(&p.prog)?;
+                jit::Jit::run(&ir)?;
                 Ok(true)
             }
             "interp" => {
-                interp::Interp::new(&p.prog).run_main()?;
+                interp::Interp::new(&ir).run_main()?;
                 Ok(true)
             }
             "build" => {
-                let out = llvm::build(&p.prog, path, None)?;
+                let out = llvm::build(&ir, path, None)?;
                 eprintln!("built ./{}", out);
                 Ok(true)
             }
-            "test" => interp::Interp::new(&p.prog).run_properties(100),
+            "test" => interp::Interp::new(&ir).run_properties(100),
             m => Err(format!("unknown mode `{}`", m)),
         }
     })()

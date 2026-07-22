@@ -1,4 +1,5 @@
 use crate::ast::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -73,17 +74,23 @@ pub struct Checker<'a> {
     p: &'a Program,
     type_ids: HashMap<String, usize>,
     sigs: HashMap<String, (Vec<Type>, Vec<bool>, Type)>,
+    expr_types: RefCell<Vec<Option<Type>>>,
 }
 
 type Scope = HashMap<String, (Type, bool)>; // type, is-mutable
 
 impl<'a> Checker<'a> {
-    pub fn check(p: &'a Program) -> Result<(), String> {
+    pub fn check_types(p: &'a Program) -> Result<Vec<Option<Type>>, String> {
         let mut type_ids = HashMap::new();
         for (i, t) in p.types.iter().enumerate() {
             type_ids.insert(t.name.clone(), i);
         }
-        let mut c = Checker { p, type_ids, sigs: HashMap::new() };
+        let mut c = Checker {
+            p,
+            type_ids,
+            sigs: HashMap::new(),
+            expr_types: RefCell::new(vec![None; p.exprs.len()]),
+        };
         for f in &p.fns {
             let params: Result<Vec<Type>, String> =
                 f.params.iter().map(|(_, t)| c.resolve(t)).collect();
@@ -108,7 +115,7 @@ impl<'a> Checker<'a> {
             let mut scopes: Vec<Scope> = vec![HashMap::new()];
             c.check_block(main, &mut scopes, &Type::Unit)?;
         }
-        Ok(())
+        Ok(c.expr_types.into_inner())
     }
 
     fn resolve(&self, s: &str) -> Result<Type, String> {
@@ -345,7 +352,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_expr(&self, eid: ExprId, scopes: &mut Vec<Scope>) -> Result<Type, String> {
-        match self.p.expr(eid) {
+        let result = match self.p.expr(eid) {
             Expr::Int(_) => Ok(Type::I64),
             Expr::Float(_) => Ok(Type::F64),
             Expr::Str(_) => Ok(Type::Str),
@@ -377,7 +384,9 @@ impl<'a> Checker<'a> {
                             self.name(&rt)
                         ));
                     }
-                    return Ok(ret.clone());
+                    let ty = ret.clone();
+                    self.expr_types.borrow_mut()[eid as usize] = Some(ty.clone());
+                    return Ok(ty);
                 }
                 match op.as_str() {
                     "and" | "or" => {
@@ -735,6 +744,10 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+        };
+        if let Ok(ty) = &result {
+            self.expr_types.borrow_mut()[eid as usize] = Some(ty.clone());
         }
+        result
     }
 }

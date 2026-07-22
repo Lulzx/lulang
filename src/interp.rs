@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::ir::TypedProgram;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -80,7 +81,8 @@ fn approx_eq(a: f64, b: f64) -> bool {
 }
 
 impl<'a> Interp<'a> {
-    pub fn new(p: &'a Program) -> Self {
+    pub fn new(ir: &'a TypedProgram) -> Self {
+        let p = ir.program();
         let mut fns = HashMap::new();
         for (i, f) in p.fns.iter().enumerate() {
             fns.insert(f.name.clone(), i);
@@ -397,7 +399,7 @@ impl<'a> Interp<'a> {
             Expr::Un(op, e) => {
                 let v = self.eval(*e, env)?;
                 match (op.as_str(), v) {
-                    ("-", Value::Int(i)) => Ok(Value::Int(-i)),
+                    ("-", Value::Int(i)) => Ok(Value::Int(i.wrapping_neg())),
                     ("-", Value::Float(f)) => Ok(Value::Float(-f)),
                     ("not", Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (op, v) => Err(format!("cannot apply `{}` to {:?}", op, v)),
@@ -487,7 +489,7 @@ impl<'a> Interp<'a> {
                     match self.eval(*body, env)? {
                         Value::Int(v) => {
                             acc += v as f64;
-                            int_acc = int_acc.map(|a| a + v);
+                            int_acc = int_acc.map(|a| a.wrapping_add(v));
                         }
                         Value::Float(v) => {
                             acc += v;
@@ -535,18 +537,24 @@ impl<'a> Interp<'a> {
         match op {
             "+" | "-" | "*" | "/" | "%" => match (&lv, &rv) {
                 (Value::Int(a), Value::Int(b)) => Ok(Value::Int(match op {
-                    "+" => a + b,
-                    "-" => a - b,
-                    "*" => a * b,
+                    "+" => a.wrapping_add(*b),
+                    "-" => a.wrapping_sub(*b),
+                    "*" => a.wrapping_mul(*b),
                     "/" => {
                         if *b == 0 {
                             return Err("integer division by zero".into());
+                        }
+                        if *a == i64::MIN && *b == -1 {
+                            return Err("integer division overflow".into());
                         }
                         a / b
                     }
                     _ => {
                         if *b == 0 {
                             return Err("integer modulo by zero".into());
+                        }
+                        if *a == i64::MIN && *b == -1 {
+                            return Err("integer division overflow".into());
                         }
                         a % b
                     }
@@ -714,8 +722,17 @@ impl<'a> Interp<'a> {
             },
             "arr" => {
                 let n = as_i64(&args[0])?;
+                if n < 0 {
+                    return Err(format!("invalid array length {}", n));
+                }
                 let init = args.get(1).cloned().unwrap_or(Value::Float(0.0));
-                Ok(Value::Arr(Rc::new(RefCell::new(vec![init; n as usize]))))
+                let n = usize::try_from(n).map_err(|_| "array allocation size overflow")?;
+                let mut cells = Vec::new();
+                cells
+                    .try_reserve_exact(n)
+                    .map_err(|_| "array allocation failed".to_string())?;
+                cells.resize(n, init);
+                Ok(Value::Arr(Rc::new(RefCell::new(cells))))
             }
             _ => {
                 let fi = *self.fns.get(name).ok_or(format!("unknown function `{}`", name))?;
