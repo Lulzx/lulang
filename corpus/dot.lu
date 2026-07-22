@@ -1,0 +1,16 @@
+// dot.lu — reduction kernel via the order-free `sum` primitive.
+
+fn dot(a: [f64], b: [f64], n: i64): f64 {
+  return sum(i in 0..n) a[i] * b[i]
+}
+
+main {
+  let n = 100000
+  var a = arr(n, 0.0)
+  var b = arr(n, 0.0)
+  for i in 0..n {
+    a[i] = float(i) * 0.001
+    b[i] = float(i) * 0.002
+  }
+  print("dot:", dot(a, b, n))
+}
