@@ -1233,7 +1233,9 @@ type M {
   heap: [V], hp: i64,
   vname: [str], vval: [V], nv: i64, fp: i64,
   ret: V, returned: i64,
-  halt: i64
+  halt: i64,
+  // the guest program's arg(i) maps to our arg(i + argbase)
+  argbase: i64
 }
 
 fn vunit(): V { return V { t: 4, i: 0, f: 0.0, s: "", o: 0, n: 0 } }
@@ -1385,14 +1387,14 @@ fn eval_call(p: P, inout m: M, e: i64): V {
   }
   if name == "nargs" {
     // interpreter convention: the interpreted program sees our args shifted
-    // by one — arg(0) here was the source path, its arg(0) is our arg(1)
-    var k = nargs() - 1
+    // past the ones the driver consumed (source path and any flags)
+    var k = nargs() - m.argbase
     if k < 0 { k = 0 }
     return vint(k)
   }
   if name == "arg" {
     let i = eval_expr(p, m, argv[0])
-    return vstr(arg(i.i + 1))
+    return vstr(arg(i.i + m.argbase))
   }
   if name == "read_file" {
     let v = eval_expr(p, m, argv[0])
@@ -1680,7 +1682,7 @@ fn exec_block(p: P, inout m: M, s0: i64) {
 
 // ---------- driver ----------
 
-fn run_src(src: str) {
+fn run_src(src: str, heapfac: i64, argbase: i64) {
   var lx = Lexer { src: src, pos: 0 }
   let cap = len(src) + 2
   var toks = arr(cap, Token { kind: Kind.KEof, text: "", num: 0.0 })
@@ -1723,12 +1725,14 @@ fn run_src(src: str) {
   }
   if p.mainbody >= 0 {
     var m = M {
-      // sized from measurement: evaluating this file itself peaks at about
-      // 182 heap slots per source byte (record-literal blocks + copies)
-      heap: arr(len(src) * 256 + 65536, vunit()), hp: 0,
+      // default 256 slots/byte comes from measurement: evaluating this file
+      // itself peaks at ~182 (record-literal blocks + copies); deeper towers
+      // need more, via --heap
+      heap: arr(len(src) * heapfac + 65536, vunit()), hp: 0,
       vname: arr(8192, ""), vval: arr(8192, vunit()), nv: 0, fp: 0,
       ret: vunit(), returned: 0,
-      halt: 0
+      halt: 0,
+      argbase: argbase
     }
     exec_block(p, m, p.mainbody)
   }
@@ -1736,15 +1740,33 @@ fn run_src(src: str) {
 
 fn run(label: str, src: str) {
   print(label)
-  run_src(src)
+  run_src(src, 256, 1)
+}
+
+fn atoi(s: str): i64 {
+  var v = 0
+  var i = 0
+  while i < len(s) {
+    v = v * 10 + (s[i] - '0')
+    i = i + 1
+  }
+  return v
 }
 
 main {
-  // file mode: `lu run selfhost/interp.lu <program.lu> [its args...]` — the
-  // interpreted program sees the remaining arguments as its own. Passing
-  // this very file as the program stacks interpreters into a tower.
+  // file mode: `lu run selfhost/interp.lu [--heap N] <program.lu> [args...]`
+  // — the interpreted program sees the remaining arguments as its own, so
+  // passing this very file as the program stacks interpreters into a tower.
+  // --heap N sets value-heap slots per guest source byte (default 256);
+  // each extra tower level needs roughly 10x more.
   if nargs() > 0 {
-    run_src(read_file(arg(0)))
+    var fac = 256
+    var pi = 0
+    if arg(0) == "--heap" and nargs() >= 3 {
+      fac = atoi(arg(1))
+      pi = 2
+    }
+    run_src(read_file(arg(pi)), fac, pi + 1)
     return
   }
   run("== fib", "fn fib(n: i64): i64 {\n  if n < 2 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\nmain {\n  print(fib(20))\n}\n")

@@ -4,7 +4,56 @@
 #include <stdlib.h>
 #include <string.h>
 
-void lu_print_f64(double v) { printf("%.17g", v); }
+/* Shortest round-trip decimal, plain notation — matches Rust's f64 Display
+   (the JIT/interp tiers print through it), so all tiers agree byte-for-byte:
+   fewest digits that parse back exactly, never scientific notation. */
+void lu_print_f64(double v) {
+  if (v != v) {
+    printf("NaN");
+    return;
+  }
+  if (v > 1.7976931348623157e308) {
+    printf("inf");
+    return;
+  }
+  if (v < -1.7976931348623157e308) {
+    printf("-inf");
+    return;
+  }
+  char buf[64];
+  int p;
+  for (p = 0; p < 17; p++) {
+    snprintf(buf, sizeof buf, "%.*e", p, v);
+    if (strtod(buf, 0) == v) break;
+  }
+  const char *s = buf;
+  if (*s == '-') {
+    putchar('-');
+    s++;
+  }
+  char digits[32];
+  long long nd = 0;
+  digits[nd++] = *s++;
+  if (*s == '.') {
+    s++;
+    while (*s && *s != 'e') digits[nd++] = *s++;
+  }
+  while (*s && *s != 'e') s++;
+  long long e10 = strtoll(s + 1, 0, 10);
+  while (nd > 1 && digits[nd - 1] == '0') nd--;
+  if (e10 >= nd - 1) { /* integer, possibly with trailing zeros */
+    fwrite(digits, 1, (size_t)nd, stdout);
+    for (long long i = 0; i < e10 - (nd - 1); i++) putchar('0');
+  } else if (e10 >= 0) { /* decimal point inside the digits */
+    fwrite(digits, 1, (size_t)e10 + 1, stdout);
+    putchar('.');
+    fwrite(digits + e10 + 1, 1, (size_t)(nd - e10 - 1), stdout);
+  } else { /* leading 0.000... */
+    printf("0.");
+    for (long long i = 0; i < -e10 - 1; i++) putchar('0');
+    fwrite(digits, 1, (size_t)nd, stdout);
+  }
+}
 void lu_print_i64(long long v) { printf("%lld", v); }
 void lu_print_bool(long long v) { printf(v ? "true" : "false"); }
 void lu_print_str(const char *p, long long n) { fwrite(p, 1, (size_t)n, stdout); }

@@ -210,7 +210,16 @@ byte-identical output to the same programs under `lu run`, and
 `lu run selfhost/interp.lu selfhost/interp.lu fib.lu` runs a two-level
 interpreter tower — interp.lu interpreting its own 1,750-line source, which
 then interprets fib — verified to print the same answer in all three tiers
-(0.9 s AOT, 2.4 s JIT, 160 s host interpreter). All
+(0.9 s AOT, 2.4 s JIT, 160 s host interpreter). Towers go deeper with more
+value-heap: `--heap N` sets slots per guest source byte (default 256, each
+level multiplies the cost ~10×), and flags pass through levels, so
+
+```
+./interp --heap 4000 selfhost/interp.lu --heap 190 selfhost/interp.lu fib5.lu
+```
+
+runs a **three-level** tower — lulang on lulang on lulang on native — in
+2.9 s (AOT, ~11 GB value heap). All
 four artifacts produce byte-identical output under `lu interp`, `lu run`,
 and `lu build`.
 
@@ -221,6 +230,12 @@ are newline-free print primitives (the evaluator uses them to reproduce host
 `print` formatting exactly). The self-hosted interpreter shifts `arg` by one
 for the program it runs — the unix interpreter convention that makes
 unmodified towers possible.
+
+**Float printing.** All tiers print f64 as the shortest decimal that parses
+back exactly, in plain notation (never scientific) — Rust's `Display`
+semantics. The interp/JIT tiers print through Rust; the C runtime implements
+the same contract (probe `%.*e` precisions until `strtod` round-trips, then
+re-render without the exponent), so AOT output is byte-identical too.
 
 Self-hosting has now surfaced and fixed three compiler gaps: float `%`
 (JIT calls `lu_fmod`, AOT emits `frem`, matching Rust's libm `%`), an
