@@ -1,0 +1,1387 @@
+// selfhost/interp.lu — the complete lulang front end *and* evaluator, written
+// in lulang (M6, rung 3 of the self-hosting ladder — this closes the loop:
+// lulang programs running on a lulang-written implementation). Pipeline:
+// lexer (extended with char literals) -> Pratt parser -> typechecker (same as
+// selfhost/checker.lu, quiet on success) -> tree-walking evaluator.
+//
+// Evaluator model: values are tagged records V (0=i64 1=f64 2=bool 3=str
+// 4=unit, >=8 array of tag-8); arrays live in a bump-allocated heap of value
+// slots; variables live on a linear env stack with a frame pointer per call;
+// `inout` params copy their final value back into the caller's variable after
+// the call; `and`/`or` short-circuit; int widens to float on assignment,
+// argument passing, array store, and return. Programs whose `print` calls
+// take a single argument produce byte-identical output to the host tiers,
+// which is how the driver's transcript is verified against `lu run`.
+
+// ---------- lexer (same as selfhost/lexer.lu) ----------
+
+enum Kind { KIdent, KInt, KFloat, KStr, KSym, KNewline, KEof, KError }
+
+type Token { kind: Kind, text: str, num: f64 }
+type Lexer { src: str, pos: i64 }
+
+fn is_digit(c: i64): bool { return c >= '0' and c <= '9' }
+
+fn is_alpha(c: i64): bool {
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'
+}
+
+fn is_ident_char(c: i64): bool { return is_alpha(c) or is_digit(c) }
+
+fn is_two_sym(a: i64, b: i64): bool {
+  if b != '=' {
+    if a == '.' and b == '.' { return true }
+    if a == '|' and b == '>' { return true }
+    return false
+  }
+  return a == '=' or a == '!' or a == '<' or a == '>' or a == '~'
+}
+
+fn skip_space(inout lx: Lexer) {
+  let n = len(lx.src)
+  var going = true
+  while going {
+    going = false
+    if lx.pos < n {
+      let c = lx.src[lx.pos]
+      if c == ' ' or c == '\t' or c == '\r' {
+        lx.pos = lx.pos + 1
+        going = true
+      }
+      if c == '/' and lx.pos + 1 < n and lx.src[lx.pos + 1] == '/' {
+        while lx.pos < n and lx.src[lx.pos] != '\n' { lx.pos = lx.pos + 1 }
+        going = true
+      }
+    }
+  }
+}
+
+fn lex_number(inout lx: Lexer): Token {
+  let s = lx.pos
+  let n = len(lx.src)
+  var v = 0.0
+  var isf = false
+  while lx.pos < n and is_digit(lx.src[lx.pos]) {
+    v = v * 10.0 + float(lx.src[lx.pos] - '0')
+    lx.pos = lx.pos + 1
+  }
+  if lx.pos + 1 < n and lx.src[lx.pos] == '.' and is_digit(lx.src[lx.pos + 1]) {
+    isf = true
+    lx.pos = lx.pos + 1
+    var scale = 0.1
+    while lx.pos < n and is_digit(lx.src[lx.pos]) {
+      v = v + float(lx.src[lx.pos] - '0') * scale
+      scale = scale * 0.1
+      lx.pos = lx.pos + 1
+    }
+  }
+  var k = Kind.KInt
+  if isf { k = Kind.KFloat }
+  return Token { kind: k, text: substr(lx.src, s, lx.pos), num: v }
+}
+
+fn lex_string(inout lx: Lexer): Token {
+  let n = len(lx.src)
+  lx.pos = lx.pos + 1
+  let s = lx.pos
+  while lx.pos < n and lx.src[lx.pos] != '"' {
+    if lx.src[lx.pos] == '\\' and lx.pos + 1 < n { lx.pos = lx.pos + 1 }
+    lx.pos = lx.pos + 1
+  }
+  if lx.pos >= n {
+    return Token { kind: Kind.KError, text: "unterminated string", num: 0.0 }
+  }
+  let body = substr(lx.src, s, lx.pos)
+  lx.pos = lx.pos + 1
+  return Token { kind: Kind.KStr, text: body, num: 0.0 }
+}
+
+fn lex_char(inout lx: Lexer): Token {
+  // byte-char literal: 'a', '\n', '\\', '\0' — value is the byte as i64
+  let n = len(lx.src)
+  lx.pos = lx.pos + 1
+  if lx.pos >= n {
+    return Token { kind: Kind.KError, text: "unterminated char literal", num: 0.0 }
+  }
+  var c = lx.src[lx.pos]
+  if c == '\\' {
+    lx.pos = lx.pos + 1
+    if lx.pos >= n {
+      return Token { kind: Kind.KError, text: "unterminated char literal", num: 0.0 }
+    }
+    let e = lx.src[lx.pos]
+    c = e
+    if e == 'n' { c = '\n' }
+    if e == 't' { c = '\t' }
+    if e == 'r' { c = '\r' }
+    if e == '0' { c = '\0' }
+  }
+  lx.pos = lx.pos + 1
+  if lx.pos >= n or lx.src[lx.pos] != '\'' {
+    return Token { kind: Kind.KError, text: "unterminated char literal", num: 0.0 }
+  }
+  lx.pos = lx.pos + 1
+  return Token { kind: Kind.KInt, text: "", num: float(c) }
+}
+
+fn next_token(inout lx: Lexer): Token {
+  skip_space(lx)
+  let n = len(lx.src)
+  if lx.pos >= n { return Token { kind: Kind.KEof, text: "", num: 0.0 } }
+  let c = lx.src[lx.pos]
+  if c == '\n' {
+    lx.pos = lx.pos + 1
+    return Token { kind: Kind.KNewline, text: "", num: 0.0 }
+  }
+  if c == '\'' { return lex_char(lx) }
+  if is_alpha(c) {
+    let s = lx.pos
+    while lx.pos < n and is_ident_char(lx.src[lx.pos]) { lx.pos = lx.pos + 1 }
+    return Token { kind: Kind.KIdent, text: substr(lx.src, s, lx.pos), num: 0.0 }
+  }
+  if is_digit(c) { return lex_number(lx) }
+  if c == '"' { return lex_string(lx) }
+  if lx.pos + 1 < n and is_two_sym(c, lx.src[lx.pos + 1]) {
+    let s = lx.pos
+    lx.pos = lx.pos + 2
+    return Token { kind: Kind.KSym, text: substr(lx.src, s, lx.pos), num: 0.0 }
+  }
+  let s = lx.pos
+  lx.pos = lx.pos + 1
+  return Token { kind: Kind.KSym, text: substr(lx.src, s, lx.pos), num: 0.0 }
+}
+
+// ---------- flat AST ----------
+
+enum EK { ENum, EStr, EIdent, EBin, EUn, ECall, EIndex, EField, EArg }
+// ENum: num, b=1 if float literal | EStr/EIdent: text
+// EBin: text=op a=l b=r | EUn: text=op a
+// ECall: text=name a=arg-chain(-1 none) | EIndex: a=base b=idx
+// EField: a=base text=field | EArg: a=expr b=next(-1)
+type ENode { kind: EK, a: i64, b: i64, num: f64, text: str }
+
+enum SK { SLet, SVar, SAssign, SIf, SFor, SWhile, SReturn, SExpr }
+// SLet/SVar: text=name a=init | SAssign: a=target b=value
+// SIf: a=cond b=then-chain c=else-chain(-1) | SFor: text=var a=lo b=hi c=body
+// SWhile: a=cond b=body | SReturn: a=expr(-1 none) | SExpr: a
+// every stmt: nxt = next in block chain (-1 ends)
+type SNode { kind: SK, a: i64, b: i64, c: i64, nxt: i64, text: str }
+
+// type codes: 0=i64 1=f64 2=bool 3=str 4=unit 5=error; [T] = T + 8
+type P {
+  toks: [Token], nt: i64, pos: i64,
+  en: [ENode], ne: i64,
+  sn: [SNode], ns: i64,
+  fname: [str], fret: [i64], fpo: [i64], fnp: [i64], fbody: [i64], nf: i64,
+  pname: [str], ptype: [i64], pmut: [i64], np: i64,
+  mainbody: i64,
+  err: i64
+}
+
+fn new_expr(inout p: P, k: EK, a: i64, b: i64, num: f64, text: str): i64 {
+  let id = p.ne
+  p.en[id] = ENode { kind: k, a: a, b: b, num: num, text: text }
+  p.ne = id + 1
+  return id
+}
+
+fn new_stmt(inout p: P, k: SK, a: i64, b: i64, c: i64, text: str): i64 {
+  let id = p.ns
+  p.sn[id] = SNode { kind: k, a: a, b: b, c: c, nxt: -1, text: text }
+  p.ns = id + 1
+  return id
+}
+
+// ---------- token cursor ----------
+
+fn cur_is_sym(p: P, s: str): bool {
+  let t = p.toks[p.pos]
+  return t.kind == Kind.KSym and t.text == s
+}
+
+fn cur_is_kw(p: P, s: str): bool {
+  let t = p.toks[p.pos]
+  return t.kind == Kind.KIdent and t.text == s
+}
+
+fn skipnl(inout p: P) {
+  while p.toks[p.pos].kind == Kind.KNewline { p.pos = p.pos + 1 }
+}
+
+fn fail(inout p: P, what: str) {
+  if p.err == 0 {
+    print("parse error near token", p.pos, "expected", what)
+    p.err = 1
+  }
+}
+
+fn expect_sym(inout p: P, s: str) {
+  if cur_is_sym(p, s) { p.pos = p.pos + 1 } else { fail(p, s) }
+}
+
+fn take_ident(inout p: P): str {
+  if p.toks[p.pos].kind == Kind.KIdent {
+    let t = p.toks[p.pos].text
+    p.pos = p.pos + 1
+    return t
+  }
+  fail(p, "identifier")
+  return ""
+}
+
+// operator precedence; -1 = not a binary operator
+fn peek_prec(p: P): i64 {
+  let t = p.toks[p.pos]
+  if t.kind == Kind.KIdent {
+    if t.text == "or" { return 1 }
+    if t.text == "and" { return 2 }
+    return -1
+  }
+  if t.kind != Kind.KSym { return -1 }
+  let s = t.text
+  if s == "==" or s == "!=" or s == "<" or s == "<=" or s == ">" or s == ">=" or s == "~=" {
+    return 3
+  }
+  if s == "+" or s == "-" { return 5 }
+  if s == "*" or s == "/" or s == "%" { return 6 }
+  return -1
+}
+
+// ---------- expressions (Pratt) ----------
+
+fn parse_expr(inout p: P, minp: i64): i64 {
+  var lhs = parse_prefix(p)
+  var going = true
+  while going and p.err == 0 {
+    let pr = peek_prec(p)
+    if pr < minp or pr < 0 {
+      going = false
+    } else {
+      let op = p.toks[p.pos].text
+      p.pos = p.pos + 1
+      skipnl(p)
+      let rhs = parse_expr(p, pr + 1)
+      lhs = new_expr(p, EK.EBin, lhs, rhs, 0.0, op)
+    }
+  }
+  return lhs
+}
+
+fn parse_prefix(inout p: P): i64 {
+  if cur_is_sym(p, "-") {
+    p.pos = p.pos + 1
+    let e = parse_prefix(p)
+    return new_expr(p, EK.EUn, e, -1, 0.0, "-")
+  }
+  if cur_is_kw(p, "not") {
+    p.pos = p.pos + 1
+    let e = parse_prefix(p)
+    return new_expr(p, EK.EUn, e, -1, 0.0, "not")
+  }
+  let a = parse_atom(p)
+  return parse_postfix(p, a)
+}
+
+fn parse_postfix(inout p: P, e0: i64): i64 {
+  var e = e0
+  var going = true
+  while going and p.err == 0 {
+    if cur_is_sym(p, ".") {
+      p.pos = p.pos + 1
+      let f = take_ident(p)
+      e = new_expr(p, EK.EField, e, -1, 0.0, f)
+    } else {
+      if cur_is_sym(p, "[") {
+        p.pos = p.pos + 1
+        let i = parse_expr(p, 0)
+        expect_sym(p, "]")
+        e = new_expr(p, EK.EIndex, e, i, 0.0, "")
+      } else {
+        going = false
+      }
+    }
+  }
+  return e
+}
+
+fn parse_args(inout p: P): i64 {
+  // consumes up to and including ")"; returns EArg chain head or -1
+  skipnl(p)
+  if cur_is_sym(p, ")") {
+    p.pos = p.pos + 1
+    return -1
+  }
+  let e = parse_expr(p, 0)
+  let node = new_expr(p, EK.EArg, e, -1, 0.0, "")
+  if cur_is_sym(p, ",") {
+    p.pos = p.pos + 1
+    let rest = parse_args(p)
+    var tmp = p.en[node]
+    tmp.b = rest
+    p.en[node] = tmp
+    return node
+  }
+  skipnl(p)
+  expect_sym(p, ")")
+  return node
+}
+
+fn parse_atom(inout p: P): i64 {
+  let t = p.toks[p.pos]
+  if t.kind == Kind.KInt or t.kind == Kind.KFloat {
+    p.pos = p.pos + 1
+    var isf = 0
+    if t.kind == Kind.KFloat { isf = 1 }
+    return new_expr(p, EK.ENum, -1, isf, t.num, "")
+  }
+  if t.kind == Kind.KStr {
+    p.pos = p.pos + 1
+    return new_expr(p, EK.EStr, -1, -1, 0.0, t.text)
+  }
+  if t.kind == Kind.KIdent {
+    p.pos = p.pos + 1
+    if cur_is_sym(p, "(") {
+      p.pos = p.pos + 1
+      let argsh = parse_args(p)
+      return new_expr(p, EK.ECall, argsh, -1, 0.0, t.text)
+    }
+    return new_expr(p, EK.EIdent, -1, -1, 0.0, t.text)
+  }
+  if t.kind == Kind.KSym and t.text == "(" {
+    p.pos = p.pos + 1
+    skipnl(p)
+    let e = parse_expr(p, 0)
+    skipnl(p)
+    expect_sym(p, ")")
+    return e
+  }
+  fail(p, "expression")
+  return new_expr(p, EK.ENum, -1, -1, 0.0, "")
+}
+
+// ---------- statements ----------
+
+fn parse_block(inout p: P): i64 {
+  skipnl(p)
+  expect_sym(p, "{")
+  var head = -1
+  var last = -1
+  var going = true
+  while going and p.err == 0 {
+    skipnl(p)
+    if cur_is_sym(p, "}") {
+      p.pos = p.pos + 1
+      going = false
+    } else {
+      if p.toks[p.pos].kind == Kind.KEof {
+        fail(p, "}")
+        going = false
+      } else {
+        let s = parse_stmt(p)
+        if head == -1 { head = s } else {
+          var tmp = p.sn[last]
+          tmp.nxt = s
+          p.sn[last] = tmp
+        }
+        last = s
+      }
+    }
+  }
+  return head
+}
+
+fn parse_stmt(inout p: P): i64 {
+  if cur_is_kw(p, "let") or cur_is_kw(p, "var") {
+    let isvar = cur_is_kw(p, "var")
+    p.pos = p.pos + 1
+    let name = take_ident(p)
+    expect_sym(p, "=")
+    let e = parse_expr(p, 0)
+    if isvar { return new_stmt(p, SK.SVar, e, -1, -1, name) }
+    return new_stmt(p, SK.SLet, e, -1, -1, name)
+  }
+  if cur_is_kw(p, "if") {
+    p.pos = p.pos + 1
+    let c = parse_expr(p, 0)
+    let then = parse_block(p)
+    var els = -1
+    if cur_is_kw(p, "else") {
+      p.pos = p.pos + 1
+      els = parse_block(p)
+    }
+    return new_stmt(p, SK.SIf, c, then, els, "")
+  }
+  if cur_is_kw(p, "for") {
+    p.pos = p.pos + 1
+    let v = take_ident(p)
+    if cur_is_kw(p, "in") { p.pos = p.pos + 1 } else { fail(p, "in") }
+    let lo = parse_expr(p, 4)
+    expect_sym(p, "..")
+    let hi = parse_expr(p, 4)
+    let body = parse_block(p)
+    let s = new_stmt(p, SK.SFor, lo, hi, body, v)
+    return s
+  }
+  if cur_is_kw(p, "while") {
+    p.pos = p.pos + 1
+    let c = parse_expr(p, 0)
+    let body = parse_block(p)
+    return new_stmt(p, SK.SWhile, c, body, -1, "")
+  }
+  if cur_is_kw(p, "return") {
+    p.pos = p.pos + 1
+    let t = p.toks[p.pos]
+    if t.kind == Kind.KNewline or t.kind == Kind.KEof or cur_is_sym(p, "}") {
+      return new_stmt(p, SK.SReturn, -1, -1, -1, "")
+    }
+    let e = parse_expr(p, 0)
+    return new_stmt(p, SK.SReturn, e, -1, -1, "")
+  }
+  let e = parse_expr(p, 0)
+  if cur_is_sym(p, "=") {
+    p.pos = p.pos + 1
+    let v = parse_expr(p, 0)
+    return new_stmt(p, SK.SAssign, e, v, -1, "")
+  }
+  return new_stmt(p, SK.SExpr, e, -1, -1, "")
+}
+
+// ---------- declarations ----------
+
+fn parse_type(inout p: P): i64 {
+  if cur_is_sym(p, "[") {
+    p.pos = p.pos + 1
+    let t = parse_type(p)
+    expect_sym(p, "]")
+    return t + 8
+  }
+  let t = take_ident(p)
+  if t == "i64" or t == "i32" { return 0 }
+  if t == "f64" or t == "f32" { return 1 }
+  if t == "bool" { return 2 }
+  if t == "str" { return 3 }
+  fail(p, "type")
+  return 5
+}
+
+fn parse_params(inout p: P): i64 {
+  expect_sym(p, "(")
+  skipnl(p)
+  var np = 0
+  var going = true
+  while going and p.err == 0 {
+    if cur_is_sym(p, ")") {
+      p.pos = p.pos + 1
+      going = false
+    } else {
+      var name = take_ident(p)
+      var m = 0
+      if name == "inout" {
+        m = 1
+        name = take_ident(p)
+      }
+      expect_sym(p, ":")
+      let t = parse_type(p)
+      p.pname[p.np] = name
+      p.ptype[p.np] = t
+      p.pmut[p.np] = m
+      p.np = p.np + 1
+      np = np + 1
+      if cur_is_sym(p, ",") {
+        p.pos = p.pos + 1
+        skipnl(p)
+      }
+    }
+  }
+  return np
+}
+
+fn parse_top(inout p: P) {
+  var going = true
+  while going and p.err == 0 {
+    skipnl(p)
+    if p.toks[p.pos].kind == Kind.KEof {
+      going = false
+    } else {
+      if cur_is_kw(p, "fn") {
+        p.pos = p.pos + 1
+        let name = take_ident(p)
+        let po = p.np
+        let np = parse_params(p)
+        var ret = 4
+        if cur_is_sym(p, ":") {
+          p.pos = p.pos + 1
+          ret = parse_type(p)
+        }
+        let body = parse_block(p)
+        p.fname[p.nf] = name
+        p.fret[p.nf] = ret
+        p.fpo[p.nf] = po
+        p.fnp[p.nf] = np
+        p.fbody[p.nf] = body
+        p.nf = p.nf + 1
+      } else {
+        if cur_is_kw(p, "main") {
+          p.pos = p.pos + 1
+          p.mainbody = parse_block(p)
+        } else {
+          fail(p, "fn or main")
+        }
+      }
+    }
+  }
+}
+
+// ---------- typechecker ----------
+
+type C { sname: [str], stype: [i64], smut: [i64], nsym: i64, err: i64 }
+
+fn tname(t: i64): str {
+  if t == 0 { return "i64" }
+  if t == 1 { return "f64" }
+  if t == 2 { return "bool" }
+  if t == 3 { return "str" }
+  if t == 4 { return "()" }
+  if t == 8 { return "[i64]" }
+  if t == 9 { return "[f64]" }
+  if t == 10 { return "[bool]" }
+  if t == 11 { return "[str]" }
+  if t >= 16 { return "[[..]]" }
+  return "<error>"
+}
+
+fn compat(expect: i64, actual: i64): bool {
+  return expect == actual or (expect == 1 and actual == 0)
+}
+
+fn is_num(t: i64): bool { return t == 0 or t == 1 }
+
+fn define(inout c: C, name: str, t: i64, m: i64) {
+  c.sname[c.nsym] = name
+  c.stype[c.nsym] = t
+  c.smut[c.nsym] = m
+  c.nsym = c.nsym + 1
+}
+
+fn find_sym(c: C, name: str): i64 {
+  var i = c.nsym - 1
+  while i >= 0 {
+    if c.sname[i] == name { return i }
+    i = i - 1
+  }
+  return -1
+}
+
+fn find_fn(p: P, name: str): i64 {
+  for i in 0..p.nf {
+    if p.fname[i] == name { return i }
+  }
+  return -1
+}
+
+fn check_call(p: P, inout c: C, e: i64): i64 {
+  let node = p.en[e]
+  let name = node.text
+  // collect argument expression ids from the EArg chain
+  var argv = arr(16, -1)
+  var na = 0
+  var a = node.a
+  while a >= 0 {
+    let an = p.en[a]
+    argv[na] = an.a
+    na = na + 1
+    a = an.b
+  }
+  var att = arr(16, 5)
+  for i in 0..na {
+    att[i] = check_expr(p, c, argv[i])
+  }
+  if c.err == 1 { return 5 }
+  // builtins (same signatures as the Rust checker)
+  if name == "print" { return 4 }
+  if name == "sqrt" or name == "sin" or name == "cos" or name == "acos" or name == "abs" or name == "floor" {
+    if na != 1 or not is_num(att[0]) {
+      print("type error:", name, "needs one numeric arg")
+      c.err = 1
+      return 5
+    }
+    return 1
+  }
+  if name == "min" or name == "max" or name == "pow" or name == "atan2" {
+    if na != 2 or not is_num(att[0]) or not is_num(att[1]) {
+      print("type error:", name, "needs two numeric args")
+      c.err = 1
+      return 5
+    }
+    return 1
+  }
+  if name == "float" {
+    if na != 1 {
+      print("type error: float expects 1 arg, got", na)
+      c.err = 1
+      return 5
+    }
+    return 1
+  }
+  if name == "int" {
+    if na != 1 {
+      print("type error: int expects 1 arg, got", na)
+      c.err = 1
+      return 5
+    }
+    return 0
+  }
+  if name == "len" {
+    if na != 1 or (att[0] != 3 and att[0] < 8) {
+      print("type error: len expects an array or str")
+      c.err = 1
+      return 5
+    }
+    return 0
+  }
+  if name == "substr" {
+    if na != 3 or att[0] != 3 or att[1] != 0 or att[2] != 0 {
+      print("type error: substr expects (str, i64, i64)")
+      c.err = 1
+      return 5
+    }
+    return 3
+  }
+  if name == "arr" {
+    if na != 2 or att[0] != 0 {
+      print("type error: arr expects (i64 length, element)")
+      c.err = 1
+      return 5
+    }
+    return att[1] + 8
+  }
+  // user function
+  let f = find_fn(p, name)
+  if f < 0 {
+    print("type error: unknown function", name)
+    c.err = 1
+    return 5
+  }
+  if p.fnp[f] != na {
+    print("type error:", name, "expects", p.fnp[f], "args, got", na)
+    c.err = 1
+    return 5
+  }
+  for i in 0..na {
+    if c.err == 0 {
+      let pt = p.ptype[p.fpo[f] + i]
+      if p.pmut[p.fpo[f] + i] == 1 {
+        // inout: the arg must be a mutable variable of the exact type
+        let an = p.en[argv[i]]
+        if an.kind == EK.EIdent {
+          let si = find_sym(c, an.text)
+          if si < 0 {
+            print("type error: unknown variable", an.text)
+            c.err = 1
+          } else {
+            if c.smut[si] == 0 {
+              print("type error: inout arg", i + 1, "of", name, "needs a var,", an.text, "is immutable")
+              c.err = 1
+            } else {
+              if c.stype[si] != pt {
+                print("type error: inout arg", i + 1, "of", name, "must be exactly", tname(pt), "got", tname(c.stype[si]))
+                c.err = 1
+              }
+            }
+          }
+        } else {
+          print("type error: inout arg", i + 1, "of", name, "must be a variable")
+          c.err = 1
+        }
+      } else {
+        if not compat(pt, att[i]) {
+          print("type error: arg", i + 1, "of", name, "expected", tname(pt), "got", tname(att[i]))
+          c.err = 1
+        }
+      }
+    }
+  }
+  if c.err == 1 { return 5 }
+  return p.fret[f]
+}
+
+fn check_expr(p: P, inout c: C, e: i64): i64 {
+  if c.err == 1 { return 5 }
+  let n = p.en[e]
+  if n.kind == EK.ENum {
+    if n.b == 1 { return 1 }
+    return 0
+  }
+  if n.kind == EK.EStr { return 3 }
+  if n.kind == EK.EIdent {
+    if n.text == "true" or n.text == "false" { return 2 }
+    let si = find_sym(c, n.text)
+    if si < 0 {
+      print("type error: unknown variable", n.text)
+      c.err = 1
+      return 5
+    }
+    return c.stype[si]
+  }
+  if n.kind == EK.EUn {
+    let t = check_expr(p, c, n.a)
+    if c.err == 1 { return 5 }
+    if n.text == "-" {
+      if is_num(t) { return t }
+      print("type error: cannot negate", tname(t))
+      c.err = 1
+      return 5
+    }
+    if t == 2 { return 2 }
+    print("type error: not needs a bool, got", tname(t))
+    c.err = 1
+    return 5
+  }
+  if n.kind == EK.EBin {
+    let lt = check_expr(p, c, n.a)
+    let rt = check_expr(p, c, n.b)
+    if c.err == 1 { return 5 }
+    let op = n.text
+    if op == "and" or op == "or" {
+      if lt == 2 and rt == 2 { return 2 }
+      print("type error:", op, "needs bool operands, got", tname(lt), "and", tname(rt))
+      c.err = 1
+      return 5
+    }
+    if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" {
+      if is_num(lt) and is_num(rt) {
+        if lt == 1 or rt == 1 { return 1 }
+        return 0
+      }
+      print("type error: cannot apply", op, "to", tname(lt), "and", tname(rt))
+      c.err = 1
+      return 5
+    }
+    if op == "==" or op == "!=" {
+      if lt == rt or (is_num(lt) and is_num(rt)) { return 2 }
+      print("type error: cannot compare", tname(lt), "with", tname(rt))
+      c.err = 1
+      return 5
+    }
+    // < <= > >= ~=
+    if is_num(lt) and is_num(rt) { return 2 }
+    print("type error: cannot compare", tname(lt), "with", tname(rt))
+    c.err = 1
+    return 5
+  }
+  if n.kind == EK.ECall { return check_call(p, c, e) }
+  if n.kind == EK.EIndex {
+    let it = check_expr(p, c, n.b)
+    let bt = check_expr(p, c, n.a)
+    if c.err == 1 { return 5 }
+    if it != 0 {
+      print("type error: array index must be i64, got", tname(it))
+      c.err = 1
+      return 5
+    }
+    if bt >= 8 { return bt - 8 }
+    if bt == 3 { return 0 }
+    print("type error: cannot index into", tname(bt))
+    c.err = 1
+    return 5
+  }
+  if n.kind == EK.EField {
+    let bt = check_expr(p, c, n.a)
+    if c.err == 1 { return 5 }
+    print("type error: cannot access field", n.text, "on", tname(bt))
+    c.err = 1
+    return 5
+  }
+  print("type error: unexpected expression node")
+  c.err = 1
+  return 5
+}
+
+fn check_stmt(p: P, inout c: C, s: i64, ret: i64): i64 {
+  let n = p.sn[s]
+  if n.kind == SK.SLet or n.kind == SK.SVar {
+    let t = check_expr(p, c, n.a)
+    if c.err == 1 { return 4 }
+    if t == 4 {
+      print("type error: cannot bind", n.text, "to a unit value")
+      c.err = 1
+      return 4
+    }
+    var m = 0
+    if n.kind == SK.SVar { m = 1 }
+    define(c, n.text, t, m)
+    return 4
+  }
+  if n.kind == SK.SAssign {
+    let vt = check_expr(p, c, n.b)
+    if c.err == 1 { return 4 }
+    let tgt = p.en[n.a]
+    if tgt.kind == EK.EIdent {
+      let si = find_sym(c, tgt.text)
+      if si < 0 {
+        print("type error: unknown variable", tgt.text)
+        c.err = 1
+        return 4
+      }
+      if c.smut[si] == 0 {
+        print("type error: cannot assign to immutable binding", tgt.text)
+        c.err = 1
+        return 4
+      }
+      if not compat(c.stype[si], vt) {
+        print("type error: cannot assign", tname(vt), "to", tgt.text, "of type", tname(c.stype[si]))
+        c.err = 1
+      }
+      return 4
+    }
+    if tgt.kind == EK.EIndex {
+      let it = check_expr(p, c, tgt.b)
+      let bt = check_expr(p, c, tgt.a)
+      if c.err == 1 { return 4 }
+      if it != 0 {
+        print("type error: array index must be i64, got", tname(it))
+        c.err = 1
+        return 4
+      }
+      if bt < 8 {
+        print("type error: cannot index into", tname(bt))
+        c.err = 1
+        return 4
+      }
+      if not compat(bt - 8, vt) {
+        print("type error: cannot store", tname(vt), "in", tname(bt))
+        c.err = 1
+        return 4
+      }
+      let base = p.en[tgt.a]
+      if base.kind == EK.EIdent {
+        let si = find_sym(c, base.text)
+        if si >= 0 and c.smut[si] == 0 {
+          print("type error: cannot write through immutable binding", base.text)
+          c.err = 1
+        }
+      }
+      return 4
+    }
+    print("type error: invalid assignment target")
+    c.err = 1
+    return 4
+  }
+  if n.kind == SK.SIf {
+    let t = check_expr(p, c, n.a)
+    if c.err == 1 { return 4 }
+    if t != 2 {
+      print("type error: if condition must be bool, got", tname(t))
+      c.err = 1
+      return 4
+    }
+    check_block(p, c, n.b, ret)
+    if n.c >= 0 { check_block(p, c, n.c, ret) }
+    return 4
+  }
+  if n.kind == SK.SWhile {
+    let t = check_expr(p, c, n.a)
+    if c.err == 1 { return 4 }
+    if t != 2 {
+      print("type error: while condition must be bool, got", tname(t))
+      c.err = 1
+      return 4
+    }
+    check_block(p, c, n.b, ret)
+    return 4
+  }
+  if n.kind == SK.SFor {
+    let lo = check_expr(p, c, n.a)
+    let hi = check_expr(p, c, n.b)
+    if c.err == 1 { return 4 }
+    if lo != 0 or hi != 0 {
+      print("type error: for bounds must be i64, got", tname(lo), "and", tname(hi))
+      c.err = 1
+      return 4
+    }
+    let mark = c.nsym
+    define(c, n.text, 0, 0)
+    check_block(p, c, n.c, ret)
+    c.nsym = mark
+    return 4
+  }
+  if n.kind == SK.SReturn {
+    var t = 4
+    if n.a >= 0 { t = check_expr(p, c, n.a) }
+    if c.err == 1 { return ret }
+    if not compat(ret, t) {
+      print("type error: return type mismatch, expected", tname(ret), "got", tname(t))
+      c.err = 1
+    }
+    return ret
+  }
+  return check_expr(p, c, n.a)
+}
+
+fn check_block(p: P, inout c: C, s0: i64, ret: i64): i64 {
+  let mark = c.nsym
+  var last = 4
+  var s = s0
+  while s >= 0 and c.err == 0 {
+    last = check_stmt(p, c, s, ret)
+    s = p.sn[s].nxt
+  }
+  c.nsym = mark
+  return last
+}
+
+fn check_fn(p: P, inout c: C, f: i64) {
+  c.nsym = 0
+  for i in 0..p.fnp[f] {
+    define(c, p.pname[p.fpo[f] + i], p.ptype[p.fpo[f] + i], p.pmut[p.fpo[f] + i])
+  }
+  let ret = p.fret[f]
+  let last = check_block(p, c, p.fbody[f], ret)
+  if c.err == 0 and ret != 4 {
+    if not compat(ret, last) {
+      print("type error: fn", p.fname[f], "declares return type", tname(ret), "but body produces", tname(last))
+      c.err = 1
+    }
+  }
+}
+
+fn check_program(p: P, inout c: C) {
+  var f = 0
+  while f < p.nf and c.err == 0 {
+    check_fn(p, c, f)
+    f = f + 1
+  }
+  if c.err == 0 and p.mainbody >= 0 {
+    c.nsym = 0
+    check_block(p, c, p.mainbody, 4)
+  }
+}
+// ---------- evaluator ----------
+
+// runtime value: t is the type code from the checker; i64/bool live in i,
+// f64 in f, str in s, arrays are (o=heap offset, n=len) with element tag t-8
+type V { t: i64, i: i64, f: f64, s: str, o: i64, n: i64 }
+
+type M {
+  heap: [V], hp: i64,
+  vname: [str], vval: [V], nv: i64, fp: i64,
+  ret: V, returned: i64,
+  halt: i64
+}
+
+fn vunit(): V { return V { t: 4, i: 0, f: 0.0, s: "", o: 0, n: 0 } }
+fn vint(x: i64): V { return V { t: 0, i: x, f: 0.0, s: "", o: 0, n: 0 } }
+fn vfloat(x: f64): V { return V { t: 1, i: 0, f: x, s: "", o: 0, n: 0 } }
+fn vbool(b: i64): V { return V { t: 2, i: b, f: 0.0, s: "", o: 0, n: 0 } }
+fn vstr(s: str): V { return V { t: 3, i: 0, f: 0.0, s: s, o: 0, n: 0 } }
+
+fn num_of(v: V): f64 {
+  if v.t == 0 { return float(v.i) }
+  return v.f
+}
+
+// int widens to float where the static type demands it
+fn coerce(v: V, want: i64): V {
+  if want == 1 and v.t == 0 { return vfloat(float(v.i)) }
+  return v
+}
+
+fn bindv(inout m: M, name: str, v: V) {
+  m.vname[m.nv] = name
+  m.vval[m.nv] = v
+  m.nv = m.nv + 1
+}
+
+// lookup is bounded by the frame pointer: callees don't see caller locals
+fn find_var(m: M, name: str): i64 {
+  var i = m.nv - 1
+  while i >= m.fp {
+    if m.vname[i] == name { return i }
+    i = i - 1
+  }
+  return -1
+}
+
+fn print_v(v: V) {
+  if v.t == 0 { print(v.i) }
+  if v.t == 1 { print(v.f) }
+  if v.t == 2 {
+    if v.i == 1 { print(true) } else { print(false) }
+  }
+  if v.t == 3 { print(v.s) }
+}
+
+fn eval_bin(inout m: M, op: str, l: V, r: V): V {
+  if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" {
+    if l.t == 0 and r.t == 0 {
+      if op == "+" { return vint(l.i + r.i) }
+      if op == "-" { return vint(l.i - r.i) }
+      if op == "*" { return vint(l.i * r.i) }
+      if op == "/" {
+        if r.i == 0 {
+          print("runtime error: division by zero")
+          m.halt = 1
+          return vunit()
+        }
+        return vint(l.i / r.i)
+      }
+      if r.i == 0 {
+        print("runtime error: division by zero")
+        m.halt = 1
+        return vunit()
+      }
+      return vint(l.i % r.i)
+    }
+    let a = num_of(l)
+    let b = num_of(r)
+    if op == "+" { return vfloat(a + b) }
+    if op == "-" { return vfloat(a - b) }
+    if op == "*" { return vfloat(a * b) }
+    if op == "/" { return vfloat(a / b) }
+    return vfloat(a % b)
+  }
+  if op == "==" or op == "!=" {
+    var same = 0
+    if l.t == 3 {
+      if l.s == r.s { same = 1 }
+    } else {
+      if l.t == 2 or r.t == 2 {
+        if l.i == r.i { same = 1 }
+      } else {
+        if num_of(l) == num_of(r) { same = 1 }
+      }
+    }
+    if op == "!=" { same = 1 - same }
+    return vbool(same)
+  }
+  if op == "~=" {
+    if num_of(l) ~= num_of(r) { return vbool(1) }
+    return vbool(0)
+  }
+  let a = num_of(l)
+  let b = num_of(r)
+  var res = 0
+  if op == "<" and a < b { res = 1 }
+  if op == "<=" and a <= b { res = 1 }
+  if op == ">" and a > b { res = 1 }
+  if op == ">=" and a >= b { res = 1 }
+  return vbool(res)
+}
+
+fn eval_call(p: P, inout m: M, e: i64): V {
+  let node = p.en[e]
+  let name = node.text
+  var argv = arr(16, -1)
+  var na = 0
+  var a = node.a
+  while a >= 0 {
+    let an = p.en[a]
+    argv[na] = an.a
+    na = na + 1
+    a = an.b
+  }
+  if name == "print" {
+    for i in 0..na {
+      let v = eval_expr(p, m, argv[i])
+      if m.halt == 0 { print_v(v) }
+    }
+    return vunit()
+  }
+  if name == "sqrt" or name == "sin" or name == "cos" or name == "acos" or name == "abs" or name == "floor" {
+    let x = num_of(eval_expr(p, m, argv[0]))
+    if name == "sqrt" { return vfloat(sqrt(x)) }
+    if name == "sin" { return vfloat(sin(x)) }
+    if name == "cos" { return vfloat(cos(x)) }
+    if name == "acos" { return vfloat(acos(x)) }
+    if name == "abs" { return vfloat(abs(x)) }
+    return vfloat(floor(x))
+  }
+  if name == "min" or name == "max" or name == "pow" or name == "atan2" {
+    let x = num_of(eval_expr(p, m, argv[0]))
+    let y = num_of(eval_expr(p, m, argv[1]))
+    if name == "min" { return vfloat(min(x, y)) }
+    if name == "max" { return vfloat(max(x, y)) }
+    if name == "pow" { return vfloat(pow(x, y)) }
+    return vfloat(atan2(x, y))
+  }
+  if name == "float" { return vfloat(num_of(eval_expr(p, m, argv[0]))) }
+  if name == "int" {
+    let v = eval_expr(p, m, argv[0])
+    if v.t == 0 { return v }
+    return vint(int(v.f))
+  }
+  if name == "len" {
+    let v = eval_expr(p, m, argv[0])
+    if v.t == 3 { return vint(len(v.s)) }
+    return vint(v.n)
+  }
+  if name == "substr" {
+    let v = eval_expr(p, m, argv[0])
+    let lo = eval_expr(p, m, argv[1])
+    let hi = eval_expr(p, m, argv[2])
+    if lo.i < 0 or hi.i > len(v.s) or lo.i > hi.i {
+      print("runtime error: substr out of bounds")
+      m.halt = 1
+      return vunit()
+    }
+    return vstr(substr(v.s, lo.i, hi.i))
+  }
+  if name == "arr" {
+    let cnt = eval_expr(p, m, argv[0])
+    let init = eval_expr(p, m, argv[1])
+    let o = m.hp
+    for j in 0..cnt.i {
+      m.heap[m.hp] = init
+      m.hp = m.hp + 1
+    }
+    return V { t: init.t + 8, i: 0, f: 0.0, s: "", o: o, n: cnt.i }
+  }
+  // user function
+  let f = find_fn(p, name)
+  var vals = arr(16, vunit())
+  for j in 0..p.fnp[f] {
+    vals[j] = coerce(eval_expr(p, m, argv[j]), p.ptype[p.fpo[f] + j])
+  }
+  if m.halt == 1 { return vunit() }
+  let base = m.nv
+  let oldfp = m.fp
+  for j in 0..p.fnp[f] {
+    bindv(m, p.pname[p.fpo[f] + j], vals[j])
+  }
+  m.fp = base
+  m.ret = vunit()
+  exec_block(p, m, p.fbody[f])
+  // capture inout finals before the frame is popped
+  var outs = arr(16, vunit())
+  for j in 0..p.fnp[f] {
+    outs[j] = m.vval[base + j]
+  }
+  m.nv = base
+  m.fp = oldfp
+  m.returned = 0
+  // copy-out: write each inout param's final value into the caller's variable
+  for j in 0..p.fnp[f] {
+    if p.pmut[p.fpo[f] + j] == 1 {
+      let an = p.en[argv[j]]
+      let idx = find_var(m, an.text)
+      m.vval[idx] = outs[j]
+    }
+  }
+  let out = coerce(m.ret, p.fret[f])
+  m.ret = vunit()
+  return out
+}
+
+fn eval_expr(p: P, inout m: M, e: i64): V {
+  if m.halt == 1 { return vunit() }
+  let nd = p.en[e]
+  if nd.kind == EK.ENum {
+    if nd.b == 1 { return vfloat(nd.num) }
+    return vint(int(nd.num))
+  }
+  if nd.kind == EK.EStr { return vstr(nd.text) }
+  if nd.kind == EK.EIdent {
+    if nd.text == "true" { return vbool(1) }
+    if nd.text == "false" { return vbool(0) }
+    let idx = find_var(m, nd.text)
+    return m.vval[idx]
+  }
+  if nd.kind == EK.EUn {
+    let v = eval_expr(p, m, nd.a)
+    if m.halt == 1 { return vunit() }
+    if nd.text == "-" {
+      if v.t == 0 { return vint(0 - v.i) }
+      return vfloat(0.0 - v.f)
+    }
+    return vbool(1 - v.i)
+  }
+  if nd.kind == EK.EBin {
+    // and/or short-circuit: the right side only runs when needed
+    if nd.text == "and" {
+      let l = eval_expr(p, m, nd.a)
+      if m.halt == 1 { return vunit() }
+      if l.i == 0 { return vbool(0) }
+      return eval_expr(p, m, nd.b)
+    }
+    if nd.text == "or" {
+      let l = eval_expr(p, m, nd.a)
+      if m.halt == 1 { return vunit() }
+      if l.i == 1 { return vbool(1) }
+      return eval_expr(p, m, nd.b)
+    }
+    let l = eval_expr(p, m, nd.a)
+    let r = eval_expr(p, m, nd.b)
+    if m.halt == 1 { return vunit() }
+    return eval_bin(m, nd.text, l, r)
+  }
+  if nd.kind == EK.ECall { return eval_call(p, m, e) }
+  if nd.kind == EK.EIndex {
+    let base = eval_expr(p, m, nd.a)
+    let idx = eval_expr(p, m, nd.b)
+    if m.halt == 1 { return vunit() }
+    if base.t == 3 {
+      if idx.i < 0 or idx.i >= len(base.s) {
+        print("runtime error: string index out of bounds")
+        m.halt = 1
+        return vunit()
+      }
+      return vint(base.s[idx.i])
+    }
+    if idx.i < 0 or idx.i >= base.n {
+      print("runtime error: index out of bounds")
+      m.halt = 1
+      return vunit()
+    }
+    return m.heap[base.o + idx.i]
+  }
+  print("runtime error: unsupported expression")
+  m.halt = 1
+  return vunit()
+}
+
+fn exec_stmt(p: P, inout m: M, s: i64) {
+  let n = p.sn[s]
+  if n.kind == SK.SLet or n.kind == SK.SVar {
+    let v = eval_expr(p, m, n.a)
+    if m.halt == 0 { bindv(m, n.text, v) }
+    return
+  }
+  if n.kind == SK.SAssign {
+    let v = eval_expr(p, m, n.b)
+    if m.halt == 1 { return }
+    let tgt = p.en[n.a]
+    if tgt.kind == EK.EIdent {
+      let idx = find_var(m, tgt.text)
+      m.vval[idx] = coerce(v, m.vval[idx].t)
+      return
+    }
+    // checked: target is an index into an array variable
+    let base = eval_expr(p, m, tgt.a)
+    let idx = eval_expr(p, m, tgt.b)
+    if m.halt == 1 { return }
+    if idx.i < 0 or idx.i >= base.n {
+      print("runtime error: index out of bounds")
+      m.halt = 1
+      return
+    }
+    m.heap[base.o + idx.i] = coerce(v, base.t - 8)
+    return
+  }
+  if n.kind == SK.SIf {
+    let c = eval_expr(p, m, n.a)
+    if m.halt == 1 { return }
+    if c.i == 1 {
+      exec_block(p, m, n.b)
+    } else {
+      if n.c >= 0 { exec_block(p, m, n.c) }
+    }
+    return
+  }
+  if n.kind == SK.SWhile {
+    var going = true
+    while going and m.halt == 0 and m.returned == 0 {
+      let c = eval_expr(p, m, n.a)
+      if m.halt == 1 { going = false } else {
+        if c.i == 0 { going = false } else { exec_block(p, m, n.b) }
+      }
+    }
+    return
+  }
+  if n.kind == SK.SFor {
+    let lo = eval_expr(p, m, n.a)
+    let hi = eval_expr(p, m, n.b)
+    if m.halt == 1 { return }
+    let mark = m.nv
+    bindv(m, n.text, vint(lo.i))
+    let slot = m.nv - 1
+    var cnt = hi.i - lo.i
+    if cnt < 0 { cnt = 0 }
+    for j in 0..cnt {
+      if m.halt == 0 and m.returned == 0 {
+        m.vval[slot] = vint(lo.i + j)
+        exec_block(p, m, n.c)
+      }
+    }
+    m.nv = mark
+    return
+  }
+  if n.kind == SK.SReturn {
+    var v = vunit()
+    if n.a >= 0 { v = eval_expr(p, m, n.a) }
+    if m.halt == 1 { return }
+    m.ret = v
+    m.returned = 1
+    return
+  }
+  eval_expr(p, m, n.a)
+}
+
+fn exec_block(p: P, inout m: M, s0: i64) {
+  let mark = m.nv
+  var s = s0
+  while s >= 0 and m.halt == 0 and m.returned == 0 {
+    exec_stmt(p, m, s)
+    s = p.sn[s].nxt
+  }
+  m.nv = mark
+}
+
+// ---------- driver ----------
+
+fn run(label: str, src: str) {
+  print(label)
+  var lx = Lexer { src: src, pos: 0 }
+  let cap = len(src) + 2
+  var toks = arr(cap, Token { kind: Kind.KEof, text: "", num: 0.0 })
+  var nt = 0
+  var lexing = true
+  while lexing {
+    let t = next_token(lx)
+    toks[nt] = t
+    nt = nt + 1
+    if t.kind == Kind.KEof { lexing = false }
+    if t.kind == Kind.KError {
+      print("lex error:", t.text)
+      lexing = false
+    }
+  }
+
+  var p = P {
+    toks: toks, nt: nt, pos: 0,
+    en: arr(cap * 2, ENode { kind: EK.ENum, a: -1, b: -1, num: 0.0, text: "" }), ne: 0,
+    sn: arr(cap, SNode { kind: SK.SExpr, a: -1, b: -1, c: -1, nxt: -1, text: "" }), ns: 0,
+    fname: arr(32, ""), fret: arr(32, 4), fpo: arr(32, 0), fnp: arr(32, 0), fbody: arr(32, -1), nf: 0,
+    pname: arr(64, ""), ptype: arr(64, 5), pmut: arr(64, 0), np: 0,
+    mainbody: -1,
+    err: 0
+  }
+  parse_top(p)
+  if p.err == 1 {
+    print("PARSE FAILED")
+    return
+  }
+  var c = C { sname: arr(256, ""), stype: arr(256, 5), smut: arr(256, 0), nsym: 0, err: 0 }
+  check_program(p, c)
+  if c.err == 1 {
+    print("typecheck: FAILED")
+    return
+  }
+  if p.mainbody >= 0 {
+    var m = M {
+      heap: arr(65536, vunit()), hp: 0,
+      vname: arr(4096, ""), vval: arr(4096, vunit()), nv: 0, fp: 0,
+      ret: vunit(), returned: 0,
+      halt: 0
+    }
+    exec_block(p, m, p.mainbody)
+  }
+}
+
+main {
+  run("== fib", "fn fib(n: i64): i64 {\n  if n < 2 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\nmain {\n  print(fib(20))\n}\n")
+  run("== collatz (inout)", "fn collatz(inout steps: i64, n0: i64) {\n  var n = n0\n  while n != 1 {\n    if n % 2 == 0 { n = n / 2 } else { n = 3 * n + 1 }\n    steps = steps + 1\n  }\n}\nmain {\n  var s = 0\n  collatz(s, 27)\n  print(s)\n}\n")
+  run("== dot (arrays, widening)", "fn dot(a: [f64], b: [f64], n: i64): f64 {\n  var acc = 0.0\n  for i in 0..n {\n    acc = acc + a[i] * b[i]\n  }\n  return acc\n}\nmain {\n  let n = 100\n  var a = arr(n, 0.0)\n  var b = arr(n, 0.0)\n  for i in 0..n {\n    a[i] = float(i) * 0.5\n    b[i] = float(i) * 0.25\n  }\n  print(dot(a, b, n))\n}\n")
+  run("== strings (chars, short-circuit)", "fn count_l(s: str): i64 {\n  var i = 0\n  var k = 0\n  while i < len(s) and s[i] != '\\0' {\n    if s[i] == 'l' { k = k + 1 }\n    i = i + 1\n  }\n  return k\n}\nmain {\n  print(count_l(\"hello lulang\"))\n  print(substr(\"self-hosting\", 0, 4))\n}\n")
+  run("== math (~=, builtins)", "main {\n  let x = sqrt(2.0)\n  print(x * x ~= 2.0)\n  print(min(3.5, 2.0) + max(1.0, 4.0))\n  print(floor(3.9))\n  print(not (1 > 2))\n}\n")
+  run("== bounds (runtime error)", "main {\n  var v = arr(2, 0)\n  print(v[0])\n  print(v[5])\n}\n")
+}

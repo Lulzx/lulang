@@ -103,6 +103,7 @@ impl<'a> Jit<'a> {
             ("lu_acos", runtime::lu_acos as *const u8),
             ("lu_atan2", runtime::lu_atan2 as *const u8),
             ("lu_pow", runtime::lu_pow as *const u8),
+            ("lu_fmod", runtime::lu_fmod as *const u8),
         ];
         for (n, ptr) in syms {
             jb.symbol(*n, *ptr);
@@ -156,6 +157,7 @@ impl<'a> Jit<'a> {
             ("lu_acos", 2, &[types::F64], true),
             ("lu_atan2", 2, &[types::F64, types::F64], true),
             ("lu_pow", 2, &[types::F64, types::F64], true),
+            ("lu_fmod", 2, &[types::F64, types::F64], true),
         ];
         for (name, kind, params, _) in specs {
             let mut sig = self.module.make_signature();
@@ -1127,7 +1129,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                         "-" => self.b.ins().fsub(a, b),
                         "*" => self.b.ins().fmul(a, b),
                         "/" => self.b.ins().fdiv(a, b),
-                        _ => return Err("`%` on floats is not supported yet".into()),
+                        _ => self.call_import("lu_fmod", &[a, b])[0],
                     };
                     Ok((CType::F64, vec![v]))
                 }

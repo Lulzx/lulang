@@ -197,5 +197,16 @@ codes (`i64/f64/bool/str/()` = 0–4, `[T]` = T+8), scopes are a linear symbol
 stack, and the rules match the Rust checker (int→float widening, bool
 conditions, exact-type `var` for `inout` args, fixed builtin signatures). Its
 driver checks 2 well-typed and 10 ill-typed programs, reporting the first
-error. All three produce byte-identical output under `lu interp`, `lu run`,
+error. Finally [selfhost/interp.lu](selfhost/interp.lu) closes the loop: the
+full pipeline (lexer with char literals, parser, quiet checker) plus a
+tree-walking evaluator — tagged value records, a bump-allocated heap of value
+slots for arrays, a linear env stack with per-call frame pointers,
+short-circuit `and`/`or`, `inout` copy-out into the caller's variable, and
+int→float coercion at the points the checker allows it. Programs executed by
+interp.lu print byte-identical output to the same programs under `lu run`.
+All four artifacts produce byte-identical output under `lu interp`, `lu run`,
 and `lu build`.
+
+Self-hosting also surfaced that the compiled tiers lacked float `%`: the JIT
+now emits a call to `lu_fmod` and the AOT tier uses LLVM `frem`, matching the
+interpreter's Rust `%` (libm fmod) in all tiers.

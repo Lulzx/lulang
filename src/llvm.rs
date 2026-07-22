@@ -903,7 +903,7 @@ impl<'a> Emit<'a> {
                         "-" => "fsub",
                         "*" => "fmul",
                         "/" => "fdiv",
-                        _ => return Err("`%` on floats is not supported yet".into()),
+                        _ => "frem",
                     };
                     let t = self.t();
                     self.line(format!("{} = {} fast double {}, {}", t, o, a, b));

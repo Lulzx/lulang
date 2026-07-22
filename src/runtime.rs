@@ -88,3 +88,6 @@ pub extern "C" fn lu_atan2(a: f64, b: f64) -> f64 {
 pub extern "C" fn lu_pow(a: f64, b: f64) -> f64 {
     a.powf(b)
 }
+pub extern "C" fn lu_fmod(a: f64, b: f64) -> f64 {
+    a % b
+}
