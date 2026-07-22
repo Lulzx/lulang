@@ -46,6 +46,7 @@ cargo build --release
 ./target/release/lu run selfhost/interp.lu # lulang running lulang: full front end + evaluator
 ./target/release/lu run selfhost/interp.lu prog.lu                     # run a file
 ./target/release/lu run selfhost/interp.lu selfhost/interp.lu prog.lu # interpreter tower
+./experiments/alcubierre.sh          # replicate AE's "alcubierre" benchmark table
 ./selfhost/build.sh prog.lu          # AOT-compile prog.lu with the compiler written in lulang
 ./selfhost/build.sh --bootstrap      # 3-stage self-compilation; verifies the IR fixpoint
 ```

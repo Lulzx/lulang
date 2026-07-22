@@ -26,7 +26,7 @@ static Quat slerp(Quat a, Quat b, double t) {
 int main() {
   Quat a = normalize({1, 2, 3, 4});
   Quat b = normalize({4, 3, 2, 1});
-  const long n = 20000000;
+  const long n = 2000000;
   double acc = 0.0;
   for (long i = 0; i < n; i++) {
     double t = (double)i / (double)n;

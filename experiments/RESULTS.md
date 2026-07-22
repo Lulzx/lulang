@@ -268,3 +268,62 @@ Startup for scale: `lu run` on a hello program is 2.1 ms (Bun: 7.6 ms).
 - The trig kernels give up correct rounding (~2 ulp) and huge-argument range
   reduction; both are inside the approximate-FP contract, and `exact` (v0.2)
   will route back to libm.
+
+---
+
+# Experiment 2 — replicating the "alcubierre" table end to end
+
+*2026-07-23, Apple M4 Pro, Apple clang 21, Bun 1.3.14, hyperfine (whole-process
+wall clock). Kernel: `corpus/alcubierre.{lu,cpp,ts}` — energy density of an
+Alcubierre warp bubble (rational bump shape, R=2, v=1) integrated over a 96³
+cell-centered grid for 6 bubble positions. All four executions print the same
+total to 15 digits. Harness: `experiments/alcubierre.sh`.*
+
+## The table, theirs vs ours
+
+AE's July 9 screenshot ("numeric, apples to apples, 1–6 iters, ms"):
+
+| Category | AE's numbers | AE ratio | lulang's numbers | lulang ratio |
+|---|---|---|---|---|
+| Native binary | ae 4.43 vs cpp 6.96 | **1.57×** | lu ~5.1 vs cpp ~5.9 | **~1.2×** |
+| JIT / runtime | ae 25.09 vs bun 234.77 | **9.4×** | lu ~20 vs bun ~26 | **~1.3–1.5×** |
+| Compile `-O3 -march=native` | ae 432.5 vs g++ 711.1 | **1.64×** | lu ~57 vs clang++ ~58 | **~1.0×** |
+
+Numbers are best-of/low-percentile across 60–300 runs; the machine is bimodal
+(P-core vs E-core scheduling makes medians drift up to ~1.7× on the C++ binary),
+so means overstate whichever contender gets scheduled worse. AE's single-shot
+screenshot numbers carry the same hazard.
+
+## What replicated and what didn't
+
+- **Native win over idiomatic C++: replicated in kind, smaller in degree.**
+  lu-bin beats `clang++ -O3 -march=native` by ~15–25% whole-process on the same
+  scalar kernel. The control AE never shows: adding `-ffast-math` to the C++
+  build closes the gap exactly (5.5 vs 5.6 ms best-of) — the entire native edge
+  is fast-math-by-contract on the `sum` reduction (vectorized sqrt/div +
+  reassociation), i.e. semantics, not compiler magic. AE's 1.57× on *their*
+  alcubierre is consistent with a kernel leaning harder on reassociation/rsqrt
+  (our nbody measured 1.67× from the same levers).
+- **JIT absolute time: eerily replicated.** `lu run` lands at ~20–25 ms where
+  `ae jit` shows 25.09 — same startup+compile+run envelope for a Cranelift-class
+  JIT on a few-ms kernel.
+- **The 9.4× JIT-vs-Bun gap: not replicable on apples-to-apples code.** Bun runs
+  the scalar TS twin in ~26 ms and even an allocating object-per-point variant
+  in ~30–45 ms (JSC sinks the allocations). To make Bun show 234 ms on a kernel
+  this size you need TS that defeats escape analysis — retained object graphs,
+  megamorphic call sites — i.e. a *pessimal* baseline, not the "apples to
+  apples" the screenshot claims. This is the least defensible cell in AE's table.
+- **Compile-time win: does not exist at this file size.** `lu build` and
+  `clang++` tie (~57 ms) because alcubierre.cpp includes only `<cmath>/<cstdio>`
+  and lu's own backend *is* clang on textual IR. The C++ header tax that funds
+  AE's claim needs real includes: Experiment 1 measured 0.26 s of frontend for
+  `<vector>/<chrono>/<cstdio>` alone, which is where 1.6×-on-small /
+  10×-on-large comes from. AE's 711 ms for g++ on a ~30-line file suggests
+  heavy includes, a cold filesystem, or g++'s slower frontend.
+
+## Verdict
+
+Two of AE's three alcubierre cells fall out of semantics + a thin toolchain, at
+somewhat smaller magnitudes; the JIT-vs-Bun cell required a baseline we could
+not reproduce with honest TS. Ranking the claims by robustness:
+native > compile (real but size-dependent) > JIT-vs-TS (baseline-dependent).

@@ -1,0 +1,31 @@
+// alcubierre.lu — replication of AE's "alcubierre" benchmark shape:
+// numeric, apples to apples, whole-process. Integrates the energy density of
+// an Alcubierre warp bubble (rational bump shape function, R = 2, v = 1) over
+// a 64^3 cell-centered grid for 6 bubble positions.
+
+fn rho(x: f64, y: f64, z: f64, xs: f64): f64 {
+  let rx = x - xs
+  let r2 = rx * rx + y * y + z * z
+  let rs = sqrt(r2)
+  let u = r2 / 4.0
+  let w = 1.0 + u * u * u
+  let dfdr = -6.0 * u * u * rs / 4.0 / (w * w)
+  return 0.25 * dfdr * dfdr * (y * y + z * z) / r2
+}
+
+main {
+  let n = 96
+  let dx = 16.0 / float(n)
+  var total = 0.0
+  for it in 0..6 {
+    let xs = -4.0 + float(it) * 0.5
+    for ix in 0..n {
+      let x = -8.0 + (float(ix) + 0.5) * dx
+      for iy in 0..n {
+        let y = -8.0 + (float(iy) + 0.5) * dx
+        total = total + sum(iz in 0..n) rho(x, y, -8.0 + (float(iz) + 0.5) * dx, xs)
+      }
+    }
+  }
+  print("total:", total * dx * dx * dx)
+}
