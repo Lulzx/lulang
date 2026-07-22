@@ -50,6 +50,110 @@ cargo build --release
 ./selfhost/build.sh --bootstrap      # 3-stage self-compilation; verifies the IR fixpoint
 ```
 
+## Architecture
+
+One front end, four back ends. Every mode runs lex → parse → typecheck over a
+flat arena AST, then dispatches:
+
+```
+                         prog.lu
+                            │
+              ┌─────────────▼──────────────┐
+              │        FRONT END           │
+              │  lexer.rs  → tokens        │
+              │  parser.rs → flat AST      │   (arena tables, ExprId indices;
+              │  check.rs  → typed ok      │    match/sum desugared at parse)
+              └─────────────┬──────────────┘
+                            │
+      ┌──────────────┬──────┴───────┬──────────────┐
+      ▼              ▼              ▼              ▼
+ ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌──────────┐
+ │lu interp │  │  lu run   │  │ lu build  │  │ lu test  │
+ │          │  │           │  │           │  │          │
+ │ tree-    │  │ Cranelift │  │ textual   │  │ property │
+ │ walking  │  │ JIT       │  │ LLVM IR   │  │ engine + │
+ │ eval     │  │           │  │   │       │  │ shrinker │
+ │          │  │ inlining  │  │   ▼       │  └──────────┘
+ │reference │  │ SIMD sum  │  │ clang -O3 │
+ │semantics │  │ LICM      │  │   │       │
+ └──────────┘  │ if-conv   │  │   ▼       │
+               │ SoA arrays│  │ native +  │
+               │ math krnls│  │lu_runtime.c
+               └───────────┘  └───────────┘
+```
+
+The same architecture is rewritten in lulang itself as a ladder — each rung
+written in lulang, run by the tier below:
+
+```
+   rung                          surface
+   ────────────────────────────────────────────────────────
+   lexer.lu      ──┐             tokens only
+   parser.lu       │ early       + flat AST, types dropped
+   checker.lu      │ rungs       + types kept, core subset
+                 ──┘
+   interp.lu       full language: lex+parse+check+eval
+                   │  can run its own source (tower, depth 3)
+                   ▼
+   codegen.lu      AOT compiler = shared front end + IR emitter
+                   ┌──────────────────┬─────────────────────┐
+                   │ front end        │ back end            │
+                   │ BYTE COPY of     │ mirrors src/llvm.rs │
+                   │ interp.lu        │ same ABI, fastmath, │
+                   │ up to its        │ SoA, bounds hoisting│
+                   │ evaluator marker │                     │
+                   └──────────────────┴─────────────────────┘
+```
+
+`selfhost/build.sh --bootstrap` closes the loop: codegen.lu compiles itself
+(interpreted), the result compiles itself, and again — stage-2 and stage-3 IR
+must be byte-identical:
+
+```
+ stage 1          stage 2               stage 3
+ ───────          ───────               ───────
+ lu run
+ codegen.lu ──ll──▶ cg1 (native)
+ (codegen.lu        │
+  compiles          │ compiles codegen.lu
+  itself,           ▼
+  interpreted)     cg2.ll ──clang──▶ cg2 (native)
+                    │                 │ compiles codegen.lu
+                    │                 ▼
+                    │                cg3.ll
+                    │                 │
+                    └────── cmp ──────┘
+                     byte-identical?  ── yes ──▶ install cg2
+                                                 as target/release/luc
+```
+
+Day-to-day compilation then goes through the installed self-hosted compiler:
+
+```
+ prog.lu ──▶ luc ──▶ prog.ll ──▶ clang -O3 ──▶ a.out ◀── linked with lu_runtime.c
+                    (textual                            (print, arrays,
+                     LLVM IR,                            read_file/write_file,
+                     fast flags)                         str = ptr+len protocol)
+```
+
+Correctness rests on a verification lattice, not the fixpoint alone (a fixpoint
+only proves self-consistency — the independently written Rust tiers are the
+oracle that catches a bug codegen.lu would faithfully preserve in itself):
+
+```
+                        prog.lu
+        ┌──────────┬───────┼────────────┬─────────────┐
+        ▼          ▼       ▼            ▼             ▼
+    lu interp   lu run  lu build   interp.lu on   luc (selfhost
+     (tree)     (JIT)   (host AOT)  the host       AOT)
+        │          │       │            │             │
+        └──────────┴───────┴─────┬──────┴─────────────┘
+                                 ▼
+                        diff — all identical
+              (sole tolerated drift: last float digit on
+               fast-math reductions; host AOT is reference)
+```
+
 ## Status
 
 | Milestone | State |
