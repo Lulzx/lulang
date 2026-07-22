@@ -237,10 +237,16 @@ unmodified towers possible.
 (desugared at parse time into an `==` if-chain with exhaustiveness checking,
 exactly like the host parser), decodes string escapes, and parses float
 literals via exact-mantissa/single-division (correctly rounded like the
-host's, up to ~15 significant digits). With that surface, the whole ladder
-runs on itself byte-identically: `lu run selfhost/interp.lu selfhost/lexer.lu`
-(or parser.lu, checker.lu, corpus/dot.lu) prints exactly what the native
-tiers print for those files.
+host's, up to ~15 significant digits). It covers the full v0.1 surface too:
+`operator` declarations (infix with anchor-copied precedence, circumfix with
+open/close glyphs — both desugared at parse time into calls of
+`operator<glyph>` functions, the host's own scheme), `property` declarations
+(bool-checked, never called by `run`), positional record literals, and
+multi-byte UTF-8 operator glyphs lexed as single symbol tokens. With that,
+the whole ladder *and the AE teaser corpus* run on it byte-identically:
+`lu run selfhost/interp.lu <file>` prints exactly what the native tiers
+print for lexer.lu, parser.lu, checker.lu, corpus/dot.lu, and
+corpus/slerp.lu (`·`, `‖·‖`, and all).
 
 **Float printing.** All tiers print f64 as the shortest decimal that parses
 back exactly, in plain notation (never scientific) — Rust's `Display`

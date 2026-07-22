@@ -182,8 +182,15 @@ fn next_token(inout lx: Lexer): Token {
     lx.pos = lx.pos + 2
     return Token { kind: Kind.KSym, text: substr(lx.src, s, lx.pos), num: 0.0 }
   }
+  // multi-byte UTF-8 scalar (e.g. an operator glyph) is one symbol token
+  var w = 1
+  if c >= 240 { w = 4 } else {
+    if c >= 224 { w = 3 } else {
+      if c >= 192 { w = 2 }
+    }
+  }
   let s = lx.pos
-  lx.pos = lx.pos + 1
+  lx.pos = lx.pos + w
   return Token { kind: Kind.KSym, text: substr(lx.src, s, lx.pos), num: 0.0 }
 }
 
@@ -211,8 +218,10 @@ type P {
   toks: [Token], nt: i64, pos: i64,
   en: [ENode], ne: i64,
   sn: [SNode], ns: i64,
-  fname: [str], fret: [i64], fpo: [i64], fnp: [i64], fbody: [i64], nf: i64,
+  fname: [str], fret: [i64], fpo: [i64], fnp: [i64], fbody: [i64], fisprop: [i64], nf: i64,
   pname: [str], ptype: [i64], pmut: [i64], np: i64,
+  opglyph: [str], opfname: [str], opprec: [i64], nops: i64,
+  copen: [str], cclose: [str], cfname: [str], ncirc: i64,
   tyname: [str], tfo: [i64], tnf: [i64], nty: i64,
   flname: [str], flty: [i64], nfl: i64,
   ename: [str], evo: [i64], evn: [i64], nen: i64,
@@ -305,6 +314,16 @@ fn take_ident(inout p: P): str {
   return ""
 }
 
+// builtin symbol precedence; -1 = not a builtin binary operator
+fn sym_prec(s: str): i64 {
+  if s == "==" or s == "!=" or s == "<" or s == "<=" or s == ">" or s == ">=" or s == "~=" {
+    return 3
+  }
+  if s == "+" or s == "-" { return 5 }
+  if s == "*" or s == "/" or s == "%" { return 6 }
+  return -1
+}
+
 // operator precedence; -1 = not a binary operator
 fn peek_prec(p: P): i64 {
   let t = p.toks[p.pos]
@@ -314,12 +333,10 @@ fn peek_prec(p: P): i64 {
     return -1
   }
   if t.kind != Kind.KSym { return -1 }
-  let s = t.text
-  if s == "==" or s == "!=" or s == "<" or s == "<=" or s == ">" or s == ">=" or s == "~=" {
-    return 3
-  }
-  if s == "+" or s == "-" { return 5 }
-  if s == "*" or s == "/" or s == "%" { return 6 }
+  let bp = sym_prec(t.text)
+  if bp >= 0 { return bp }
+  let oi = find_op(p, t.text)
+  if oi >= 0 { return p.opprec[oi] }
   return -1
 }
 
@@ -337,7 +354,15 @@ fn parse_expr(inout p: P, minp: i64): i64 {
       p.pos = p.pos + 1
       skipnl(p)
       let rhs = parse_expr(p, pr + 1)
-      lhs = new_expr(p, EK.EBin, lhs, rhs, 0.0, op)
+      let oi = find_op(p, op)
+      if oi >= 0 {
+        // user infix operator desugars to a call of its operator function
+        let a2 = new_expr(p, EK.EArg, rhs, -1, 0.0, "")
+        let a1 = new_expr(p, EK.EArg, lhs, a2, 0.0, "")
+        lhs = new_expr(p, EK.ECall, a1, -1, 0.0, p.opfname[oi])
+      } else {
+        lhs = new_expr(p, EK.EBin, lhs, rhs, 0.0, op)
+      }
     }
   }
   return lhs
@@ -403,14 +428,18 @@ fn parse_args(inout p: P): i64 {
 }
 
 fn parse_field_inits(inout p: P): i64 {
-  // consumes up to and including "}"; returns EArg chain (text = field name)
+  // consumes up to and including "}"; returns EArg chain (text = field name,
+  // "" for a positional init filling the next field in declaration order)
   skipnl(p)
   if cur_is_sym(p, "}") {
     p.pos = p.pos + 1
     return -1
   }
-  let f = take_ident(p)
-  expect_sym(p, ":")
+  var f = ""
+  if p.toks[p.pos].kind == Kind.KIdent and p.toks[p.pos + 1].kind == Kind.KSym and p.toks[p.pos + 1].text == ":" {
+    f = take_ident(p)
+    p.pos = p.pos + 1
+  }
   let e = parse_expr(p, 0)
   let node = new_expr(p, EK.EArg, e, -1, 0.0, f)
   if cur_is_sym(p, ",") { p.pos = p.pos + 1 }
@@ -468,6 +497,17 @@ fn parse_atom(inout p: P): i64 {
     skipnl(p)
     expect_sym(p, ")")
     return e
+  }
+  if t.kind == Kind.KSym {
+    // circumfix operator: <open> expr <close> desugars to a call
+    let ci = find_circ(p, t.text)
+    if ci >= 0 {
+      p.pos = p.pos + 1
+      let e = parse_expr(p, 0)
+      if cur_is_sym(p, p.cclose[ci]) { p.pos = p.pos + 1 } else { fail(p, p.cclose[ci]) }
+      let a1 = new_expr(p, EK.EArg, e, -1, 0.0, "")
+      return new_expr(p, EK.ECall, a1, -1, 0.0, p.cfname[ci])
+    }
   }
   fail(p, "expression")
   return new_expr(p, EK.ENum, -1, -1, 0.0, "")
@@ -761,6 +801,94 @@ fn parse_params(inout p: P): i64 {
   return np
 }
 
+fn add_fn(inout p: P, name: str, ret: i64, po: i64, np2: i64, body: i64, isprop: i64) {
+  p.fname[p.nf] = name
+  p.fret[p.nf] = ret
+  p.fpo[p.nf] = po
+  p.fnp[p.nf] = np2
+  p.fbody[p.nf] = body
+  p.fisprop[p.nf] = isprop
+  p.nf = p.nf + 1
+}
+
+fn parse_param1(inout p: P) {
+  expect_sym(p, "(")
+  let name = take_ident(p)
+  expect_sym(p, ":")
+  let t = parse_type(p)
+  p.pname[p.np] = name
+  p.ptype[p.np] = t
+  p.pmut[p.np] = 0
+  p.np = p.np + 1
+  expect_sym(p, ")")
+}
+
+fn parse_operator(inout p: P) {
+  // infix:     operator<anchor> (a: T) <glyph> (b: U): R { .. }
+  //            — the anchor is a known-precedence symbol followed by `(`
+  // circumfix: operator <open>(v: T)<close>: R { .. }
+  // both desugar to a function named operator<glyphs> (host rule)
+  if p.toks[p.pos].kind != Kind.KSym {
+    fail(p, "operator glyph")
+    return
+  }
+  let first = p.toks[p.pos].text
+  p.pos = p.pos + 1
+  let ap = sym_prec(first)
+  if ap >= 0 and cur_is_sym(p, "(") {
+    let po = p.np
+    parse_param1(p)
+    if p.toks[p.pos].kind != Kind.KSym {
+      fail(p, "infix glyph")
+      return
+    }
+    let glyph = p.toks[p.pos].text
+    p.pos = p.pos + 1
+    parse_param1(p)
+    expect_sym(p, ":")
+    let ret = parse_type(p)
+    let fname = concat("operator", glyph)
+    p.opglyph[p.nops] = glyph
+    p.opfname[p.nops] = fname
+    p.opprec[p.nops] = ap
+    p.nops = p.nops + 1
+    let body = parse_block(p)
+    add_fn(p, fname, ret, po, 2, body, 0)
+  } else {
+    let po = p.np
+    parse_param1(p)
+    if p.toks[p.pos].kind != Kind.KSym {
+      fail(p, "closing glyph")
+      return
+    }
+    let close = p.toks[p.pos].text
+    p.pos = p.pos + 1
+    expect_sym(p, ":")
+    let ret = parse_type(p)
+    let fname = concat(concat("operator", first), close)
+    p.copen[p.ncirc] = first
+    p.cclose[p.ncirc] = close
+    p.cfname[p.ncirc] = fname
+    p.ncirc = p.ncirc + 1
+    let body = parse_block(p)
+    add_fn(p, fname, ret, po, 1, body, 0)
+  }
+}
+
+fn parse_property(inout p: P) {
+  // a property is a bool-valued fn checked but never called by `run`
+  let name = take_ident(p)
+  let po = p.np
+  let np2 = parse_params(p)
+  var ret = 2
+  if cur_is_sym(p, ":") {
+    p.pos = p.pos + 1
+    ret = parse_type(p)
+  }
+  let body = parse_block(p)
+  add_fn(p, name, ret, po, np2, body, 1)
+}
+
 fn parse_top(inout p: P) {
   var going = true
   while going and p.err == 0 {
@@ -779,12 +907,7 @@ fn parse_top(inout p: P) {
           ret = parse_type(p)
         }
         let body = parse_block(p)
-        p.fname[p.nf] = name
-        p.fret[p.nf] = ret
-        p.fpo[p.nf] = po
-        p.fnp[p.nf] = np
-        p.fbody[p.nf] = body
-        p.nf = p.nf + 1
+        add_fn(p, name, ret, po, np, body, 0)
       } else {
         if cur_is_kw(p, "type") {
           p.pos = p.pos + 1
@@ -794,11 +917,21 @@ fn parse_top(inout p: P) {
             p.pos = p.pos + 1
             parse_enum_decl(p)
           } else {
-            if cur_is_kw(p, "main") {
+            if cur_is_kw(p, "operator") {
               p.pos = p.pos + 1
-              p.mainbody = parse_block(p)
+              parse_operator(p)
             } else {
-              fail(p, "declaration")
+              if cur_is_kw(p, "property") {
+                p.pos = p.pos + 1
+                parse_property(p)
+              } else {
+                if cur_is_kw(p, "main") {
+                  p.pos = p.pos + 1
+                  p.mainbody = parse_block(p)
+                } else {
+                  fail(p, "declaration")
+                }
+              }
             }
           }
         }
@@ -851,7 +984,21 @@ fn find_sym(c: C, name: str): i64 {
 
 fn find_fn(p: P, name: str): i64 {
   for i in 0..p.nf {
-    if p.fname[i] == name { return i }
+    if p.fname[i] == name and p.fisprop[i] == 0 { return i }
+  }
+  return -1
+}
+
+fn find_op(p: P, glyph: str): i64 {
+  for i in 0..p.nops {
+    if p.opglyph[i] == glyph { return i }
+  }
+  return -1
+}
+
+fn find_circ(p: P, open: str): i64 {
+  for i in 0..p.ncirc {
+    if p.copen[i] == open { return i }
   }
   return -1
 }
@@ -1173,8 +1320,9 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
     var a = n.a
     while a >= 0 and c.err == 0 {
       let an = p.en[a]
-      let fi = field_index(p, ti, an.text)
-      if fi < 0 {
+      var fi = cnt
+      if an.text != "" { fi = field_index(p, ti, an.text) }
+      if fi < 0 or fi >= p.tnf[ti] {
         print("type error: type", n.text, "has no field", an.text)
         c.err = 1
         return 5
@@ -1771,11 +1919,14 @@ fn eval_expr(p: P, inout m: M, e: i64): V {
     let o = m.hp
     m.hp = m.hp + nf
     var a = nd.a
+    var pos2 = 0
     while a >= 0 and m.halt == 0 {
       let an = p.en[a]
-      let fi = field_index(p, ti, an.text)
+      var fi = pos2
+      if an.text != "" { fi = field_index(p, ti, an.text) }
       let fv = coerce(eval_expr(p, m, an.a), p.flty[p.tfo[ti] + fi])
       if m.halt == 0 { m.heap[o + fi] = copy_val(m, fv) }
+      pos2 = pos2 + 1
       a = an.b
     }
     return V { t: 64 + ti, i: 0, f: 0.0, s: "", o: o, n: nf }
@@ -1908,8 +2059,10 @@ fn run_src(src: str, heapfac: i64, argbase: i64) {
     toks: toks, nt: nt, pos: 0,
     en: arr(cap * 2, ENode { kind: EK.ENum, a: -1, b: -1, num: 0.0, text: "" }), ne: 0,
     sn: arr(cap, SNode { kind: SK.SExpr, a: -1, b: -1, c: -1, nxt: -1, text: "" }), ns: 0,
-    fname: arr(256, ""), fret: arr(256, 4), fpo: arr(256, 0), fnp: arr(256, 0), fbody: arr(256, -1), nf: 0,
+    fname: arr(256, ""), fret: arr(256, 4), fpo: arr(256, 0), fnp: arr(256, 0), fbody: arr(256, -1), fisprop: arr(256, 0), nf: 0,
     pname: arr(2048, ""), ptype: arr(2048, 5), pmut: arr(2048, 0), np: 0,
+    opglyph: arr(32, ""), opfname: arr(32, ""), opprec: arr(32, 0), nops: 0,
+    copen: arr(32, ""), cclose: arr(32, ""), cfname: arr(32, ""), ncirc: 0,
     tyname: arr(64, ""), tfo: arr(64, 0), tnf: arr(64, 0), nty: 0,
     flname: arr(512, ""), flty: arr(512, 5), nfl: 0,
     ename: arr(32, ""), evo: arr(32, 0), evn: arr(32, 0), nen: 0,
