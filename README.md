@@ -47,10 +47,10 @@ cargo build --release
 |---|---|
 | M0 — spec + benchmark corpus | done |
 | M1 — lexer, parser, typechecker, interpreter | done |
-| M2 — Cranelift JIT (`lu run`): inlining, 4-acc `sum`, hoisted bounds checks | done — beats Bun on dot, trails on slerp (needs LICM) |
+| M2 — Cranelift JIT (`lu run`): inlining, 4-acc `sum`, hoisted bounds checks, opt_level=speed | done — 2.6× over Bun on dot; slerp needs pure-call LICM |
 | M3 — LLVM AOT (`lu build`): fast-flagged IR via clang | **done — 2.08× geomean over idiomatic C++, inside AE's claimed band** |
-| M4 — full property engine, shrinking | partial (runner works, no shrinking) |
-| M5 — middle-end: SoA layout, reduction vectorization, vector math | planned |
+| M4 — property engine with counterexample shrinking | done |
+| M5 — middle-end: inline math kernels (JIT LICM + vectorization), SoA layout | planned |
 
 Known v0.1 deviations from spec: arrays are reference-backed in the interpreter
 (aliasing is observable through them — will be fixed when the IR lands); functions
