@@ -547,6 +547,20 @@ impl<'a> Checker<'a> {
                         }
                         Ok(Type::Str)
                     }
+                    "chr" => {
+                        need(1)?;
+                        if ats[0] != Type::I64 {
+                            return Err("`chr` expects an i64".into());
+                        }
+                        Ok(Type::Str)
+                    }
+                    "concat" => {
+                        need(2)?;
+                        if ats[0] != Type::Str || ats[1] != Type::Str {
+                            return Err("`concat` expects two strs".into());
+                        }
+                        Ok(Type::Str)
+                    }
                     "read_file" => {
                         need(1)?;
                         if ats[0] != Type::Str {

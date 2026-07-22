@@ -227,9 +227,20 @@ and `lu build`.
 `read_file(path: str): str` expose CLI arguments (everything after the source
 file) and file contents in all three tiers; `puti/putf/putb/puts/putsp/putnl`
 are newline-free print primitives (the evaluator uses them to reproduce host
-`print` formatting exactly). The self-hosted interpreter shifts `arg` by one
-for the program it runs — the unix interpreter convention that makes
+`print` formatting exactly); `chr(b: i64): str` and
+`concat(a: str, b: str): str` construct strings (the self-hosted lexer uses
+them to decode escape sequences). The self-hosted interpreter shifts `arg` by
+one for the program it runs — the unix interpreter convention that makes
 unmodified towers possible.
+
+**Ladder self-application.** interp.lu also supports `sum` and `match`
+(desugared at parse time into an `==` if-chain with exhaustiveness checking,
+exactly like the host parser), decodes string escapes, and parses float
+literals via exact-mantissa/single-division (correctly rounded like the
+host's, up to ~15 significant digits). With that surface, the whole ladder
+runs on itself byte-identically: `lu run selfhost/interp.lu selfhost/lexer.lu`
+(or parser.lu, checker.lu, corpus/dot.lu) prints exactly what the native
+tiers print for those files.
 
 **Float printing.** All tiers print f64 as the shortest decimal that parses
 back exactly, in plain notation (never scientific) — Rust's `Display`

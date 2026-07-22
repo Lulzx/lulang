@@ -108,6 +108,8 @@ impl<'a> Jit<'a> {
             ("lu_arg", runtime::lu_arg as *const u8),
             ("lu_read_file", runtime::lu_read_file as *const u8),
             ("lu_last_len", runtime::lu_last_len as *const u8),
+            ("lu_chr", runtime::lu_chr as *const u8),
+            ("lu_concat", runtime::lu_concat as *const u8),
         ];
         for (n, ptr) in syms {
             jb.symbol(*n, *ptr);
@@ -166,6 +168,8 @@ impl<'a> Jit<'a> {
             ("lu_arg", 1, &[types::I64], false),
             ("lu_read_file", 1, &[types::I64, types::I64], false),
             ("lu_last_len", 1, &[], false),
+            ("lu_chr", 1, &[types::I64], false),
+            ("lu_concat", 1, &[types::I64, types::I64, types::I64, types::I64], false),
         ];
         for (name, kind, params, _) in specs {
             let mut sig = self.module.make_signature();
@@ -1394,7 +1398,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                     "sqrt" | "abs" | "floor" | "sin" | "cos" | "acos" | "min" | "max" | "pow"
                     | "atan2" | "float" => Some(CType::F64),
                     "int" | "len" | "nargs" => Some(CType::I64),
-                    "arg" | "read_file" => Some(CType::Str),
+                    "arg" | "read_file" | "chr" | "concat" => Some(CType::Str),
                     _ => self.spec_fn(name, depth),
                 }
             }
@@ -2043,6 +2047,19 @@ impl<'a, 'b> Gen<'a, 'b> {
             }
             "read_file" => {
                 let p = self.call_import("lu_read_file", &[avals[0][0], avals[0][1]])[0];
+                let l = self.call_import("lu_last_len", &[])[0];
+                Ok((CType::Str, vec![p, l]))
+            }
+            "chr" => {
+                let p = self.call_import("lu_chr", &[avals[0][0]])[0];
+                let l = self.call_import("lu_last_len", &[])[0];
+                Ok((CType::Str, vec![p, l]))
+            }
+            "concat" => {
+                let p = self.call_import(
+                    "lu_concat",
+                    &[avals[0][0], avals[0][1], avals[1][0], avals[1][1]],
+                )[0];
                 let l = self.call_import("lu_last_len", &[])[0];
                 Ok((CType::Str, vec![p, l]))
             }

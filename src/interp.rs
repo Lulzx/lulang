@@ -610,6 +610,16 @@ impl<'a> Interp<'a> {
                 let s = crate::runtime::args().get(i as usize).cloned().unwrap_or_default();
                 Ok(Value::Str(Rc::new(s)))
             }
+            "chr" => {
+                let c = as_i64(args.first().ok_or("`chr` needs 1 arg".to_string())?)?;
+                Ok(Value::Str(Rc::new(String::from_utf8_lossy(&[c as u8]).into_owned())))
+            }
+            "concat" => {
+                match (&args[0], &args[1]) {
+                    (Value::Str(a), Value::Str(b)) => Ok(Value::Str(Rc::new(format!("{}{}", a, b)))),
+                    _ => Err("`concat` expects two strs".into()),
+                }
+            }
             "read_file" => {
                 let p = match args.first() {
                     Some(Value::Str(s)) => s.to_string(),

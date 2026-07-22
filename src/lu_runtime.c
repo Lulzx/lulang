@@ -148,6 +148,21 @@ const char *lu_read_file(const char *p, long long n) {
 
 long long lu_last_len(void) { return g_last_len; }
 
+const char *lu_chr(long long c) {
+  char *p = malloc(1);
+  p[0] = (char)c;
+  g_last_len = 1;
+  return p;
+}
+
+const char *lu_concat(const char *ap, long long al, const char *bp, long long bl) {
+  char *p = malloc((size_t)(al + bl) + 1);
+  memcpy(p, ap, (size_t)al);
+  memcpy(p + al, bp, (size_t)bl);
+  g_last_len = al + bl;
+  return p;
+}
+
 /* Compiled programs enter through lu_entry; main runs it on a 512 MiB stack
    so deep recursion (e.g. self-hosted interpreter towers) doesn't overflow. */
 extern int lu_entry(void);

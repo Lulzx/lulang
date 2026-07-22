@@ -58,7 +58,7 @@ cargo build --release
 | M3 — LLVM AOT (`lu build`): fast-flagged IR via clang | **done — 2.08× geomean over idiomatic C++, inside AE's claimed band** |
 | M4 — property engine with counterexample shrinking | done |
 | M5 — middle-end: inline math kernels, if-conversion + LICM, SIMD `sum`, SoA record arrays | **done — JIT slerp 1.7×, dot 1.3×; record-array kernel beats idiomatic C++ `-O3` by 1.4× in both tiers** |
-| M6 — self-hosting: v0.2 surface + lulang lexer, parser, typechecker, and interpreter in lulang, able to run **its own source** | **done — [selfhost/interp.lu](selfhost/interp.lu) handles records, enums, and file input; a two-level interpreter tower (fib on lulang-on-lulang) matches native in <1 s AOT, and a three-level tower (`--heap` scaling) runs in 2.9 s. All tiers print floats identically (shortest round-trip, plain notation)** |
+| M6 — self-hosting: v0.2 surface + lulang lexer, parser, typechecker, and interpreter in lulang, able to run **its own source** | **done — [selfhost/interp.lu](selfhost/interp.lu) handles records, enums, `match`, `sum`, string escapes, and file input; interpreter towers reach depth 3 (`--heap` scaling, 2.9 s AOT); the whole ladder runs on itself byte-identically (`lu run selfhost/interp.lu selfhost/checker.lu` etc). All tiers print floats identically (shortest round-trip, plain notation)** |
 
 The M5 middle-end lives in the JIT tier (the AOT tier gets the equivalent from
 LLVM, plus the same SoA layout): branch-free inline sin/cos/acos kernels (musl

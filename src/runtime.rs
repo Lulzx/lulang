@@ -50,6 +50,26 @@ pub extern "C" fn lu_last_len() -> i64 {
     unsafe { LAST_LEN }
 }
 
+pub extern "C" fn lu_chr(c: i64) -> *const u8 {
+    let b = vec![c as u8];
+    unsafe { LAST_LEN = 1 };
+    let p = b.as_ptr();
+    std::mem::forget(b);
+    p
+}
+
+pub extern "C" fn lu_concat(ap: *const u8, al: i64, bp: *const u8, bl: i64) -> *const u8 {
+    let a = unsafe { std::slice::from_raw_parts(ap, al as usize) };
+    let b = unsafe { std::slice::from_raw_parts(bp, bl as usize) };
+    let mut v = Vec::with_capacity(a.len() + b.len());
+    v.extend_from_slice(a);
+    v.extend_from_slice(b);
+    unsafe { LAST_LEN = v.len() as i64 };
+    let p = v.as_ptr();
+    std::mem::forget(v);
+    p
+}
+
 pub extern "C" fn lu_print_f64(v: f64) {
     print!("{}", v);
 }

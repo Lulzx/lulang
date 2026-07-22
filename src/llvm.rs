@@ -138,6 +138,7 @@ pub fn build(p: &Program, src_path: &str, out_path: Option<&str>) -> Result<Stri
          declare void @lu_oob(i64, i64) #1\n\
          declare i64 @lu_nargs()\ndeclare ptr @lu_arg(i64)\n\
          declare ptr @lu_read_file(ptr, i64)\ndeclare i64 @lu_last_len()\n\
+         declare ptr @lu_chr(i64)\ndeclare ptr @lu_concat(ptr, i64, ptr, i64)\n\
          attributes #0 = { nounwind willreturn memory(none) }\n\
          attributes #1 = { noreturn }\n\n",
     );
@@ -1133,6 +1134,23 @@ impl<'a> Emit<'a> {
                 self.line(format!(
                     "{} = call ptr @lu_read_file(ptr {}, i64 {})",
                     p, args[0].regs[0], args[0].regs[1]
+                ));
+                let l = self.t();
+                self.line(format!("{} = call i64 @lu_last_len()", l));
+                Ok(EV { ty: CType::Str, regs: vec![p, l] })
+            }
+            "chr" => {
+                let p = self.t();
+                self.line(format!("{} = call ptr @lu_chr(i64 {})", p, args[0].regs[0]));
+                let l = self.t();
+                self.line(format!("{} = call i64 @lu_last_len()", l));
+                Ok(EV { ty: CType::Str, regs: vec![p, l] })
+            }
+            "concat" => {
+                let p = self.t();
+                self.line(format!(
+                    "{} = call ptr @lu_concat(ptr {}, i64 {}, ptr {}, i64 {})",
+                    p, args[0].regs[0], args[0].regs[1], args[1].regs[0], args[1].regs[1]
                 ));
                 let l = self.t();
                 self.line(format!("{} = call i64 @lu_last_len()", l));
