@@ -146,6 +146,19 @@ const char *lu_read_file(const char *p, long long n) {
   return buf;
 }
 
+void lu_write_file(const char *p, long long n, const char *data, long long dn) {
+  char path[4096];
+  if (n >= (long long)sizeof(path)) n = sizeof(path) - 1;
+  memcpy(path, p, (size_t)n);
+  path[n] = 0;
+  FILE *f = fopen(path, "wb");
+  if (!f || fwrite(data, 1, (size_t)dn, f) != (size_t)dn) {
+    fprintf(stderr, "error: cannot write %s\n", path);
+    exit(1);
+  }
+  fclose(f);
+}
+
 long long lu_last_len(void) { return g_last_len; }
 
 const char *lu_chr(long long c) {

@@ -633,6 +633,18 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
+            "write_file" => {
+                match (&args[0], &args[1]) {
+                    (Value::Str(p), Value::Str(c)) => {
+                        if let Err(e) = std::fs::write(p.as_str(), c.as_bytes()) {
+                            eprintln!("error: cannot write {}: {}", p, e);
+                            std::process::exit(1);
+                        }
+                        Ok(Value::Unit)
+                    }
+                    _ => Err("`write_file` expects (str, str)".into()),
+                }
+            }
             "sqrt" | "sin" | "cos" | "acos" | "abs" | "floor" => {
                 let x = as_f64(args.first().ok_or(format!("`{}` needs 1 arg", name))?)?;
                 Ok(Value::Float(match name {

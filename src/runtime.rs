@@ -46,6 +46,16 @@ pub extern "C" fn lu_read_file(ptr: *const u8, len: i64) -> *const u8 {
     }
 }
 
+pub extern "C" fn lu_write_file(pp: *const u8, pl: i64, cp: *const u8, cl: i64) {
+    let path = unsafe { std::slice::from_raw_parts(pp, pl as usize) };
+    let path = String::from_utf8_lossy(path).into_owned();
+    let data = unsafe { std::slice::from_raw_parts(cp, cl as usize) };
+    if let Err(e) = std::fs::write(&path, data) {
+        eprintln!("error: cannot write {}: {}", path, e);
+        std::process::exit(1);
+    }
+}
+
 pub extern "C" fn lu_last_len() -> i64 {
     unsafe { LAST_LEN }
 }

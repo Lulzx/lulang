@@ -231,7 +231,9 @@ and `lu build`.
 
 **Program input.** `nargs(): i64`, `arg(i: i64): str`, and
 `read_file(path: str): str` expose CLI arguments (everything after the source
-file) and file contents in all three tiers; `puti/putf/putb/puts/putsp/putnl`
+file) and file contents in all three tiers;
+`write_file(path: str, contents: str)` writes a file (creating or replacing
+it), so a self-hosted toolchain can emit its output without shell redirection; `puti/putf/putb/puts/putsp/putnl`
 are newline-free print primitives (the evaluator uses them to reproduce host
 `print` formatting exactly); `chr(b: i64): str` and
 `concat(a: str, b: str): str` construct strings (the self-hosted lexer uses

@@ -107,6 +107,7 @@ impl<'a> Jit<'a> {
             ("lu_nargs", runtime::lu_nargs as *const u8),
             ("lu_arg", runtime::lu_arg as *const u8),
             ("lu_read_file", runtime::lu_read_file as *const u8),
+            ("lu_write_file", runtime::lu_write_file as *const u8),
             ("lu_last_len", runtime::lu_last_len as *const u8),
             ("lu_chr", runtime::lu_chr as *const u8),
             ("lu_concat", runtime::lu_concat as *const u8),
@@ -167,6 +168,7 @@ impl<'a> Jit<'a> {
             ("lu_nargs", 1, &[], false),
             ("lu_arg", 1, &[types::I64], false),
             ("lu_read_file", 1, &[types::I64, types::I64], false),
+            ("lu_write_file", 0, &[types::I64, types::I64, types::I64, types::I64], false),
             ("lu_last_len", 1, &[], false),
             ("lu_chr", 1, &[types::I64], false),
             ("lu_concat", 1, &[types::I64, types::I64, types::I64, types::I64], false),
@@ -2049,6 +2051,13 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let p = self.call_import("lu_read_file", &[avals[0][0], avals[0][1]])[0];
                 let l = self.call_import("lu_last_len", &[])[0];
                 Ok((CType::Str, vec![p, l]))
+            }
+            "write_file" => {
+                self.call_import(
+                    "lu_write_file",
+                    &[avals[0][0], avals[0][1], avals[1][0], avals[1][1]],
+                );
+                Ok((CType::Unit, vec![]))
             }
             "chr" => {
                 let p = self.call_import("lu_chr", &[avals[0][0]])[0];

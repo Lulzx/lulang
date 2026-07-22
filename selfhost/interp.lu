@@ -1156,6 +1156,14 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
     }
     return 3
   }
+  if name == "write_file" {
+    if na != 2 or att[0] != 3 or att[1] != 3 {
+      print("type error: write_file expects (str, str)")
+      c.err = 1
+      return 5
+    }
+    return 4
+  }
   if name == "chr" {
     if na != 1 or att[0] != 0 {
       print("type error: chr expects an i64")
@@ -1788,6 +1796,12 @@ fn eval_call(p: P, inout m: M, e: i64): V {
   if name == "read_file" {
     let v = eval_expr(p, m, argv[0])
     return vstr(read_file(v.s))
+  }
+  if name == "write_file" {
+    let a2 = eval_expr(p, m, argv[0])
+    let b2 = eval_expr(p, m, argv[1])
+    write_file(a2.s, b2.s)
+    return vunit()
   }
   if name == "chr" {
     let v = eval_expr(p, m, argv[0])

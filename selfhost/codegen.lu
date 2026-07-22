@@ -1147,6 +1147,14 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
     }
     return 3
   }
+  if name == "write_file" {
+    if na != 2 or att[0] != 3 or att[1] != 3 {
+      print("type error: write_file expects (str, str)")
+      c.err = 1
+      return 5
+    }
+    return 4
+  }
   if name == "chr" {
     if na != 1 or att[0] != 0 {
       print("type error: chr expects an i64")
@@ -1600,7 +1608,6 @@ fn check_program(p: P, inout c: C) {
     check_block(p, c, p.mainbody, 4)
   }
 }
-
 // ---------- LLVM IR emitter ----------
 
 // emitter state: register/label counters, the variable environment (name ->
@@ -2587,6 +2594,10 @@ fn emit_call(p: P, inout g: G, e: i64): R {
     eline(c2str(lr, " = call i64 @lu_last_len()"))
     return rpush2(g, 3, pr, lr)
   }
+  if name == "write_file" {
+    eline(c9("call void @lu_write_file(ptr ", g.rs[ao[0]], ", i64 ", g.rs[ao[0] + 1], ", ptr ", g.rs[ao[1]], ", i64 ", g.rs[ao[1] + 1], ")"))
+    return runit()
+  }
   if name == "chr" {
     let pr = newt(g)
     eline(c4(pr, " = call ptr @lu_chr(i64 ", g.rs[ao[0]], ")"))
@@ -3054,6 +3065,8 @@ fn emit_module(p: P, inout g: G, triple: str) {
   puts("declare ptr @lu_read_file(ptr, i64)")
   putnl()
   puts("declare i64 @lu_last_len()")
+  putnl()
+  puts("declare void @lu_write_file(ptr, i64, ptr, i64)")
   putnl()
   puts("declare ptr @lu_chr(i64)")
   putnl()

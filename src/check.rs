@@ -601,6 +601,13 @@ impl<'a> Checker<'a> {
                         }
                         Ok(Type::Str)
                     }
+                    "write_file" => {
+                        need(2)?;
+                        if ats[0] != Type::Str || ats[1] != Type::Str {
+                            return Err("`write_file` expects (str, str)".into());
+                        }
+                        Ok(Type::Unit)
+                    }
                     "sqrt" | "sin" | "cos" | "acos" | "abs" | "floor" => {
                         need(1)?;
                         if !self.numeric(&ats[0]) {
