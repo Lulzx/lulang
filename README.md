@@ -46,6 +46,8 @@ cargo build --release
 ./target/release/lu run selfhost/interp.lu # lulang running lulang: full front end + evaluator
 ./target/release/lu run selfhost/interp.lu prog.lu                     # run a file
 ./target/release/lu run selfhost/interp.lu selfhost/interp.lu prog.lu # interpreter tower
+./selfhost/build.sh prog.lu          # AOT-compile prog.lu with the compiler written in lulang
+./selfhost/build.sh --bootstrap      # 3-stage self-compilation; verifies the IR fixpoint
 ```
 
 ## Status
@@ -59,6 +61,7 @@ cargo build --release
 | M4 — property engine with counterexample shrinking | done |
 | M5 — middle-end: inline math kernels, if-conversion + LICM, SIMD `sum`, SoA record arrays | **done — JIT slerp 1.7×, dot 1.3×; record-array kernel beats idiomatic C++ `-O3` by 1.4× in both tiers** |
 | M6 — self-hosting: full v0.1+v0.2 surface + lulang lexer, parser, typechecker, and interpreter in lulang, able to run **its own source** | **done — [selfhost/interp.lu](selfhost/interp.lu) handles records, enums, `match`, `sum`, user `operator`/`property` declarations, Unicode glyphs, string escapes, and file input; interpreter towers reach depth 3 (`--heap` scaling, 2.9 s AOT); the whole ladder *and* the slerp teaser corpus run on it byte-identically (`lu run selfhost/interp.lu corpus/slerp.lu`). All tiers print floats identically (shortest round-trip, plain notation)** |
+| M7 — bootstrapping compiler: LLVM AOT backend in lulang ([selfhost/codegen.lu](selfhost/codegen.lu)) | **done — the front end shared with interp.lu plus an IR emitter mirroring `src/llvm.rs` (flattened multi-component values, fast-flagged FP, SoA record arrays, hoisted bounds checks, same C runtime ABI). Compiles the whole ladder and the teaser corpus byte-identically to `lu build`, compiles interp.lu into a native interpreter that reruns the ladder, and **compiles itself to a fixpoint**: stage-1 (interpreted), stage-2, and stage-3 binaries emit byte-identical IR (`selfhost/build.sh --bootstrap`; self-compilation drops from 6.5 s interpreted to 60 ms compiled)** |
 
 The M5 middle-end lives in the JIT tier (the AOT tier gets the equivalent from
 LLVM, plus the same SoA layout): branch-free inline sin/cos/acos kernels (musl
