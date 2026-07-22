@@ -994,6 +994,58 @@ fn find_circ(p: P, open: str): i64 {
   return -1
 }
 
+// no-aliasing support: true if evaluating e can write variable `name`
+// through an inout parameter of some call nested inside it. Copy-in for an
+// inout argument snapshots the variable at its argument position, so a
+// mutation from a sibling argument would be silently lost — rejected here.
+fn arg_writes(p: P, e: i64, name: str): bool {
+  if e < 0 { return false }
+  let n = p.en[e]
+  if n.kind == EK.ECall {
+    let f = find_fn(p, n.text)
+    var a = n.a
+    var j = 0
+    while a >= 0 {
+      let an = p.en[a]
+      if f >= 0 and j < p.fnp[f] and p.pmut[p.fpo[f] + j] == 1 {
+        let ag = p.en[an.a]
+        if ag.kind == EK.EIdent and ag.text == name { return true }
+      }
+      if arg_writes(p, an.a, name) { return true }
+      j = j + 1
+      a = an.b
+    }
+    return false
+  }
+  if n.kind == EK.EBin or n.kind == EK.EIndex {
+    if arg_writes(p, n.a, name) { return true }
+    return arg_writes(p, n.b, name)
+  }
+  if n.kind == EK.EUn { return arg_writes(p, n.a, name) }
+  if n.kind == EK.EField {
+    let bn = p.en[n.a]
+    if bn.kind == EK.EIdent and find_enum(p, bn.text) >= 0 { return false }
+    return arg_writes(p, n.a, name)
+  }
+  if n.kind == EK.ERec {
+    var a = n.a
+    var hit = false
+    while a >= 0 {
+      let an = p.en[a]
+      if arg_writes(p, an.a, name) { hit = true }
+      a = an.b
+    }
+    return hit
+  }
+  if n.kind == EK.ESum {
+    let aux = p.en[n.b]
+    if arg_writes(p, n.a, name) { return true }
+    if arg_writes(p, aux.a, name) { return true }
+    return arg_writes(p, aux.b, name)
+  }
+  return false
+}
+
 fn check_call(p: P, inout c: C, e: i64): i64 {
   let node = p.en[e]
   let name = node.text
@@ -1154,6 +1206,21 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
               if c.stype[si] != pt {
                 print("type error: inout arg", i + 1, "of", name, "must be exactly", tname(p, pt), "got", tname(p, c.stype[si]))
                 c.err = 1
+              }
+              // no aliasing: no other argument may pass or mutate the same
+              // variable — copy-in/copy-out would silently drop one write
+              for j in 0..na {
+                if j != i and c.err == 0 {
+                  var bad = arg_writes(p, argv[j], an.text)
+                  if p.pmut[p.fpo[f] + j] == 1 {
+                    let aj = p.en[argv[j]]
+                    if aj.kind == EK.EIdent and aj.text == an.text { bad = true }
+                  }
+                  if bad {
+                    print("type error: inout arg", i + 1, "of", name, "aliases", an.text, "in arg", j + 1)
+                    c.err = 1
+                  }
+                }
               }
             }
           }

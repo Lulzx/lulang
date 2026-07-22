@@ -163,6 +163,12 @@ Implemented in all three tiers (interpreter, Cranelift JIT, LLVM AOT):
   of the exact type; operators and properties cannot take `inout`. In the
   outlined-call ABI the copy-out travels as extra return values; inlined
   calls write the SSA values back directly. No aliasing is ever created.
+  The checker enforces this at call sites: an `inout` argument's variable
+  may not be passed `inout` twice in one call, and no sibling argument may
+  contain a call that mutates it through its own `inout` parameter (copy-in
+  snapshots the variable at its argument position, so such a sibling write
+  would be silently lost). Read-only sibling uses remain legal:
+  `addto(g, g * 2)` is fine, `take(g, bump(g))` is rejected.
 - **Field assignment** — `lx.pos = e`, including nested paths, on mutable
   record variables. Pure value semantics (copy-on-write in the interpreter,
   per-component SSA/alloca writes in the back ends).

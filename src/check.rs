@@ -13,6 +13,39 @@ pub enum Type {
     Enum(usize),
 }
 
+/// True if evaluating `e` can write variable `name` through an `inout`
+/// parameter of some call nested inside it. Used by the no-aliasing rule:
+/// copy-in for an inout argument snapshots the variable at its argument
+/// position, so a mutation from a sibling argument would be silently lost.
+fn writes_var(p: &Program, e: ExprId, name: &str) -> bool {
+    match p.expr(e) {
+        Expr::Call(fname, args) => {
+            if let Some(f) = p.find_fn(fname) {
+                for (j, &a) in args.iter().enumerate() {
+                    if f.inouts.get(j).copied().unwrap_or(false) {
+                        if let Expr::Ident(n) = p.expr(a) {
+                            if n == name {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            args.iter().any(|&a| writes_var(p, a, name))
+        }
+        Expr::Bin(_, l, r) | Expr::Index(l, r) => {
+            writes_var(p, *l, name) || writes_var(p, *r, name)
+        }
+        Expr::Un(_, x) | Expr::Circum(_, x) | Expr::Field(x, _) => writes_var(p, *x, name),
+        Expr::Record(_, inits) => inits.iter().any(|(_, a)| writes_var(p, *a, name)),
+        Expr::Array(items) => items.iter().any(|&a| writes_var(p, a, name)),
+        Expr::Sum { lo, hi, body, .. } => {
+            writes_var(p, *lo, name) || writes_var(p, *hi, name) || writes_var(p, *body, name)
+        }
+        _ => false,
+    }
+}
+
 pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
     match s {
         "f64" | "f32" => Ok(Type::F64),
@@ -642,6 +675,22 @@ impl<'a> Checker<'a> {
                                                 "inout arg {} of `{}` must be exactly {}, got {}",
                                                 i + 1, name, self.name(p), self.name(&t)
                                             ));
+                                        }
+                                        // no aliasing: no other argument may pass or
+                                        // mutate the same variable — copy-in/copy-out
+                                        // would silently drop one of the writes
+                                        for (j, &aj) in args.iter().enumerate() {
+                                            if j == i {
+                                                continue;
+                                            }
+                                            let dup = inouts[j]
+                                                && matches!(self.p.expr(aj), Expr::Ident(m) if m == n);
+                                            if dup || writes_var(self.p, aj, n) {
+                                                return Err(format!(
+                                                    "inout arg {} of `{}` aliases `{}` in arg {}",
+                                                    i + 1, name, n, j + 1
+                                                ));
+                                            }
                                         }
                                     }
                                     _ => {
