@@ -592,6 +592,37 @@ impl<'a> Interp<'a> {
                 println!("{}", parts.join(" "));
                 Ok(Value::Unit)
             }
+            "puti" | "putf" | "putb" | "puts" => {
+                print!("{}", self.display(args.first().ok_or(format!("`{}` needs 1 arg", name))?));
+                Ok(Value::Unit)
+            }
+            "putsp" => {
+                print!(" ");
+                Ok(Value::Unit)
+            }
+            "putnl" => {
+                println!();
+                Ok(Value::Unit)
+            }
+            "nargs" => Ok(Value::Int(crate::runtime::args().len() as i64)),
+            "arg" => {
+                let i = as_i64(args.first().ok_or("`arg` needs 1 arg".to_string())?)?;
+                let s = crate::runtime::args().get(i as usize).cloned().unwrap_or_default();
+                Ok(Value::Str(Rc::new(s)))
+            }
+            "read_file" => {
+                let p = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    _ => return Err("`read_file` expects a str".into()),
+                };
+                match std::fs::read_to_string(&p) {
+                    Ok(s) => Ok(Value::Str(Rc::new(s))),
+                    Err(e) => {
+                        eprintln!("error: cannot read {}: {}", p, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             "sqrt" | "sin" | "cos" | "acos" | "abs" | "floor" => {
                 let x = as_f64(args.first().ok_or(format!("`{}` needs 1 arg", name))?)?;
                 Ok(Value::Float(match name {

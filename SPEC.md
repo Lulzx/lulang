@@ -197,16 +197,36 @@ codes (`i64/f64/bool/str/()` = 0–4, `[T]` = T+8), scopes are a linear symbol
 stack, and the rules match the Rust checker (int→float widening, bool
 conditions, exact-type `var` for `inout` args, fixed builtin signatures). Its
 driver checks 2 well-typed and 10 ill-typed programs, reporting the first
-error. Finally [selfhost/interp.lu](selfhost/interp.lu) closes the loop: the
-full pipeline (lexer with char literals, parser, quiet checker) plus a
-tree-walking evaluator — tagged value records, a bump-allocated heap of value
-slots for arrays, a linear env stack with per-call frame pointers,
-short-circuit `and`/`or`, `inout` copy-out into the caller's variable, and
-int→float coercion at the points the checker allows it. Programs executed by
-interp.lu print byte-identical output to the same programs under `lu run`.
-All four artifacts produce byte-identical output under `lu interp`, `lu run`,
+error. Finally [selfhost/interp.lu](selfhost/interp.lu) closes the loop and
+**runs its own source**: the full pipeline (lexer with char literals, parser
+with `type`/`enum` declarations and record literals, quiet checker with
+enum/record types) plus a tree-walking evaluator — tagged value records, a
+bump-allocated heap of value slots for arrays and record blocks (records keep
+value semantics: blocks copy on var-bind/assign/array-store, immutable
+bindings share), a linear env stack with per-call frame pointers,
+short-circuit `and`/`or`, `inout` write-back, and int→float coercion at the
+points the checker allows it. Programs executed by interp.lu print
+byte-identical output to the same programs under `lu run`, and
+`lu run selfhost/interp.lu selfhost/interp.lu fib.lu` runs a two-level
+interpreter tower — interp.lu interpreting its own 1,750-line source, which
+then interprets fib — verified to print the same answer in all three tiers
+(0.9 s AOT, 2.4 s JIT, 160 s host interpreter). All
+four artifacts produce byte-identical output under `lu interp`, `lu run`,
 and `lu build`.
 
-Self-hosting also surfaced that the compiled tiers lacked float `%`: the JIT
-now emits a call to `lu_fmod` and the AOT tier uses LLVM `frem`, matching the
-interpreter's Rust `%` (libm fmod) in all tiers.
+**Program input.** `nargs(): i64`, `arg(i: i64): str`, and
+`read_file(path: str): str` expose CLI arguments (everything after the source
+file) and file contents in all three tiers; `puti/putf/putb/puts/putsp/putnl`
+are newline-free print primitives (the evaluator uses them to reproduce host
+`print` formatting exactly). The self-hosted interpreter shifts `arg` by one
+for the program it runs — the unix interpreter convention that makes
+unmodified towers possible.
+
+Self-hosting has now surfaced and fixed three compiler gaps: float `%`
+(JIT calls `lu_fmod`, AOT emits `frem`, matching Rust's libm `%`), an
+unbounded inline policy (the JIT inlined every call to depth 8 with no size
+limit, which exploded exponentially on the evaluator's large mutually
+recursive functions — inlining now has a 3,000-statement per-function
+budget), and thin native stacks (all tiers now run programs on a 512 MiB
+thread; AOT binaries enter through `lu_entry` on a pthread the C runtime
+spawns).

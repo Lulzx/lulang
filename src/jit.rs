@@ -104,6 +104,10 @@ impl<'a> Jit<'a> {
             ("lu_atan2", runtime::lu_atan2 as *const u8),
             ("lu_pow", runtime::lu_pow as *const u8),
             ("lu_fmod", runtime::lu_fmod as *const u8),
+            ("lu_nargs", runtime::lu_nargs as *const u8),
+            ("lu_arg", runtime::lu_arg as *const u8),
+            ("lu_read_file", runtime::lu_read_file as *const u8),
+            ("lu_last_len", runtime::lu_last_len as *const u8),
         ];
         for (n, ptr) in syms {
             jb.symbol(*n, *ptr);
@@ -158,6 +162,10 @@ impl<'a> Jit<'a> {
             ("lu_atan2", 2, &[types::F64, types::F64], true),
             ("lu_pow", 2, &[types::F64, types::F64], true),
             ("lu_fmod", 2, &[types::F64, types::F64], true),
+            ("lu_nargs", 1, &[], false),
+            ("lu_arg", 1, &[types::I64], false),
+            ("lu_read_file", 1, &[types::I64, types::I64], false),
+            ("lu_last_len", 1, &[], false),
         ];
         for (name, kind, params, _) in specs {
             let mut sig = self.module.make_signature();
@@ -247,6 +255,7 @@ impl<'a> Jit<'a> {
                 refs: HashMap::new(),
                 inline_frames: Vec::new(),
                 inline_stack: Vec::new(),
+                inline_spent: 0,
                 trusted_idx: Vec::new(),
                 soa: self.soa,
                 simd: self.simd,
@@ -324,6 +333,7 @@ impl<'a> Jit<'a> {
                 refs: HashMap::new(),
                 inline_frames: Vec::new(),
                 inline_stack: Vec::new(),
+                inline_spent: 0,
                 trusted_idx: Vec::new(),
                 soa: self.soa,
                 simd: self.simd,
@@ -442,6 +452,21 @@ fn licm(func: &mut cranelift_codegen::ir::Function) {
     }
 }
 
+/// Statement count of a body including nested blocks — the unit of the
+/// per-function inlining budget.
+fn body_size(p: &Program, stmts: &[StmtId]) -> usize {
+    let mut n = 0;
+    for &sid in stmts {
+        n += 1;
+        match p.stmt(sid) {
+            Stmt::If(_, t, e) => n += body_size(p, t) + body_size(p, e),
+            Stmt::For(_, _, _, b) | Stmt::While(_, b) => n += body_size(p, b),
+            _ => {}
+        }
+    }
+    n
+}
+
 struct InlineFrame {
     result: Vec<Variable>,
     cont: cranelift_codegen::ir::Block,
@@ -457,6 +482,9 @@ struct Gen<'a, 'b> {
     refs: HashMap<String, cranelift_codegen::ir::FuncRef>,
     inline_frames: Vec<InlineFrame>,
     inline_stack: Vec<String>,
+    // statements of inlined bodies emitted into the current function; the
+    // budget stops exponential blowup on large mutually-calling functions
+    inline_spent: usize,
     // (array ident, loop var, logical length) triples whose whole index range
     // was checked at loop entry — accesses through them skip the per-element
     // bounds check and reuse the hoisted length for SoA plane addressing.
@@ -1365,7 +1393,8 @@ impl<'a, 'b> Gen<'a, 'b> {
                 match name.as_str() {
                     "sqrt" | "abs" | "floor" | "sin" | "cos" | "acos" | "min" | "max" | "pow"
                     | "atan2" | "float" => Some(CType::F64),
-                    "int" | "len" => Some(CType::I64),
+                    "int" | "len" | "nargs" => Some(CType::I64),
+                    "arg" | "read_file" => Some(CType::Str),
                     _ => self.spec_fn(name, depth),
                 }
             }
@@ -1838,9 +1867,13 @@ impl<'a, 'b> Gen<'a, 'b> {
             .expect("declared fn must exist");
         // Inline every user function up to a depth cap (recursion falls back to a
         // real call). Args are SSA values bound to fresh variables — evaluated
-        // exactly once, so this is always semantics-preserving.
+        // exactly once, so this is always semantics-preserving. A per-function
+        // size budget keeps large mutually-calling functions (e.g. a
+        // tree-walking evaluator) from exploding exponentially.
         let recursive = self.inline_stack.iter().any(|n| n == fname);
-        if !recursive && self.inline_stack.len() < 8 {
+        let size = body_size(self.p, &decl.body);
+        if !recursive && self.inline_stack.len() < 8 && self.inline_spent + size <= 3000 {
+            self.inline_spent += size;
             let params = self.fns[fname].params.clone();
             let saved_env = std::mem::replace(&mut self.env, vec![HashMap::new()]);
             let saved_trust = std::mem::take(&mut self.trusted_idx);
@@ -1974,6 +2007,44 @@ impl<'a, 'b> Gen<'a, 'b> {
                 }
                 self.call_import("lu_print_nl", &[]);
                 Ok((CType::Unit, vec![]))
+            }
+            "puti" => {
+                self.call_import("lu_print_i64", &[avals[0][0]]);
+                Ok((CType::Unit, vec![]))
+            }
+            "putf" => {
+                self.call_import("lu_print_f64", &[avals[0][0]]);
+                Ok((CType::Unit, vec![]))
+            }
+            "putb" => {
+                self.call_import("lu_print_bool", &[avals[0][0]]);
+                Ok((CType::Unit, vec![]))
+            }
+            "puts" => {
+                self.call_import("lu_print_str", &[avals[0][0], avals[0][1]]);
+                Ok((CType::Unit, vec![]))
+            }
+            "putsp" => {
+                self.call_import("lu_print_sep", &[]);
+                Ok((CType::Unit, vec![]))
+            }
+            "putnl" => {
+                self.call_import("lu_print_nl", &[]);
+                Ok((CType::Unit, vec![]))
+            }
+            "nargs" => {
+                let v = self.call_import("lu_nargs", &[])[0];
+                Ok((CType::I64, vec![v]))
+            }
+            "arg" => {
+                let p = self.call_import("lu_arg", &[avals[0][0]])[0];
+                let l = self.call_import("lu_last_len", &[])[0];
+                Ok((CType::Str, vec![p, l]))
+            }
+            "read_file" => {
+                let p = self.call_import("lu_read_file", &[avals[0][0], avals[0][1]])[0];
+                let l = self.call_import("lu_last_len", &[])[0];
+                Ok((CType::Str, vec![p, l]))
             }
             "sqrt" | "abs" | "floor" | "sin" | "cos" | "acos" => {
                 let x = self.f64_of(&atys[0], avals[0][0]);

@@ -2,6 +2,53 @@
 // followed by 8-byte elements; allocations are leaked (benchmark-lifetime model,
 // real memory management arrives with the value-semantics IR).
 use std::alloc::{alloc, Layout};
+use std::sync::OnceLock;
+
+// program arguments (everything after the source file on the CLI) and the
+// str-returning builtin protocol: calls that produce a str return the pointer
+// and stash the length for an immediately following lu_last_len() call
+// (single-threaded language, same protocol as the C runtime).
+static ARGS: OnceLock<Vec<String>> = OnceLock::new();
+static mut LAST_LEN: i64 = 0;
+
+pub fn set_args(args: Vec<String>) {
+    let _ = ARGS.set(args);
+}
+
+pub fn args() -> &'static [String] {
+    ARGS.get().map(|v| v.as_slice()).unwrap_or(&[])
+}
+
+pub extern "C" fn lu_nargs() -> i64 {
+    args().len() as i64
+}
+
+pub extern "C" fn lu_arg(i: i64) -> *const u8 {
+    let s = args().get(i as usize).map(|s| s.as_str()).unwrap_or("");
+    unsafe { LAST_LEN = s.len() as i64 };
+    s.as_ptr()
+}
+
+pub extern "C" fn lu_read_file(ptr: *const u8, len: i64) -> *const u8 {
+    let path = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let path = String::from_utf8_lossy(path).into_owned();
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            unsafe { LAST_LEN = bytes.len() as i64 };
+            let p = bytes.as_ptr();
+            std::mem::forget(bytes);
+            p
+        }
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", path, e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub extern "C" fn lu_last_len() -> i64 {
+    unsafe { LAST_LEN }
+}
 
 pub extern "C" fn lu_print_f64(v: f64) {
     print!("{}", v);

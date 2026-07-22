@@ -44,6 +44,8 @@ cargo build --release
 ./target/release/lu run selfhost/parser.lu # the lulang parser, written in lulang
 ./target/release/lu run selfhost/checker.lu # the lulang typechecker, written in lulang
 ./target/release/lu run selfhost/interp.lu # lulang running lulang: full front end + evaluator
+./target/release/lu run selfhost/interp.lu prog.lu                     # run a file
+./target/release/lu run selfhost/interp.lu selfhost/interp.lu prog.lu # interpreter tower
 ```
 
 ## Status
@@ -56,7 +58,7 @@ cargo build --release
 | M3 — LLVM AOT (`lu build`): fast-flagged IR via clang | **done — 2.08× geomean over idiomatic C++, inside AE's claimed band** |
 | M4 — property engine with counterexample shrinking | done |
 | M5 — middle-end: inline math kernels, if-conversion + LICM, SIMD `sum`, SoA record arrays | **done — JIT slerp 1.7×, dot 1.3×; record-array kernel beats idiomatic C++ `-O3` by 1.4× in both tiers** |
-| M6 — self-hosting begun: v0.2 surface (enums, `match`, `inout`, `while`, strings) + lulang lexer, parser, typechecker, and interpreter in lulang | **loop closed — [selfhost/lexer.lu](selfhost/lexer.lu), [selfhost/parser.lu](selfhost/parser.lu), [selfhost/checker.lu](selfhost/checker.lu), and [selfhost/interp.lu](selfhost/interp.lu) (full pipeline + tree-walking evaluator) run identically in all three tiers; programs run under interp.lu print byte-identical output to `lu run`** |
+| M6 — self-hosting: v0.2 surface + lulang lexer, parser, typechecker, and interpreter in lulang, able to run **its own source** | **done — [selfhost/interp.lu](selfhost/interp.lu) handles records, enums, and file input; `lu run selfhost/interp.lu selfhost/interp.lu fib.lu` runs a two-level interpreter tower (fib on lulang-on-lulang) printing the same answer as native, in <1 s AOT** |
 
 The M5 middle-end lives in the JIT tier (the AOT tier gets the equivalent from
 LLVM, plus the same SoA layout): branch-free inline sin/cos/acos kernels (musl

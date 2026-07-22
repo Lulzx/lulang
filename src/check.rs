@@ -504,6 +504,56 @@ impl<'a> Checker<'a> {
                 };
                 match name.as_str() {
                     "print" => Ok(Type::Unit),
+                    "putsp" | "putnl" => {
+                        need(0)?;
+                        Ok(Type::Unit)
+                    }
+                    "puti" => {
+                        need(1)?;
+                        if ats[0] != Type::I64 {
+                            return Err("`puti` expects an i64".into());
+                        }
+                        Ok(Type::Unit)
+                    }
+                    "putf" => {
+                        need(1)?;
+                        if ats[0] != Type::F64 {
+                            return Err("`putf` expects an f64".into());
+                        }
+                        Ok(Type::Unit)
+                    }
+                    "putb" => {
+                        need(1)?;
+                        if ats[0] != Type::Bool {
+                            return Err("`putb` expects a bool".into());
+                        }
+                        Ok(Type::Unit)
+                    }
+                    "puts" => {
+                        need(1)?;
+                        if ats[0] != Type::Str {
+                            return Err("`puts` expects a str".into());
+                        }
+                        Ok(Type::Unit)
+                    }
+                    "nargs" => {
+                        need(0)?;
+                        Ok(Type::I64)
+                    }
+                    "arg" => {
+                        need(1)?;
+                        if ats[0] != Type::I64 {
+                            return Err("`arg` expects an i64".into());
+                        }
+                        Ok(Type::Str)
+                    }
+                    "read_file" => {
+                        need(1)?;
+                        if ats[0] != Type::Str {
+                            return Err("`read_file` expects a str".into());
+                        }
+                        Ok(Type::Str)
+                    }
                     "sqrt" | "sin" | "cos" | "acos" | "abs" | "floor" => {
                         need(1)?;
                         if !self.numeric(&ats[0]) {

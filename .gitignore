@@ -6,3 +6,12 @@ experiments/bench-fast
 experiments/tiny.cpp
 *.o
 *.ll
+/slerp
+/dot
+/qnorm
+/interp
+/checker
+/parser
+/lexer
+/fmod_t
+/argt

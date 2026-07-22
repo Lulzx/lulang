@@ -1,17 +1,25 @@
 // selfhost/interp.lu — the complete lulang front end *and* evaluator, written
-// in lulang (M6, rung 3 of the self-hosting ladder — this closes the loop:
-// lulang programs running on a lulang-written implementation). Pipeline:
-// lexer (extended with char literals) -> Pratt parser -> typechecker (same as
-// selfhost/checker.lu, quiet on success) -> tree-walking evaluator.
+// in lulang (M6 — and it runs its own source). Pipeline: lexer (with char
+// literals) -> Pratt parser (type/enum declarations, record literals) ->
+// typechecker (quiet on success) -> tree-walking evaluator.
 //
-// Evaluator model: values are tagged records V (0=i64 1=f64 2=bool 3=str
-// 4=unit, >=8 array of tag-8); arrays live in a bump-allocated heap of value
-// slots; variables live on a linear env stack with a frame pointer per call;
-// `inout` params copy their final value back into the caller's variable after
-// the call; `and`/`or` short-circuit; int widens to float on assignment,
-// argument passing, array store, and return. Programs whose `print` calls
-// take a single argument produce byte-identical output to the host tiers,
-// which is how the driver's transcript is verified against `lu run`.
+// Run a file:      lu run selfhost/interp.lu prog.lu [prog args...]
+// Interpreter tower (this file interpreting itself interpreting prog.lu):
+//                  lu run selfhost/interp.lu selfhost/interp.lu prog.lu
+// The interpreted program sees the remaining CLI args as its own (arg(i)
+// here maps to arg(i+1) of the host), so towers stack with no source edits.
+// With no args, a built-in demo suite runs whose transcript is byte-identical
+// to running the same programs natively under `lu run`.
+//
+// Evaluator model: values are tagged records V (type codes 0=i64 1=f64
+// 2=bool 3=str 4=unit, enums 16+, records 64+, arrays T+1024); arrays and
+// record blocks live in a bump-allocated heap of value slots; records have
+// value semantics (blocks copy on var-bind, assignment, and array store;
+// immutable bindings and parameters share); variables live on a linear env
+// stack with a frame pointer per call; `inout` params write back into the
+// caller's variable; `and`/`or` short-circuit; int widens to float exactly
+// where the checker permits it; `print` reproduces host formatting through
+// the put* builtins.
 
 // ---------- lexer (same as selfhost/lexer.lu) ----------
 
@@ -153,11 +161,12 @@ fn next_token(inout lx: Lexer): Token {
 
 // ---------- flat AST ----------
 
-enum EK { ENum, EStr, EIdent, EBin, EUn, ECall, EIndex, EField, EArg }
+enum EK { ENum, EStr, EIdent, EBin, EUn, ECall, EIndex, EField, EArg, ERec }
 // ENum: num, b=1 if float literal | EStr/EIdent: text
 // EBin: text=op a=l b=r | EUn: text=op a
 // ECall: text=name a=arg-chain(-1 none) | EIndex: a=base b=idx
-// EField: a=base text=field | EArg: a=expr b=next(-1)
+// EField: a=base text=field | EArg: a=expr b=next(-1), text=field name in ERec
+// ERec: text=type name a=EArg chain of named field inits
 type ENode { kind: EK, a: i64, b: i64, num: f64, text: str }
 
 enum SK { SLet, SVar, SAssign, SIf, SFor, SWhile, SReturn, SExpr }
@@ -167,15 +176,53 @@ enum SK { SLet, SVar, SAssign, SIf, SFor, SWhile, SReturn, SExpr }
 // every stmt: nxt = next in block chain (-1 ends)
 type SNode { kind: SK, a: i64, b: i64, c: i64, nxt: i64, text: str }
 
-// type codes: 0=i64 1=f64 2=bool 3=str 4=unit 5=error; [T] = T + 8
+// type codes: 0=i64 1=f64 2=bool 3=str 4=unit 5=error;
+// enum Ei = 16+ei, record Ti = 64+ti, [T] = T + 1024 (nestable)
 type P {
   toks: [Token], nt: i64, pos: i64,
   en: [ENode], ne: i64,
   sn: [SNode], ns: i64,
   fname: [str], fret: [i64], fpo: [i64], fnp: [i64], fbody: [i64], nf: i64,
   pname: [str], ptype: [i64], pmut: [i64], np: i64,
+  tyname: [str], tfo: [i64], tnf: [i64], nty: i64,
+  flname: [str], flty: [i64], nfl: i64,
+  ename: [str], evo: [i64], evn: [i64], nen: i64,
+  vrname: [str], nvr: i64,
   mainbody: i64,
   err: i64
+}
+
+fn is_arrt(t: i64): bool { return t >= 1024 }
+fn elem_of(t: i64): i64 { return t - 1024 }
+fn is_enumt(t: i64): bool { return t >= 16 and t < 64 }
+fn is_rect(t: i64): bool { return t >= 64 and t < 1024 }
+
+fn find_ty(p: P, name: str): i64 {
+  for i in 0..p.nty {
+    if p.tyname[i] == name { return i }
+  }
+  return -1
+}
+
+fn find_enum(p: P, name: str): i64 {
+  for i in 0..p.nen {
+    if p.ename[i] == name { return i }
+  }
+  return -1
+}
+
+fn enum_variant(p: P, ei: i64, name: str): i64 {
+  for i in 0..p.evn[ei] {
+    if p.vrname[p.evo[ei] + i] == name { return i }
+  }
+  return -1
+}
+
+fn field_index(p: P, ti: i64, name: str): i64 {
+  for i in 0..p.tnf[ti] {
+    if p.flname[p.tfo[ti] + i] == name { return i }
+  }
+  return -1
 }
 
 fn new_expr(inout p: P, k: EK, a: i64, b: i64, num: f64, text: str): i64 {
@@ -326,6 +373,25 @@ fn parse_args(inout p: P): i64 {
   return node
 }
 
+fn parse_field_inits(inout p: P): i64 {
+  // consumes up to and including "}"; returns EArg chain (text = field name)
+  skipnl(p)
+  if cur_is_sym(p, "}") {
+    p.pos = p.pos + 1
+    return -1
+  }
+  let f = take_ident(p)
+  expect_sym(p, ":")
+  let e = parse_expr(p, 0)
+  let node = new_expr(p, EK.EArg, e, -1, 0.0, f)
+  if cur_is_sym(p, ",") { p.pos = p.pos + 1 }
+  let rest = parse_field_inits(p)
+  var tmp = p.en[node]
+  tmp.b = rest
+  p.en[node] = tmp
+  return node
+}
+
 fn parse_atom(inout p: P): i64 {
   let t = p.toks[p.pos]
   if t.kind == Kind.KInt or t.kind == Kind.KFloat {
@@ -344,6 +410,12 @@ fn parse_atom(inout p: P): i64 {
       p.pos = p.pos + 1
       let argsh = parse_args(p)
       return new_expr(p, EK.ECall, argsh, -1, 0.0, t.text)
+    }
+    // record literal only when the name is a declared type (host rule)
+    if cur_is_sym(p, "{") and find_ty(p, t.text) >= 0 {
+      p.pos = p.pos + 1
+      let inits = parse_field_inits(p)
+      return new_expr(p, EK.ERec, inits, -1, 0.0, t.text)
     }
     return new_expr(p, EK.EIdent, -1, -1, 0.0, t.text)
   }
@@ -453,15 +525,72 @@ fn parse_type(inout p: P): i64 {
     p.pos = p.pos + 1
     let t = parse_type(p)
     expect_sym(p, "]")
-    return t + 8
+    return t + 1024
   }
   let t = take_ident(p)
   if t == "i64" or t == "i32" { return 0 }
   if t == "f64" or t == "f32" { return 1 }
   if t == "bool" { return 2 }
   if t == "str" { return 3 }
+  let ei = find_enum(p, t)
+  if ei >= 0 { return 16 + ei }
+  let ti = find_ty(p, t)
+  if ti >= 0 { return 64 + ti }
   fail(p, "type")
   return 5
+}
+
+fn parse_type_decl(inout p: P) {
+  let name = take_ident(p)
+  skipnl(p)
+  expect_sym(p, "{")
+  p.tyname[p.nty] = name
+  p.tfo[p.nty] = p.nfl
+  var nf = 0
+  var going = true
+  while going and p.err == 0 {
+    skipnl(p)
+    if cur_is_sym(p, "}") {
+      p.pos = p.pos + 1
+      going = false
+    } else {
+      let f = take_ident(p)
+      expect_sym(p, ":")
+      let t = parse_type(p)
+      p.flname[p.nfl] = f
+      p.flty[p.nfl] = t
+      p.nfl = p.nfl + 1
+      nf = nf + 1
+      if cur_is_sym(p, ",") { p.pos = p.pos + 1 }
+    }
+  }
+  p.tnf[p.nty] = nf
+  p.nty = p.nty + 1
+}
+
+fn parse_enum_decl(inout p: P) {
+  let name = take_ident(p)
+  skipnl(p)
+  expect_sym(p, "{")
+  p.ename[p.nen] = name
+  p.evo[p.nen] = p.nvr
+  var nv = 0
+  var going = true
+  while going and p.err == 0 {
+    skipnl(p)
+    if cur_is_sym(p, "}") {
+      p.pos = p.pos + 1
+      going = false
+    } else {
+      let v = take_ident(p)
+      p.vrname[p.nvr] = v
+      p.nvr = p.nvr + 1
+      nv = nv + 1
+      if cur_is_sym(p, ",") { p.pos = p.pos + 1 }
+    }
+  }
+  p.evn[p.nen] = nv
+  p.nen = p.nen + 1
 }
 
 fn parse_params(inout p: P): i64 {
@@ -521,11 +650,21 @@ fn parse_top(inout p: P) {
         p.fbody[p.nf] = body
         p.nf = p.nf + 1
       } else {
-        if cur_is_kw(p, "main") {
+        if cur_is_kw(p, "type") {
           p.pos = p.pos + 1
-          p.mainbody = parse_block(p)
+          parse_type_decl(p)
         } else {
-          fail(p, "fn or main")
+          if cur_is_kw(p, "enum") {
+            p.pos = p.pos + 1
+            parse_enum_decl(p)
+          } else {
+            if cur_is_kw(p, "main") {
+              p.pos = p.pos + 1
+              p.mainbody = parse_block(p)
+            } else {
+              fail(p, "declaration")
+            }
+          }
         }
       }
     }
@@ -536,17 +675,19 @@ fn parse_top(inout p: P) {
 
 type C { sname: [str], stype: [i64], smut: [i64], nsym: i64, err: i64 }
 
-fn tname(t: i64): str {
+fn tname(p: P, t: i64): str {
   if t == 0 { return "i64" }
   if t == 1 { return "f64" }
   if t == 2 { return "bool" }
   if t == 3 { return "str" }
   if t == 4 { return "()" }
-  if t == 8 { return "[i64]" }
-  if t == 9 { return "[f64]" }
-  if t == 10 { return "[bool]" }
-  if t == 11 { return "[str]" }
-  if t >= 16 { return "[[..]]" }
+  if is_enumt(t) { return p.ename[t - 16] }
+  if is_rect(t) { return p.tyname[t - 64] }
+  if t == 1024 { return "[i64]" }
+  if t == 1025 { return "[f64]" }
+  if t == 1026 { return "[bool]" }
+  if t == 1027 { return "[str]" }
+  if is_arrt(t) { return "[..]" }
   return "<error>"
 }
 
@@ -632,7 +773,7 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
     return 0
   }
   if name == "len" {
-    if na != 1 or (att[0] != 3 and att[0] < 8) {
+    if na != 1 or (att[0] != 3 and not is_arrt(att[0])) {
       print("type error: len expects an array or str")
       c.err = 1
       return 5
@@ -653,7 +794,44 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
       c.err = 1
       return 5
     }
-    return att[1] + 8
+    return att[1] + 1024
+  }
+  if name == "nargs" or name == "putsp" or name == "putnl" {
+    if na != 0 {
+      print("type error:", name, "expects no args")
+      c.err = 1
+      return 5
+    }
+    if name == "nargs" { return 0 }
+    return 4
+  }
+  if name == "arg" {
+    if na != 1 or att[0] != 0 {
+      print("type error: arg expects an i64")
+      c.err = 1
+      return 5
+    }
+    return 3
+  }
+  if name == "read_file" {
+    if na != 1 or att[0] != 3 {
+      print("type error: read_file expects a str")
+      c.err = 1
+      return 5
+    }
+    return 3
+  }
+  if name == "puti" or name == "putf" or name == "putb" or name == "puts" {
+    var want = 0
+    if name == "putf" { want = 1 }
+    if name == "putb" { want = 2 }
+    if name == "puts" { want = 3 }
+    if na != 1 or att[0] != want {
+      print("type error:", name, "expects one", tname(p, want), "arg")
+      c.err = 1
+      return 5
+    }
+    return 4
   }
   // user function
   let f = find_fn(p, name)
@@ -684,7 +862,7 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
               c.err = 1
             } else {
               if c.stype[si] != pt {
-                print("type error: inout arg", i + 1, "of", name, "must be exactly", tname(pt), "got", tname(c.stype[si]))
+                print("type error: inout arg", i + 1, "of", name, "must be exactly", tname(p, pt), "got", tname(p, c.stype[si]))
                 c.err = 1
               }
             }
@@ -695,7 +873,7 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
         }
       } else {
         if not compat(pt, att[i]) {
-          print("type error: arg", i + 1, "of", name, "expected", tname(pt), "got", tname(att[i]))
+          print("type error: arg", i + 1, "of", name, "expected", tname(p, pt), "got", tname(p, att[i]))
           c.err = 1
         }
       }
@@ -728,12 +906,12 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
     if c.err == 1 { return 5 }
     if n.text == "-" {
       if is_num(t) { return t }
-      print("type error: cannot negate", tname(t))
+      print("type error: cannot negate", tname(p, t))
       c.err = 1
       return 5
     }
     if t == 2 { return 2 }
-    print("type error: not needs a bool, got", tname(t))
+    print("type error: not needs a bool, got", tname(p, t))
     c.err = 1
     return 5
   }
@@ -744,7 +922,7 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
     let op = n.text
     if op == "and" or op == "or" {
       if lt == 2 and rt == 2 { return 2 }
-      print("type error:", op, "needs bool operands, got", tname(lt), "and", tname(rt))
+      print("type error:", op, "needs bool operands, got", tname(p, lt), "and", tname(p, rt))
       c.err = 1
       return 5
     }
@@ -753,19 +931,19 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
         if lt == 1 or rt == 1 { return 1 }
         return 0
       }
-      print("type error: cannot apply", op, "to", tname(lt), "and", tname(rt))
+      print("type error: cannot apply", op, "to", tname(p, lt), "and", tname(p, rt))
       c.err = 1
       return 5
     }
     if op == "==" or op == "!=" {
       if lt == rt or (is_num(lt) and is_num(rt)) { return 2 }
-      print("type error: cannot compare", tname(lt), "with", tname(rt))
+      print("type error: cannot compare", tname(p, lt), "with", tname(p, rt))
       c.err = 1
       return 5
     }
     // < <= > >= ~=
     if is_num(lt) and is_num(rt) { return 2 }
-    print("type error: cannot compare", tname(lt), "with", tname(rt))
+    print("type error: cannot compare", tname(p, lt), "with", tname(p, rt))
     c.err = 1
     return 5
   }
@@ -775,22 +953,75 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
     let bt = check_expr(p, c, n.a)
     if c.err == 1 { return 5 }
     if it != 0 {
-      print("type error: array index must be i64, got", tname(it))
+      print("type error: array index must be i64, got", tname(p, it))
       c.err = 1
       return 5
     }
-    if bt >= 8 { return bt - 8 }
+    if is_arrt(bt) { return elem_of(bt) }
     if bt == 3 { return 0 }
-    print("type error: cannot index into", tname(bt))
+    print("type error: cannot index into", tname(p, bt))
     c.err = 1
     return 5
   }
   if n.kind == EK.EField {
+    let base = p.en[n.a]
+    if base.kind == EK.EIdent {
+      // an enum name in base position is a value reference, not a variable
+      let ei = find_enum(p, base.text)
+      if ei >= 0 {
+        if enum_variant(p, ei, n.text) < 0 {
+          print("type error: unknown enum value", base.text, ".", n.text)
+          c.err = 1
+          return 5
+        }
+        return 16 + ei
+      }
+    }
     let bt = check_expr(p, c, n.a)
     if c.err == 1 { return 5 }
-    print("type error: cannot access field", n.text, "on", tname(bt))
+    if is_rect(bt) {
+      let ti = bt - 64
+      let fi = field_index(p, ti, n.text)
+      if fi < 0 {
+        print("type error: type", tname(p, bt), "has no field", n.text)
+        c.err = 1
+        return 5
+      }
+      return p.flty[p.tfo[ti] + fi]
+    }
+    print("type error: cannot access field", n.text, "on", tname(p, bt))
     c.err = 1
     return 5
+  }
+  if n.kind == EK.ERec {
+    let ti = find_ty(p, n.text)
+    var cnt = 0
+    var a = n.a
+    while a >= 0 and c.err == 0 {
+      let an = p.en[a]
+      let fi = field_index(p, ti, an.text)
+      if fi < 0 {
+        print("type error: type", n.text, "has no field", an.text)
+        c.err = 1
+        return 5
+      }
+      let ft = p.flty[p.tfo[ti] + fi]
+      let got = check_expr(p, c, an.a)
+      if c.err == 1 { return 5 }
+      if not compat(ft, got) {
+        print("type error: field", an.text, "of", n.text, "is", tname(p, ft), "got", tname(p, got))
+        c.err = 1
+        return 5
+      }
+      cnt = cnt + 1
+      a = an.b
+    }
+    if cnt != p.tnf[ti] {
+      print("type error:", n.text, "has", p.tnf[ti], "fields, literal provides", cnt)
+      c.err = 1
+      return 5
+    }
+    return 64 + ti
   }
   print("type error: unexpected expression node")
   c.err = 1
@@ -829,7 +1060,7 @@ fn check_stmt(p: P, inout c: C, s: i64, ret: i64): i64 {
         return 4
       }
       if not compat(c.stype[si], vt) {
-        print("type error: cannot assign", tname(vt), "to", tgt.text, "of type", tname(c.stype[si]))
+        print("type error: cannot assign", tname(p, vt), "to", tgt.text, "of type", tname(p, c.stype[si]))
         c.err = 1
       }
       return 4
@@ -839,17 +1070,17 @@ fn check_stmt(p: P, inout c: C, s: i64, ret: i64): i64 {
       let bt = check_expr(p, c, tgt.a)
       if c.err == 1 { return 4 }
       if it != 0 {
-        print("type error: array index must be i64, got", tname(it))
+        print("type error: array index must be i64, got", tname(p, it))
         c.err = 1
         return 4
       }
-      if bt < 8 {
-        print("type error: cannot index into", tname(bt))
+      if not is_arrt(bt) {
+        print("type error: cannot index into", tname(p, bt))
         c.err = 1
         return 4
       }
-      if not compat(bt - 8, vt) {
-        print("type error: cannot store", tname(vt), "in", tname(bt))
+      if not compat(elem_of(bt), vt) {
+        print("type error: cannot store", tname(p, vt), "in", tname(p, bt))
         c.err = 1
         return 4
       }
@@ -863,6 +1094,39 @@ fn check_stmt(p: P, inout c: C, s: i64, ret: i64): i64 {
       }
       return 4
     }
+    if tgt.kind == EK.EField {
+      // walk the field chain down to the root variable, which must be mutable
+      var cur = n.a
+      var walking = true
+      while walking {
+        let tn = p.en[cur]
+        if tn.kind == EK.EField { cur = tn.a } else { walking = false }
+      }
+      let root = p.en[cur]
+      if root.kind != EK.EIdent {
+        print("type error: field assignment root must be a variable")
+        c.err = 1
+        return 4
+      }
+      let si = find_sym(c, root.text)
+      if si < 0 {
+        print("type error: unknown variable", root.text)
+        c.err = 1
+        return 4
+      }
+      if c.smut[si] == 0 {
+        print("type error: cannot assign through immutable binding", root.text)
+        c.err = 1
+        return 4
+      }
+      let ft = check_expr(p, c, n.a)
+      if c.err == 1 { return 4 }
+      if not compat(ft, vt) {
+        print("type error: cannot assign", tname(p, vt), "to field of type", tname(p, ft))
+        c.err = 1
+      }
+      return 4
+    }
     print("type error: invalid assignment target")
     c.err = 1
     return 4
@@ -871,7 +1135,7 @@ fn check_stmt(p: P, inout c: C, s: i64, ret: i64): i64 {
     let t = check_expr(p, c, n.a)
     if c.err == 1 { return 4 }
     if t != 2 {
-      print("type error: if condition must be bool, got", tname(t))
+      print("type error: if condition must be bool, got", tname(p, t))
       c.err = 1
       return 4
     }
@@ -883,7 +1147,7 @@ fn check_stmt(p: P, inout c: C, s: i64, ret: i64): i64 {
     let t = check_expr(p, c, n.a)
     if c.err == 1 { return 4 }
     if t != 2 {
-      print("type error: while condition must be bool, got", tname(t))
+      print("type error: while condition must be bool, got", tname(p, t))
       c.err = 1
       return 4
     }
@@ -895,7 +1159,7 @@ fn check_stmt(p: P, inout c: C, s: i64, ret: i64): i64 {
     let hi = check_expr(p, c, n.b)
     if c.err == 1 { return 4 }
     if lo != 0 or hi != 0 {
-      print("type error: for bounds must be i64, got", tname(lo), "and", tname(hi))
+      print("type error: for bounds must be i64, got", tname(p, lo), "and", tname(p, hi))
       c.err = 1
       return 4
     }
@@ -910,7 +1174,7 @@ fn check_stmt(p: P, inout c: C, s: i64, ret: i64): i64 {
     if n.a >= 0 { t = check_expr(p, c, n.a) }
     if c.err == 1 { return ret }
     if not compat(ret, t) {
-      print("type error: return type mismatch, expected", tname(ret), "got", tname(t))
+      print("type error: return type mismatch, expected", tname(p, ret), "got", tname(p, t))
       c.err = 1
     }
     return ret
@@ -939,7 +1203,7 @@ fn check_fn(p: P, inout c: C, f: i64) {
   let last = check_block(p, c, p.fbody[f], ret)
   if c.err == 0 and ret != 4 {
     if not compat(ret, last) {
-      print("type error: fn", p.fname[f], "declares return type", tname(ret), "but body produces", tname(last))
+      print("type error: fn", p.fname[f], "declares return type", tname(p, ret), "but body produces", tname(p, last))
       c.err = 1
     }
   }
@@ -958,8 +1222,11 @@ fn check_program(p: P, inout c: C) {
 }
 // ---------- evaluator ----------
 
-// runtime value: t is the type code from the checker; i64/bool live in i,
-// f64 in f, str in s, arrays are (o=heap offset, n=len) with element tag t-8
+// runtime value: t is the type code from the checker; i64/bool/enum live in
+// i, f64 in f, str in s; arrays and records are heap blocks (o=offset,
+// n=len/field count). Records have value semantics: blocks are copied
+// whenever a record is stored (var bind, assignment, array slot) — reads and
+// immutable bindings share the block.
 type V { t: i64, i: i64, f: f64, s: str, o: i64, n: i64 }
 
 type M {
@@ -1002,13 +1269,25 @@ fn find_var(m: M, name: str): i64 {
   return -1
 }
 
-fn print_v(v: V) {
-  if v.t == 0 { print(v.i) }
-  if v.t == 1 { print(v.f) }
-  if v.t == 2 {
-    if v.i == 1 { print(true) } else { print(false) }
+// copy a record block (value semantics); everything else passes through
+fn copy_val(inout m: M, v: V): V {
+  if not is_rect(v.t) { return v }
+  let o2 = m.hp
+  m.hp = m.hp + v.n
+  for j in 0..v.n {
+    let f = m.heap[v.o + j]
+    m.heap[o2 + j] = copy_val(m, f)
   }
-  if v.t == 3 { print(v.s) }
+  return V { t: v.t, i: 0, f: 0.0, s: "", o: o2, n: v.n }
+}
+
+fn put_v(v: V) {
+  if v.t == 0 { puti(v.i) }
+  if v.t == 1 { putf(v.f) }
+  if v.t == 2 {
+    if v.i == 1 { putb(true) } else { putb(false) }
+  }
+  if v.t == 3 { puts(v.s) }
 }
 
 fn eval_bin(inout m: M, op: str, l: V, r: V): V {
@@ -1045,7 +1324,7 @@ fn eval_bin(inout m: M, op: str, l: V, r: V): V {
     if l.t == 3 {
       if l.s == r.s { same = 1 }
     } else {
-      if l.t == 2 or r.t == 2 {
+      if l.t == 2 or is_enumt(l.t) {
         if l.i == r.i { same = 1 }
       } else {
         if num_of(l) == num_of(r) { same = 1 }
@@ -1083,9 +1362,41 @@ fn eval_call(p: P, inout m: M, e: i64): V {
   if name == "print" {
     for i in 0..na {
       let v = eval_expr(p, m, argv[i])
-      if m.halt == 0 { print_v(v) }
+      if m.halt == 0 {
+        if i > 0 { putsp() }
+        put_v(v)
+      }
     }
+    if m.halt == 0 { putnl() }
     return vunit()
+  }
+  if name == "puti" or name == "putf" or name == "putb" or name == "puts" {
+    let v = eval_expr(p, m, argv[0])
+    if m.halt == 0 { put_v(v) }
+    return vunit()
+  }
+  if name == "putsp" {
+    putsp()
+    return vunit()
+  }
+  if name == "putnl" {
+    putnl()
+    return vunit()
+  }
+  if name == "nargs" {
+    // interpreter convention: the interpreted program sees our args shifted
+    // by one — arg(0) here was the source path, its arg(0) is our arg(1)
+    var k = nargs() - 1
+    if k < 0 { k = 0 }
+    return vint(k)
+  }
+  if name == "arg" {
+    let i = eval_expr(p, m, argv[0])
+    return vstr(arg(i.i + 1))
+  }
+  if name == "read_file" {
+    let v = eval_expr(p, m, argv[0])
+    return vstr(read_file(v.s))
   }
   if name == "sqrt" or name == "sin" or name == "cos" or name == "acos" or name == "abs" or name == "floor" {
     let x = num_of(eval_expr(p, m, argv[0]))
@@ -1130,11 +1441,11 @@ fn eval_call(p: P, inout m: M, e: i64): V {
     let cnt = eval_expr(p, m, argv[0])
     let init = eval_expr(p, m, argv[1])
     let o = m.hp
+    m.hp = m.hp + cnt.i
     for j in 0..cnt.i {
-      m.heap[m.hp] = init
-      m.hp = m.hp + 1
+      m.heap[o + j] = copy_val(m, init)
     }
-    return V { t: init.t + 8, i: 0, f: 0.0, s: "", o: o, n: cnt.i }
+    return V { t: init.t + 1024, i: 0, f: 0.0, s: "", o: o, n: cnt.i }
   }
   // user function
   let f = find_fn(p, name)
@@ -1234,6 +1545,34 @@ fn eval_expr(p: P, inout m: M, e: i64): V {
     }
     return m.heap[base.o + idx.i]
   }
+  if nd.kind == EK.EField {
+    let base = p.en[nd.a]
+    if base.kind == EK.EIdent {
+      let ei = find_enum(p, base.text)
+      if ei >= 0 {
+        return V { t: 16 + ei, i: enum_variant(p, ei, nd.text), f: 0.0, s: "", o: 0, n: 0 }
+      }
+    }
+    let v = eval_expr(p, m, nd.a)
+    if m.halt == 1 { return vunit() }
+    let fi = field_index(p, v.t - 64, nd.text)
+    return m.heap[v.o + fi]
+  }
+  if nd.kind == EK.ERec {
+    let ti = find_ty(p, nd.text)
+    let nf = p.tnf[ti]
+    let o = m.hp
+    m.hp = m.hp + nf
+    var a = nd.a
+    while a >= 0 and m.halt == 0 {
+      let an = p.en[a]
+      let fi = field_index(p, ti, an.text)
+      let fv = coerce(eval_expr(p, m, an.a), p.flty[p.tfo[ti] + fi])
+      if m.halt == 0 { m.heap[o + fi] = copy_val(m, fv) }
+      a = an.b
+    }
+    return V { t: 64 + ti, i: 0, f: 0.0, s: "", o: o, n: nf }
+  }
   print("runtime error: unsupported expression")
   m.halt = 1
   return vunit()
@@ -1242,8 +1581,12 @@ fn eval_expr(p: P, inout m: M, e: i64): V {
 fn exec_stmt(p: P, inout m: M, s: i64) {
   let n = p.sn[s]
   if n.kind == SK.SLet or n.kind == SK.SVar {
-    let v = eval_expr(p, m, n.a)
-    if m.halt == 0 { bindv(m, n.text, v) }
+    var v = eval_expr(p, m, n.a)
+    if m.halt == 0 {
+      // a var owns its record block; let bindings are immutable and share
+      if n.kind == SK.SVar { v = copy_val(m, v) }
+      bindv(m, n.text, v)
+    }
     return
   }
   if n.kind == SK.SAssign {
@@ -1252,19 +1595,28 @@ fn exec_stmt(p: P, inout m: M, s: i64) {
     let tgt = p.en[n.a]
     if tgt.kind == EK.EIdent {
       let idx = find_var(m, tgt.text)
-      m.vval[idx] = coerce(v, m.vval[idx].t)
+      m.vval[idx] = copy_val(m, coerce(v, m.vval[idx].t))
       return
     }
-    // checked: target is an index into an array variable
-    let base = eval_expr(p, m, tgt.a)
-    let idx = eval_expr(p, m, tgt.b)
+    if tgt.kind == EK.EIndex {
+      let base = eval_expr(p, m, tgt.a)
+      let idx = eval_expr(p, m, tgt.b)
+      if m.halt == 1 { return }
+      if idx.i < 0 or idx.i >= base.n {
+        print("runtime error: index out of bounds")
+        m.halt = 1
+        return
+      }
+      m.heap[base.o + idx.i] = copy_val(m, coerce(v, elem_of(base.t)))
+      return
+    }
+    // checked: x.f = v (possibly nested) — the enclosing record block is
+    // uniquely owned by the root var, so writing the slot in place is safe
+    let bv = eval_expr(p, m, tgt.a)
     if m.halt == 1 { return }
-    if idx.i < 0 or idx.i >= base.n {
-      print("runtime error: index out of bounds")
-      m.halt = 1
-      return
-    }
-    m.heap[base.o + idx.i] = coerce(v, base.t - 8)
+    let ti = bv.t - 64
+    let fi = field_index(p, ti, tgt.text)
+    m.heap[bv.o + fi] = copy_val(m, coerce(v, p.flty[p.tfo[ti] + fi]))
     return
   }
   if n.kind == SK.SIf {
@@ -1328,8 +1680,7 @@ fn exec_block(p: P, inout m: M, s0: i64) {
 
 // ---------- driver ----------
 
-fn run(label: str, src: str) {
-  print(label)
+fn run_src(src: str) {
   var lx = Lexer { src: src, pos: 0 }
   let cap = len(src) + 2
   var toks = arr(cap, Token { kind: Kind.KEof, text: "", num: 0.0 })
@@ -1350,8 +1701,12 @@ fn run(label: str, src: str) {
     toks: toks, nt: nt, pos: 0,
     en: arr(cap * 2, ENode { kind: EK.ENum, a: -1, b: -1, num: 0.0, text: "" }), ne: 0,
     sn: arr(cap, SNode { kind: SK.SExpr, a: -1, b: -1, c: -1, nxt: -1, text: "" }), ns: 0,
-    fname: arr(32, ""), fret: arr(32, 4), fpo: arr(32, 0), fnp: arr(32, 0), fbody: arr(32, -1), nf: 0,
-    pname: arr(64, ""), ptype: arr(64, 5), pmut: arr(64, 0), np: 0,
+    fname: arr(256, ""), fret: arr(256, 4), fpo: arr(256, 0), fnp: arr(256, 0), fbody: arr(256, -1), nf: 0,
+    pname: arr(2048, ""), ptype: arr(2048, 5), pmut: arr(2048, 0), np: 0,
+    tyname: arr(64, ""), tfo: arr(64, 0), tnf: arr(64, 0), nty: 0,
+    flname: arr(512, ""), flty: arr(512, 5), nfl: 0,
+    ename: arr(32, ""), evo: arr(32, 0), evn: arr(32, 0), nen: 0,
+    vrname: arr(256, ""), nvr: 0,
     mainbody: -1,
     err: 0
   }
@@ -1360,7 +1715,7 @@ fn run(label: str, src: str) {
     print("PARSE FAILED")
     return
   }
-  var c = C { sname: arr(256, ""), stype: arr(256, 5), smut: arr(256, 0), nsym: 0, err: 0 }
+  var c = C { sname: arr(512, ""), stype: arr(512, 5), smut: arr(512, 0), nsym: 0, err: 0 }
   check_program(p, c)
   if c.err == 1 {
     print("typecheck: FAILED")
@@ -1368,8 +1723,10 @@ fn run(label: str, src: str) {
   }
   if p.mainbody >= 0 {
     var m = M {
-      heap: arr(65536, vunit()), hp: 0,
-      vname: arr(4096, ""), vval: arr(4096, vunit()), nv: 0, fp: 0,
+      // sized from measurement: evaluating this file itself peaks at about
+      // 182 heap slots per source byte (record-literal blocks + copies)
+      heap: arr(len(src) * 256 + 65536, vunit()), hp: 0,
+      vname: arr(8192, ""), vval: arr(8192, vunit()), nv: 0, fp: 0,
       ret: vunit(), returned: 0,
       halt: 0
     }
@@ -1377,11 +1734,24 @@ fn run(label: str, src: str) {
   }
 }
 
+fn run(label: str, src: str) {
+  print(label)
+  run_src(src)
+}
+
 main {
+  // file mode: `lu run selfhost/interp.lu <program.lu> [its args...]` — the
+  // interpreted program sees the remaining arguments as its own. Passing
+  // this very file as the program stacks interpreters into a tower.
+  if nargs() > 0 {
+    run_src(read_file(arg(0)))
+    return
+  }
   run("== fib", "fn fib(n: i64): i64 {\n  if n < 2 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\nmain {\n  print(fib(20))\n}\n")
   run("== collatz (inout)", "fn collatz(inout steps: i64, n0: i64) {\n  var n = n0\n  while n != 1 {\n    if n % 2 == 0 { n = n / 2 } else { n = 3 * n + 1 }\n    steps = steps + 1\n  }\n}\nmain {\n  var s = 0\n  collatz(s, 27)\n  print(s)\n}\n")
   run("== dot (arrays, widening)", "fn dot(a: [f64], b: [f64], n: i64): f64 {\n  var acc = 0.0\n  for i in 0..n {\n    acc = acc + a[i] * b[i]\n  }\n  return acc\n}\nmain {\n  let n = 100\n  var a = arr(n, 0.0)\n  var b = arr(n, 0.0)\n  for i in 0..n {\n    a[i] = float(i) * 0.5\n    b[i] = float(i) * 0.25\n  }\n  print(dot(a, b, n))\n}\n")
   run("== strings (chars, short-circuit)", "fn count_l(s: str): i64 {\n  var i = 0\n  var k = 0\n  while i < len(s) and s[i] != '\\0' {\n    if s[i] == 'l' { k = k + 1 }\n    i = i + 1\n  }\n  return k\n}\nmain {\n  print(count_l(\"hello lulang\"))\n  print(substr(\"self-hosting\", 0, 4))\n}\n")
   run("== math (~=, builtins)", "main {\n  let x = sqrt(2.0)\n  print(x * x ~= 2.0)\n  print(min(3.5, 2.0) + max(1.0, 4.0))\n  print(floor(3.9))\n  print(not (1 > 2))\n}\n")
+  run("== records and enums", "enum Color { Red, Green, Blue }\ntype Point { x: f64, y: f64 }\nfn norm2(q: Point): f64 {\n  return q.x * q.x + q.y * q.y\n}\nfn shift(inout q: Point, d: f64) {\n  q.x = q.x + d\n  q.y = q.y + d\n}\nmain {\n  var q = Point { x: 3.0, y: 4.0 }\n  print(norm2(q))\n  shift(q, 1.0)\n  print(q.x, q.y)\n  var pts = arr(3, Point { x: 0.0, y: 0.0 })\n  for i in 0..3 {\n    var w = pts[i]\n    w.x = float(i) + 0.5\n    pts[i] = w\n  }\n  print(pts[2].x)\n  let c = Color.Green\n  print(c == Color.Green, c == Color.Blue)\n}\n")
   run("== bounds (runtime error)", "main {\n  var v = arr(2, 0)\n  print(v[0])\n  print(v[5])\n}\n")
 }
