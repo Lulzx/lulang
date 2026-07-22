@@ -163,3 +163,108 @@ JIT tier: dot 213.5→102.9 ms (**2.63× faster than Bun**), slerp 341→308 ms.
 The remaining slerp gap is extern sin/acos calls per iteration, which Cranelift
 cannot hoist (no pure-call attribute) — the planned middle-end fix is inline
 polynomial math kernels, which double as the M5 vectorizable math library.
+
+---
+
+# Experiment 2 — M5: owning the middle-end (JIT passes + SoA layout)
+
+*2026-07-22, Apple M4 Pro. Whole-process wall clock (`hyperfine`, mean of 10,
+2 warmups) on the corpus `.lu` files as committed; `lu` startup+JIT overhead is
+~2.1 ms of every number. Equal workloads across languages in each row.*
+
+M5 moves the optimizations that the M1 experiment simulated with clang flags
+into passes we own. Five mechanisms, each independently ablatable:
+
+1. **Inline math kernels** (`LU_MATH=call` reverts): sin/cos/acos emitted as
+   branch-free pure Cranelift IR — Cody-Waite reduction + musl minimax
+   polynomials, selects instead of branches. Worst error measured vs libm:
+   ~2 ulp (contract is rtol 2⁻⁴⁰ ≈ 9e-13, so ~3 000× headroom).
+2. **If-conversion** (`LU_IFCONV=off`): speculation-safe `if` arms (pure,
+   non-trapping — no prints, allocs, array ops, or integer division) execute
+   unconditionally and merge through selects, keeping values in pure SSA
+   instead of merge block-params.
+3. **LICM** (`LU_LICM=off`): our own CLIF-level pass hoisting pure
+   instructions with loop-invariant operands to the preheader, run *after*
+   Cranelift's egraph pass. (Cranelift's own elaboration re-materializes
+   constants into loops, which sinks whole constant-fed chains back into the
+   loop body — so the module compiles at opt_level=none and we drive the
+   egraph + LICM pipeline manually.)
+4. **SIMD `sum`** (`LU_SIMD=off`): reductions whose body is pure f64
+   arithmetic over check-free unit-stride loads vectorize to f64x2 × 4
+   accumulators (8 lanes/iter), scalar remainder loop.
+5. **SoA record arrays** (`LU_LAYOUT=aos`): `arr(n, Record)` lays fields out
+   as per-field planes — the layout freedom the language contract grants.
+   Implemented in both the JIT and the LLVM AOT tier.
+
+## slerp: the passes only pay as a *system*
+
+`bench_slerp.lu`, 2M slerps through user operators (JIT tier):
+
+| Configuration | ms |
+|---|---|
+| kernels off, if-conv off, LICM off (≈ M4 state) | 32.4 |
+| + inline kernels only | 32.2 |
+| + kernels + LICM (no if-conv) | 32.9 |
+| + kernels + if-conv (no LICM) | 35.0 |
+| **all three** | **18.8 (1.72×)** |
+
+No pass helps alone: libcalls aren't hoistable (kernels fix that), invariant
+values hide behind merge block-params (if-conversion fixes that), and nothing
+hoists unless a pass actually does it (Cranelift's won't; ours does). After the
+composed passes, 109 instructions — `a·b`, `acos(d)`, `sin(th)`, the branch
+selects — sit in the preheader; the loop retains the two `t`-dependent sins as
+~30-flop inline polynomials. This is the "slerp needs pure-call LICM" gap from
+M2, closed.
+
+## dot: SIMD reduction
+
+`bench_dot.lu`, 20 × 2M-element dot (memory-bound at this size):
+
+| Configuration | ms |
+|---|---|
+| scalar 4-accumulator `sum` (M4 state) | 16.0 |
+| f64x2 × 4 `sum` | **12.1 (1.3×)** |
+| Bun, same workload | 39.6 |
+
+## qnorm: layout × SIMD is the point (new corpus kernel)
+
+`bench_qnorm.lu`, 20 reduction passes over 2M `Quat` records — the first
+record-array benchmark (M4 JIT/AOT couldn't compile record arrays at all).
+Twins: idiomatic C++ AoS `struct Quat` + `std::vector` at `-O3`; Bun gets
+hand-written SoA typed arrays (its best case, not its idiomatic case).
+
+| Variant | ms |
+|---|---|
+| lu JIT, AoS scalar | 29.6 |
+| lu JIT, SoA scalar | 30.2 |
+| **lu JIT, SoA + SIMD** | **21.0** |
+| lu AOT, AoS | 23.8 |
+| **lu AOT, SoA** | **21.3** |
+| C++ AoS idiomatic `-O3` | 28.6–30.5 |
+| Bun (hand-SoA typed arrays) | 50.5 |
+
+SoA alone is ~neutral in scalar code (four streams vs one). Its value is that
+it *legalizes* vectorization: every field access becomes a unit-stride plane
+load, so the JIT's `sum` vectorizer (and LLVM's, in the AOT tier) can fire on
+record fields. Composed, **both lu tiers beat idiomatic C++ `-O3` by ~1.4×**
+on a record-array kernel — the compiler-owned-layout thesis, now implemented
+as passes rather than simulated with flags.
+
+## Scorecard movement
+
+| AE claim | after M3/M4 | after M5 |
+|---|---|---|
+| JIT vs js (Bun, whole-process) | dot 1.27×, slerp 0.46× | **dot 3.3×, slerp 1.7×, qnorm 2.4×** |
+| record arrays | unsupported outside interpreter | SoA in both tiers, beats C++ `-O3` |
+
+Startup for scale: `lu run` on a hello program is 2.1 ms (Bun: 7.6 ms).
+
+## Honest losses
+
+- SoA costs ~2% in scalar-only code on this kernel (extra address streams).
+- If-conversion executes both arms; on a branch-predictable workload with a
+  heavy arm it can lose (slerp with LICM off measured 35.0 vs 32.4 baseline) —
+  it pays only in concert with LICM, which is why both ship together.
+- The trig kernels give up correct rounding (~2 ulp) and huge-argument range
+  reduction; both are inside the approximate-FP contract, and `exact` (v0.2)
+  will route back to libm.

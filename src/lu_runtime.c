@@ -34,6 +34,10 @@ char *lu_arr_new_i64(long long n, long long init) {
   return p;
 }
 
+/* Uninitialized array of n 8-byte slots; the compiler emits the fill loop
+   (record arrays are laid out SoA — a compiler decision, not a runtime one). */
+char *lu_arr_new_raw(long long n) { return arr_alloc(n); }
+
 void lu_oob(long long idx, long long len) {
   fprintf(stderr, "error: index %lld out of bounds (length %lld)\n", idx, len);
   exit(1);

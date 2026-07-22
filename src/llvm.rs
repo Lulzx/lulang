@@ -56,7 +56,8 @@ struct Emit<'a> {
     // name -> (type, alloca ptrs per component)
     env: Vec<HashMap<String, (CType, Vec<String>)>>,
     strings: Vec<String>,
-    trusted: Vec<(String, String)>,
+    trusted: Vec<(String, String, String)>,
+    soa: bool,
     ret: CType,
     terminated: bool,
 }
@@ -70,6 +71,7 @@ pub fn build(p: &Program, src_path: &str, out_path: Option<&str>) -> Result<Stri
         env: vec![HashMap::new()],
         strings: Vec::new(),
         trusted: Vec::new(),
+        soa: std::env::var("LU_LAYOUT").map(|v| v != "aos").unwrap_or(true),
         ret: CType::Unit,
         terminated: false,
     };
@@ -104,6 +106,7 @@ pub fn build(p: &Program, src_path: &str, out_path: Option<&str>) -> Result<Stri
          declare void @lu_print_f64(double)\ndeclare void @lu_print_i64(i64)\n\
          declare void @lu_print_bool(i64)\ndeclare void @lu_print_str(ptr, i64)\n\
          declare void @lu_print_sep()\ndeclare void @lu_print_nl()\n\
+         declare ptr @lu_arr_new_raw(i64)\n\
          declare ptr @lu_arr_new_f64(i64, double)\ndeclare ptr @lu_arr_new_i64(i64, i64)\n\
          declare void @lu_oob(i64, i64) #1\n\
          attributes #0 = { nounwind willreturn memory(none) }\n\
@@ -338,11 +341,9 @@ impl<'a> Emit<'a> {
                             CType::Arr(e) => e.as_ref().clone(),
                             _ => return Err("cannot index non-array".into()),
                         };
-                        let addr = self.index_addr(&av.regs[0], &iv.regs[0], &elem, trusted)?;
+                        let addrs = self.elem_addrs(&av.regs[0], &iv.regs[0], &elem, trusted)?;
                         let comps = lty(self.p, &elem)?;
-                        for (k, (c, r)) in comps.iter().zip(v.regs.iter()).enumerate() {
-                            let ep = self.t();
-                            self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", ep, addr, k * 8));
+                        for ((c, r), ep) in comps.iter().zip(v.regs.iter()).zip(addrs.iter()) {
                             self.line(format!("store {} {}, ptr {}", c, r, ep));
                         }
                     }
@@ -451,11 +452,14 @@ impl<'a> Emit<'a> {
         }
     }
 
-    fn is_trusted(&self, a: ExprId, i: ExprId) -> bool {
+    fn is_trusted(&self, a: ExprId, i: ExprId) -> Option<String> {
         if let (Expr::Ident(an), Expr::Ident(inm)) = (self.p.expr(a), self.p.expr(i)) {
-            self.trusted.iter().any(|(x, y)| x == an && y == inm)
+            self.trusted
+                .iter()
+                .find(|(x, y, _)| x == an && y == inm)
+                .map(|(_, _, n)| n.clone())
         } else {
-            false
+            None
         }
     }
 
@@ -488,42 +492,71 @@ impl<'a> Emit<'a> {
             self.line(format!("call void @lu_oob(i64 {}, i64 {})", hi, logical));
             self.line("unreachable".into());
             self.label(&lg);
-            self.trusted.push((name.clone(), var.to_string()));
+            self.trusted.push((name.clone(), var.to_string(), logical.clone()));
             pushed += 1;
         }
         Ok(pushed)
     }
 
-    fn index_addr(&mut self, base: &str, idx: &str, elem: &CType, trusted: bool) -> Result<String, String> {
+    /// Per-component addresses of element `idx` — same layout contract as the
+    /// JIT: scalar/AoS elements contiguous, SoA records (default) in per-field
+    /// planes of `n` slots, so field accesses are unit-stride for the
+    /// vectorizer. `trusted` carries the loop-hoisted logical length.
+    fn elem_addrs(&mut self, base: &str, idx: &str, elem: &CType, trusted: Option<String>) -> Result<Vec<String>, String> {
         let stride = lty(self.p, elem)?.len() as i64;
-        if !trusted {
-            let lenr = self.t();
-            self.line(format!("{} = load i64, ptr {}", lenr, base));
-            let logical = if stride == 1 {
-                lenr.clone()
-            } else {
-                let d = self.t();
-                self.line(format!("{} = sdiv i64 {}, {}", d, lenr, stride));
-                d
-            };
-            let bad = self.t();
-            self.line(format!("{} = icmp uge i64 {}, {}", bad, idx, logical));
-            let lb = self.l();
-            let lg = self.l();
-            self.line(format!("br i1 {}, label %{}, label %{}", bad, lb, lg));
-            self.label(&lb);
-            self.line(format!("call void @lu_oob(i64 {}, i64 {})", idx, logical));
-            self.line("unreachable".into());
-            self.label(&lg);
+        let logical = match trusted {
+            Some(n) => n,
+            None => {
+                let lenr = self.t();
+                self.line(format!("{} = load i64, ptr {}", lenr, base));
+                let logical = if stride == 1 {
+                    lenr.clone()
+                } else {
+                    let d = self.t();
+                    self.line(format!("{} = sdiv i64 {}, {}", d, lenr, stride));
+                    d
+                };
+                let bad = self.t();
+                self.line(format!("{} = icmp uge i64 {}, {}", bad, idx, logical));
+                let lb = self.l();
+                let lg = self.l();
+                self.line(format!("br i1 {}, label %{}, label %{}", bad, lb, lg));
+                self.label(&lb);
+                self.line(format!("call void @lu_oob(i64 {}, i64 {})", idx, logical));
+                self.line("unreachable".into());
+                self.label(&lg);
+                logical
+            }
+        };
+        let mut out = Vec::new();
+        if stride > 1 && self.soa {
+            let lane = self.t();
+            self.line(format!("{} = mul i64 {}, 8", lane, idx));
+            let lane8 = self.t();
+            self.line(format!("{} = add i64 {}, 8", lane8, lane));
+            for c in 0..stride {
+                let plane = self.t();
+                self.line(format!("{} = mul i64 {}, {}", plane, logical, 8 * c));
+                let off = self.t();
+                self.line(format!("{} = add i64 {}, {}", off, lane8, plane));
+                let addr = self.t();
+                self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", addr, base, off));
+                out.push(addr);
+            }
+        } else {
+            let off = self.t();
+            self.line(format!("{} = mul i64 {}, {}", off, idx, stride * 8));
+            for c in 0..stride {
+                let offc = self.t();
+                self.line(format!("{} = add i64 {}, {}", offc, off, 8 + 8 * c));
+                let addr = self.t();
+                self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", addr, base, offc));
+                out.push(addr);
+            }
         }
-        let off = self.t();
-        self.line(format!("{} = mul i64 {}, {}", off, idx, stride * 8));
-        let off8 = self.t();
-        self.line(format!("{} = add i64 {}, 8", off8, off));
-        let addr = self.t();
-        self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", addr, base, off8));
-        Ok(addr)
+        Ok(out)
     }
+
 
     fn emit_expr(&mut self, eid: ExprId) -> Result<EV, String> {
         match self.p.expr(eid) {
@@ -580,12 +613,10 @@ impl<'a> Emit<'a> {
                     CType::Arr(e) => e.as_ref().clone(),
                     _ => return Err("cannot index non-array".into()),
                 };
-                let addr = self.index_addr(&av.regs[0], &iv.regs[0], &elem, trusted)?;
+                let addrs = self.elem_addrs(&av.regs[0], &iv.regs[0], &elem, trusted)?;
                 let comps = lty(self.p, &elem)?;
                 let mut regs = Vec::new();
-                for (k, c) in comps.iter().enumerate() {
-                    let ep = self.t();
-                    self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", ep, addr, k * 8));
+                for (c, ep) in comps.iter().zip(addrs.iter()) {
                     let r = self.t();
                     self.line(format!("{} = load {}, ptr {}", r, c, ep));
                     regs.push(r);
@@ -953,6 +984,41 @@ impl<'a> Emit<'a> {
                             t, n, args[1].regs[0]
                         ));
                         Ok(EV { ty: CType::Arr(Box::new(CType::I64)), regs: vec![t] })
+                    }
+                    t @ CType::Rec(_) => {
+                        let elem = t.clone();
+                        let stride = lty(self.p, &elem)? .len() as i64;
+                        let slots = self.t();
+                        self.line(format!("{} = mul i64 {}, {}", slots, n, stride));
+                        let base = self.t();
+                        self.line(format!("{} = call ptr @lu_arr_new_raw(i64 {})", base, slots));
+                        // fill loop over logical elements, SoA planes by default
+                        let iptr = self.t();
+                        self.line(format!("{} = alloca i64", iptr));
+                        self.line(format!("store i64 0, ptr {}", iptr));
+                        let lh = self.l();
+                        let lb = self.l();
+                        let lx = self.l();
+                        let n = n.clone();
+                        self.line(format!("br label %{}", lh));
+                        self.label(&lh);
+                        let iv = self.t();
+                        self.line(format!("{} = load i64, ptr {}", iv, iptr));
+                        let more = self.t();
+                        self.line(format!("{} = icmp slt i64 {}, {}", more, iv, n));
+                        self.line(format!("br i1 {}, label %{}, label %{}", more, lb, lx));
+                        self.label(&lb);
+                        let addrs = self.elem_addrs(&base, &iv, &elem, Some(n.clone()))?;
+                        let comps = lty(self.p, &elem)?;
+                        for ((c, r), ep) in comps.iter().zip(args[1].regs.iter()).zip(addrs.iter()) {
+                            self.line(format!("store {} {}, ptr {}", c, r, ep));
+                        }
+                        let ivn = self.t();
+                        self.line(format!("{} = add i64 {}, 1", ivn, iv));
+                        self.line(format!("store i64 {}, ptr {}", ivn, iptr));
+                        self.line(format!("br label %{}", lh));
+                        self.label(&lx);
+                        Ok(EV { ty: CType::Arr(Box::new(elem)), regs: vec![base] })
                     }
                     t => Err(format!("arr of {:?} unsupported in AOT", t)),
                 }

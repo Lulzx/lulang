@@ -53,6 +53,12 @@ pub extern "C" fn lu_arr_new_i64(n: i64, init: i64) -> *mut u8 {
     p
 }
 
+/// Uninitialized array of `n` 8-byte slots (JIT emits the fill loop — record
+/// arrays are laid out SoA, a decision the compiler owns, not the runtime).
+pub extern "C" fn lu_arr_new_raw(n: i64) -> *mut u8 {
+    arr_alloc(n)
+}
+
 pub extern "C" fn lu_oob(idx: i64, len: i64) {
     eprintln!("error: index {} out of bounds (length {})", idx, len);
     std::process::exit(1);

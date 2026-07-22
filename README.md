@@ -50,7 +50,15 @@ cargo build --release
 | M2 — Cranelift JIT (`lu run`): inlining, 4-acc `sum`, hoisted bounds checks, opt_level=speed | done — 2.6× over Bun on dot; slerp needs pure-call LICM |
 | M3 — LLVM AOT (`lu build`): fast-flagged IR via clang | **done — 2.08× geomean over idiomatic C++, inside AE's claimed band** |
 | M4 — property engine with counterexample shrinking | done |
-| M5 — middle-end: inline math kernels (JIT LICM + vectorization), SoA layout | planned |
+| M5 — middle-end: inline math kernels, if-conversion + LICM, SIMD `sum`, SoA record arrays | **done — JIT slerp 1.7×, dot 1.3×; record-array kernel beats idiomatic C++ `-O3` by 1.4× in both tiers** |
+
+The M5 middle-end lives in the JIT tier (the AOT tier gets the equivalent from
+LLVM, plus the same SoA layout): branch-free inline sin/cos/acos kernels (musl
+polynomials as pure Cranelift IR), if-conversion of speculation-safe `if`s into
+selects, a CLIF-level LICM pass, f64x2 vectorization of `sum`, and SoA field
+planes for record arrays. Each is ablatable (`LU_MATH=call`, `LU_IFCONV=off`,
+`LU_LICM=off`, `LU_SIMD=off`, `LU_LAYOUT=aos`) — measurements in
+[experiments/RESULTS.md](experiments/RESULTS.md).
 
 Known v0.1 deviations from spec: arrays are reference-backed in the interpreter
 (aliasing is observable through them — will be fixed when the IR lands); functions

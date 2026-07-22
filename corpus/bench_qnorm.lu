@@ -1,0 +1,23 @@
+// bench_qnorm.lu — record-array reduction over 2M quaternions, 20 repetitions.
+// Layout is compiler-owned: the JIT stores [Quat] as SoA field planes, so each
+// field access in the reduction is a unit-stride vector load.
+
+type Quat { w: f64, x: f64, y: f64, z: f64 }
+
+fn qq(qs: [Quat], n: i64): f64 {
+  return sum(i in 0..n) qs[i].w * qs[i].w + qs[i].x * qs[i].x + qs[i].y * qs[i].y + qs[i].z * qs[i].z
+}
+
+main {
+  let n = 2000000
+  var qs = arr(n, Quat { 0.0, 0.0, 0.0, 0.0 })
+  for i in 0..n {
+    let f = float(i) * 0.000001
+    qs[i] = Quat { w: 1.0 + f, x: 2.0 - f, y: f * 3.0, z: 0.5 }
+  }
+  var acc = 0.0
+  for r in 0..20 {
+    acc = acc + qq(qs, n)
+  }
+  print("acc:", acc)
+}
