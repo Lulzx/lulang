@@ -1075,7 +1075,31 @@ impl<'a, 'b> Gen<'a, 'b> {
                 }
                 Ok((elem, out))
             }
-            Expr::Array(_) => Err("array literals are not supported by the JIT yet (use arr)".into()),
+            Expr::Array(items) => {
+                let mut generated = Vec::with_capacity(items.len());
+                for &item in items {
+                    generated.push(self.gen_expr(item)?);
+                }
+                let elem = generated
+                    .first()
+                    .map(|(ty, _)| ty.clone())
+                    .ok_or("cannot lower an empty array literal")?;
+                let stride = comps(self.p, &elem)?.len() as i64;
+                let logical = self.b.ins().iconst(types::I64, generated.len() as i64);
+                let slots = self.b.ins().imul_imm(logical, stride);
+                let base = self.call_import("lu_arr_new_raw", &[slots])[0];
+                for (i, (ty, mut vals)) in generated.into_iter().enumerate() {
+                    if elem == CType::F64 && ty == CType::I64 {
+                        vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
+                    }
+                    let idx = self.b.ins().iconst(types::I64, i as i64);
+                    let addrs = self.elem_addrs(base, idx, &elem, Some(logical))?;
+                    for (v, addr) in vals.into_iter().zip(addrs) {
+                        self.b.ins().store(MemFlags::trusted(), v, addr, 0);
+                    }
+                }
+                Ok((CType::Arr(Box::new(elem)), vec![base]))
+            }
             Expr::Record(name, inits) => {
                 let ti = self
                     .p
@@ -1279,12 +1303,16 @@ impl<'a, 'b> Gen<'a, 'b> {
 
         // `sum` is order-free by language contract: emit 4 independent
         // accumulators (the reassociation C++ needs -ffast-math to allow).
-        let accs: Vec<Variable> = (0..4).map(|_| self.b.declare_var(types::F64)).collect();
-        let zero = self.b.ins().f64const(0.0);
-        for &a in &accs {
-            self.b.def_var(a, zero);
+        let faccs: Vec<Variable> = (0..4).map(|_| self.b.declare_var(types::F64)).collect();
+        let iaccs: Vec<Variable> = (0..4).map(|_| self.b.declare_var(types::I64)).collect();
+        let fzero = self.b.ins().f64const(0.0);
+        let izero = self.b.ins().iconst(types::I64, 0);
+        for &a in &faccs {
+            self.b.def_var(a, fzero);
         }
-        let is_int = self.b.declare_var(types::I64); // discovered from body type below
+        for &a in &iaccs {
+            self.b.def_var(a, izero);
+        }
 
         let head4 = self.b.create_block();
         let body4 = self.b.create_block();
@@ -1300,17 +1328,20 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.ins().brif(fits, body4, &[], head1, &[]);
 
         self.b.switch_to_block(body4);
-        let mut body_ty = CType::F64;
         for k in 0..4 {
             let ivk = self.b.use_var(ivar);
             let ik = self.b.ins().iadd_imm(ivk, k);
             self.b.def_var(ivar, ik);
             let (t, vals) = self.gen_expr(body)?;
-            body_ty = t.clone();
-            let f = self.f64_of(&t, vals[0]);
-            let cur = self.b.use_var(accs[k as usize]);
-            let nxt = self.b.ins().fadd(cur, f);
-            self.b.def_var(accs[k as usize], nxt);
+            if t == CType::I64 {
+                let cur = self.b.use_var(iaccs[k as usize]);
+                let nxt = self.b.ins().iadd(cur, vals[0]);
+                self.b.def_var(iaccs[k as usize], nxt);
+            } else {
+                let cur = self.b.use_var(faccs[k as usize]);
+                let nxt = self.b.ins().fadd(cur, vals[0]);
+                self.b.def_var(faccs[k as usize], nxt);
+            }
             // restore i to base before next unroll step
             let back = self.b.ins().iadd_imm(ik, -k);
             self.b.def_var(ivar, back);
@@ -1326,32 +1357,40 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.ins().brif(more, body1, &[], exit, &[]);
 
         self.b.switch_to_block(body1);
-        let (t, vals) = self.gen_expr(body)?;
-        let f = self.f64_of(&t, vals[0]);
-        let cur = self.b.use_var(accs[0]);
-        let nxt = self.b.ins().fadd(cur, f);
-        self.b.def_var(accs[0], nxt);
+        let (body_ty, vals) = self.gen_expr(body)?;
+        if body_ty == CType::I64 {
+            let cur = self.b.use_var(iaccs[0]);
+            let nxt = self.b.ins().iadd(cur, vals[0]);
+            self.b.def_var(iaccs[0], nxt);
+        } else {
+            let cur = self.b.use_var(faccs[0]);
+            let nxt = self.b.ins().fadd(cur, vals[0]);
+            self.b.def_var(faccs[0], nxt);
+        }
         let ivt = self.b.use_var(ivar);
         let ivt2 = self.b.ins().iadd_imm(ivt, 1);
         self.b.def_var(ivar, ivt2);
         self.b.ins().jump(head1, &[]);
 
         self.b.switch_to_block(exit);
-        let a0 = self.b.use_var(accs[0]);
-        let a1 = self.b.use_var(accs[1]);
-        let a2 = self.b.use_var(accs[2]);
-        let a3 = self.b.use_var(accs[3]);
-        let s01 = self.b.ins().fadd(a0, a1);
-        let s23 = self.b.ins().fadd(a2, a3);
-        let total = self.b.ins().fadd(s01, s23);
         self.trusted_idx.truncate(self.trusted_idx.len() - pushed);
         self.env.pop();
-        let _ = is_int;
         if body_ty == CType::I64 {
-            let vi = self.b.ins().fcvt_to_sint(types::I64, total);
-            Ok((CType::I64, vec![vi]))
+            let a0 = self.b.use_var(iaccs[0]);
+            let a1 = self.b.use_var(iaccs[1]);
+            let a2 = self.b.use_var(iaccs[2]);
+            let a3 = self.b.use_var(iaccs[3]);
+            let s01 = self.b.ins().iadd(a0, a1);
+            let s23 = self.b.ins().iadd(a2, a3);
+            Ok((CType::I64, vec![self.b.ins().iadd(s01, s23)]))
         } else {
-            Ok((CType::F64, vec![total]))
+            let a0 = self.b.use_var(faccs[0]);
+            let a1 = self.b.use_var(faccs[1]);
+            let a2 = self.b.use_var(faccs[2]);
+            let a3 = self.b.use_var(faccs[3]);
+            let s01 = self.b.ins().fadd(a0, a1);
+            let s23 = self.b.ins().fadd(a2, a3);
+            Ok((CType::F64, vec![self.b.ins().fadd(s01, s23)]))
         }
     }
 

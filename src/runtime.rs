@@ -2,6 +2,7 @@
 // followed by 8-byte elements; allocations are leaked (benchmark-lifetime model,
 // real memory management arrives with the value-semantics IR).
 use std::alloc::{alloc, Layout};
+use std::io::Write as _;
 use std::sync::OnceLock;
 
 // program arguments (everything after the source file on the CLI) and the
@@ -91,7 +92,7 @@ pub extern "C" fn lu_print_bool(v: i64) {
 }
 pub extern "C" fn lu_print_str(ptr: *const u8, len: i64) {
     let s = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-    print!("{}", String::from_utf8_lossy(s));
+    let _ = std::io::stdout().write_all(s);
 }
 pub extern "C" fn lu_print_sep() {
     print!(" ");
