@@ -1,0 +1,57 @@
+# lulang
+
+A numerics-first programming language built from scratch to test a thesis: that the
+extraordinary performance claims of [Rysana's unreleased AE
+language](ae-research.md) fall out of **language semantics**, not compiler magic —
+approximate floating point by contract, value semantics with no aliasing, compiler-
+owned data layout, and whole-program compilation.
+
+```
+type Quat { w: f64, x: f64, y: f64, z: f64 }
+
+operator* (a: Quat) · (b: Quat): f64 {
+  return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+operator ‖(q: Quat)‖: f64 { return sqrt(q · q) }
+
+property slerp_stays_unit(a: Quat, b: Quat, t: f64) {
+  ‖slerp(normalize(a), normalize(b), t)‖ ~= 1.0
+}
+```
+
+User-defined Unicode operators (infix by precedence-anchor, circumfix pairs),
+records, an order-free `sum` reduction primitive, and first-class property-based
+testing.
+
+## Documents
+
+| File | What it is |
+|---|---|
+| [ae-research.md](ae-research.md) | Everything publicly known about AE, with sources |
+| [DESIGN.md](DESIGN.md) | Reverse-engineering AE's architecture; three revisions deep |
+| [SPEC.md](SPEC.md) | The frozen lulang v0.1 language specification |
+| [experiments/RESULTS.md](experiments/RESULTS.md) | Measurements validating the semantics thesis (~1.9× over idiomatic C++ from defaults alone) |
+
+## Usage
+
+```
+cargo build --release
+./target/release/lu run  corpus/slerp.lu   # execute main
+./target/release/lu test corpus/slerp.lu   # run property-based tests
+```
+
+## Status
+
+| Milestone | State |
+|---|---|
+| M0 — spec + benchmark corpus | done |
+| M1 — lexer, parser, typechecker, interpreter | done |
+| M2 — SSA IR + Cranelift JIT (`lu run`) | next |
+| M3 — LLVM AOT (`lu build`) | planned |
+| M4 — full property engine, shrinking | partial (runner works, no shrinking) |
+| M5 — middle-end: SoA layout, reduction vectorization, vector math | planned |
+
+Known v0.1 deviations from spec: arrays are reference-backed in the interpreter
+(aliasing is observable through them — will be fixed when the IR lands); functions
+must end in an explicit `return` unless they return the block's final expression.
