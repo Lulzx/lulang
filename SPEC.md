@@ -175,5 +175,21 @@ Implemented in all three tiers (interpreter, Cranelift JIT, LLVM AOT):
 - **`fn` with no return annotation** returns unit (previously an accidental
   `bool` default; `property` bodies remain predicates).
 
-First artifact: [selfhost/lexer.lu](selfhost/lexer.lu) — the lulang lexer
-written in lulang, producing identical output under all three tiers.
+- **Short-circuit `and`/`or`** — the right operand does not evaluate when the
+  left decides. (The interpreter always did this; the compiled tiers
+  previously evaluated both sides, which aborted on guard idioms like
+  `i < len(s) and s[i] == c`. Now uniform across tiers.)
+- **Escapes** — `\r` and `\0` now unescape correctly in string and char
+  literals (previously fell through as the literal letter).
+
+**inout ABI note.** Inlined calls write the copy-out back as SSA values. An
+outlined call (recursion) passes one hidden out-pointer per `inout` parameter
+and the callee stores the final value through it before returning — copy-out
+values can exceed what return registers hold (e.g. `inout p: Parser`).
+
+First artifacts: [selfhost/lexer.lu](selfhost/lexer.lu) — the lulang lexer in
+lulang — and [selfhost/parser.lu](selfhost/parser.lu) — a recursive-descent
+Pratt parser for the core language, building a flat index-based AST out of
+record arrays (the same architecture as the Rust compiler) and printing a
+deterministic pre-order dump. Both produce byte-identical output under
+`lu interp`, `lu run`, and `lu build`.

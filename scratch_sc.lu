@@ -1,0 +1,13 @@
+fn safe_at(s: str, i: i64): i64 {
+  if i < len(s) and s[i] == 'x' { return 1 }
+  if i >= len(s) or s[i] == 'a' { return 2 }
+  return 0
+}
+main {
+  let s = "abc"
+  print(safe_at(s, 5), safe_at(s, 0), safe_at(s, 1))
+  var lx = "// comment to eof"
+  var pos = 0
+  while pos < len(lx) and lx[pos] != '\n' { pos = pos + 1 }
+  print("pos:", pos)
+}

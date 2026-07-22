@@ -855,15 +855,34 @@ impl<'a> Emit<'a> {
             let rv = self.emit_expr(r)?;
             return self.emit_user_call(&fname, vec![lv, rv], None);
         }
+        if op == "and" || op == "or" {
+            // short-circuit: the right side must not evaluate when the left
+            // side already decides (it may guard the right side's bounds)
+            let lv = self.emit_expr(l)?;
+            let res = self.t();
+            self.line(format!("{} = alloca i64", res));
+            self.line(format!("store i64 {}, ptr {}", lv.regs[0], res));
+            let cb = self.t();
+            self.line(format!("{} = icmp ne i64 {}, 0", cb, lv.regs[0]));
+            let lr = self.l();
+            let lm = self.l();
+            if op == "and" {
+                self.line(format!("br i1 {}, label %{}, label %{}", cb, lr, lm));
+            } else {
+                self.line(format!("br i1 {}, label %{}, label %{}", cb, lm, lr));
+            }
+            self.label(&lr);
+            let rv = self.emit_expr(r)?;
+            self.line(format!("store i64 {}, ptr {}", rv.regs[0], res));
+            self.line(format!("br label %{}", lm));
+            self.label(&lm);
+            let out = self.t();
+            self.line(format!("{} = load i64, ptr {}", out, res));
+            return Ok(EV { ty: CType::Bool, regs: vec![out] });
+        }
         let lv = self.emit_expr(l)?;
         let rv = self.emit_expr(r)?;
         match op.as_str() {
-            "and" | "or" => {
-                let t = self.t();
-                let o = if op == "and" { "and" } else { "or" };
-                self.line(format!("{} = {} i64 {}, {}", t, o, lv.regs[0], rv.regs[0]));
-                Ok(EV { ty: CType::Bool, regs: vec![t] })
-            }
             "+" | "-" | "*" | "/" | "%" => {
                 if lv.ty == CType::I64 && rv.ty == CType::I64 {
                     let o = match op.as_str() {

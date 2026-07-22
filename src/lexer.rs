@@ -61,6 +61,8 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 ch = match cs[i] {
                     'n' => '\n',
                     't' => '\t',
+                    'r' => '\r',
+                    '0' => '\0',
                     x => x,
                 };
             }
@@ -82,6 +84,8 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     s.push(match cs[i] {
                         'n' => '\n',
                         't' => '\t',
+                        'r' => '\r',
+                        '0' => '\0',
                         x => x,
                     });
                 } else {

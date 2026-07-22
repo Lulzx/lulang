@@ -191,13 +191,12 @@ impl<'a> Jit<'a> {
             for c in comps(self.p, &ret)? {
                 sig.returns.push(AbiParam::new(c));
             }
-            // inout params are copy-in/copy-out: their final values travel
-            // back as extra return values in the outlined-call ABI
-            for (t, &io) in params.iter().zip(f.inouts.iter()) {
+            // inout params are copy-in/copy-out: the outlined-call ABI passes a
+            // hidden out-pointer per inout param (final values may not fit in
+            // return registers) — the callee stores the copy-out through it
+            for &io in f.inouts.iter() {
                 if io {
-                    for c in comps(self.p, t)? {
-                        sig.returns.push(AbiParam::new(c));
-                    }
+                    sig.params.push(AbiParam::new(types::I64));
                 }
             }
             let id = self
@@ -223,11 +222,9 @@ impl<'a> Jit<'a> {
         for c in comps(self.p, &ret)? {
             sig.returns.push(AbiParam::new(c));
         }
-        for (t, &io) in params.iter().zip(f.inouts.iter()) {
+        for &io in f.inouts.iter() {
             if io {
-                for c in comps(self.p, t)? {
-                    sig.returns.push(AbiParam::new(c));
-                }
+                sig.params.push(AbiParam::new(types::I64));
             }
         }
         ctx.func.signature = sig;
@@ -253,7 +250,7 @@ impl<'a> Jit<'a> {
                 simd: self.simd,
                 ifconv: self.ifconv,
                 inline_math: self.inline_math,
-                ret_inout: Vec::new(),
+                inout_outs: Vec::new(),
             };
             let mut cursor = 0;
             for ((name, _), t) in f.params.iter().zip(params.iter()) {
@@ -264,19 +261,21 @@ impl<'a> Jit<'a> {
             }
             for ((name, _), &io) in f.params.iter().zip(f.inouts.iter()) {
                 if io {
+                    let ptr = entry_params[cursor];
+                    cursor += 1;
                     let (_, vars) = g.lookup(name).unwrap();
-                    g.ret_inout.extend(vars);
+                    g.inout_outs.push((ptr, vars));
                 }
             }
             let (terminated, last) = g.gen_block(&f.body)?;
             if !terminated {
                 if ret == CType::Unit {
-                    let extra = g.inout_ret_vals();
-                    g.b.ins().return_(&extra);
+                    g.emit_inout_stores();
+                    g.b.ins().return_(&[]);
                 } else {
                     match last {
-                        Some((t, mut vals)) if t == ret => {
-                            vals.extend(g.inout_ret_vals());
+                        Some((t, vals)) if t == ret => {
+                            g.emit_inout_stores();
                             g.b.ins().return_(&vals);
                         }
                         _ => {
@@ -328,7 +327,7 @@ impl<'a> Jit<'a> {
                 simd: self.simd,
                 ifconv: self.ifconv,
                 inline_math: self.inline_math,
-                ret_inout: Vec::new(),
+                inout_outs: Vec::new(),
             };
             let entry = g.b.create_block();
             g.b.switch_to_block(entry);
@@ -466,9 +465,9 @@ struct Gen<'a, 'b> {
     simd: bool,
     ifconv: bool,
     inline_math: bool,
-    // component variables of the current fn's inout params, in param order —
-    // their final values are appended to every outlined return
-    ret_inout: Vec<Variable>,
+    // (out-pointer, component variables) of the current fn's inout params —
+    // stored through the pointer at every outlined return
+    inout_outs: Vec<(Value, Vec<Variable>)>,
 }
 
 /// Find arrays indexed as `a[i]` (i = the loop variable) in a loop body, so the
@@ -589,9 +588,16 @@ fn collect_assigned(p: &Program, stmts: &[StmtId], out: &mut Vec<String>) {
 }
 
 impl<'a, 'b> Gen<'a, 'b> {
-    fn inout_ret_vals(&mut self) -> Vec<Value> {
-        let vars = self.ret_inout.clone();
-        vars.into_iter().map(|v| self.b.use_var(v)).collect()
+    /// Store the current fn's inout param values through their out-pointers
+    /// (called right before every outlined return).
+    fn emit_inout_stores(&mut self) {
+        let outs = self.inout_outs.clone();
+        for (ptr, vars) in outs {
+            for (k, v) in vars.iter().enumerate() {
+                let val = self.b.use_var(*v);
+                self.b.ins().store(MemFlags::trusted(), val, ptr, (k * 8) as i32);
+            }
+        }
     }
 
     fn bind(&mut self, name: &str, t: CType, vals: &[Value]) -> Result<(), String> {
@@ -794,7 +800,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 Ok(StmtOut::Value(None))
             }
             Stmt::Return(e) => {
-                let mut vals = match e {
+                let vals = match e {
                     Some(e) => self.gen_expr(*e)?.1,
                     None => Vec::new(),
                 };
@@ -806,7 +812,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                     }
                     self.b.ins().jump(cont, &[]);
                 } else {
-                    vals.extend(self.inout_ret_vals());
+                    self.emit_inout_stores();
                     self.b.ins().return_(&vals);
                 }
                 Ok(StmtOut::Terminated)
@@ -1064,6 +1070,27 @@ impl<'a, 'b> Gen<'a, 'b> {
     }
 
     fn gen_bin(&mut self, op: String, l: ExprId, r: ExprId) -> Result<(CType, Vec<Value>), String> {
+        // `and`/`or` are short-circuit by language semantics: the right side
+        // must not evaluate (it may index past a bound the left side guards)
+        if op == "and" || op == "or" {
+            let (_, lv) = self.gen_expr(l)?;
+            let res = self.b.declare_var(types::I64);
+            self.b.def_var(res, lv[0]);
+            let rhs_b = self.b.create_block();
+            let merge = self.b.create_block();
+            if op == "and" {
+                self.b.ins().brif(lv[0], rhs_b, &[], merge, &[]);
+            } else {
+                self.b.ins().brif(lv[0], merge, &[], rhs_b, &[]);
+            }
+            self.b.switch_to_block(rhs_b);
+            let (_, rv) = self.gen_expr(r)?;
+            self.b.def_var(res, rv[0]);
+            self.b.ins().jump(merge, &[]);
+            self.b.switch_to_block(merge);
+            let out = self.b.use_var(res);
+            return Ok((CType::Bool, vec![out]));
+        }
         if let Some(fname) = self.p.infix_ops.get(&op).cloned() {
             let (lt, lv) = self.gen_expr(l)?;
             let (rt, rv) = self.gen_expr(r)?;
@@ -1081,8 +1108,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let (lt, lv) = self.gen_expr(l)?;
         let (rt, rv) = self.gen_expr(r)?;
         match op.as_str() {
-            "and" => Ok((CType::Bool, vec![self.b.ins().band(lv[0], rv[0])])),
-            "or" => Ok((CType::Bool, vec![self.b.ins().bor(lv[0], rv[0])])),
+            // `and`/`or` never reach here — handled short-circuit above
             "+" | "-" | "*" | "/" | "%" => {
                 if lt == CType::I64 && rt == CType::I64 {
                     let v = match op.as_str() {
@@ -1867,20 +1893,33 @@ impl<'a, 'b> Gen<'a, 'b> {
             let out: Vec<Value> = result.iter().map(|&v| self.b.use_var(v)).collect();
             return Ok((ret, out));
         }
-        let r = self.callee(fname);
-        let call = self.b.ins().call(r, &args);
-        let results = self.b.inst_results(call).to_vec();
-        let ret_w = comps(self.p, &ret)?.len();
-        let out = results[..ret_w].to_vec();
-        let mut cursor = ret_w;
+        use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
         let params = self.fns[fname].params.clone();
+        let mut args = args;
+        let mut slots = Vec::new();
         for (i, (&io, t)) in decl.inouts.iter().zip(params.iter()).enumerate() {
             if io {
-                let w = comps(self.p, t)?.len();
-                let vals = results[cursor..cursor + w].to_vec();
-                cursor += w;
-                self.write_back_inout(arg_exprs, i, &vals)?;
+                let cs = comps(self.p, t)?;
+                let ss = self.b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    (cs.len() * 8) as u32,
+                    3,
+                ));
+                let addr = self.b.ins().stack_addr(types::I64, ss, 0);
+                args.push(addr);
+                slots.push((i, ss, cs));
             }
+        }
+        let r = self.callee(fname);
+        let call = self.b.ins().call(r, &args);
+        let out = self.b.inst_results(call).to_vec();
+        for (i, ss, cs) in slots {
+            let vals: Vec<Value> = cs
+                .iter()
+                .enumerate()
+                .map(|(k, &c)| self.b.ins().stack_load(c, ss, (k * 8) as i32))
+                .collect();
+            self.write_back_inout(arg_exprs, i, &vals)?;
         }
         Ok((ret, out))
     }
