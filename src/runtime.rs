@@ -101,20 +101,40 @@ pub extern "C" fn lu_print_nl() {
     println!();
 }
 
-fn arr_alloc(n: i64) -> *mut u8 {
-    let bytes = 8 + (n as usize) * 8;
-    let layout = Layout::from_size_align(bytes, 8).expect("bad array layout");
+fn arr_alloc(n: i64, stride: i64) -> *mut u8 {
+    let slot_count = n
+        .checked_mul(stride)
+        .filter(|&v| n >= 0 && stride > 0 && v >= 0)
+        .unwrap_or_else(|| {
+            eprintln!("error: invalid array length {} with stride {}", n, stride);
+            std::process::exit(1);
+        });
+    let slots = usize::try_from(slot_count).unwrap_or_else(|_| {
+        eprintln!("error: array allocation size overflow");
+        std::process::exit(1);
+    });
+    let bytes = slots
+        .checked_mul(8)
+        .and_then(|v| v.checked_add(8))
+        .unwrap_or_else(|| {
+            eprintln!("error: array allocation size overflow");
+            std::process::exit(1);
+        });
+    let layout = Layout::from_size_align(bytes, 8).unwrap_or_else(|_| {
+        eprintln!("error: array allocation size overflow");
+        std::process::exit(1);
+    });
     let p = unsafe { alloc(layout) };
     if p.is_null() {
         eprintln!("error: out of memory allocating array of {} elements", n);
         std::process::exit(1);
     }
-    unsafe { *(p as *mut i64) = n };
+    unsafe { *(p as *mut i64) = slot_count };
     p
 }
 
 pub extern "C" fn lu_arr_new_f64(n: i64, init: f64) -> *mut u8 {
-    let p = arr_alloc(n);
+    let p = arr_alloc(n, 1);
     let data = unsafe { (p.add(8)) as *mut f64 };
     for i in 0..n as usize {
         unsafe { *data.add(i) = init };
@@ -123,7 +143,7 @@ pub extern "C" fn lu_arr_new_f64(n: i64, init: f64) -> *mut u8 {
 }
 
 pub extern "C" fn lu_arr_new_i64(n: i64, init: i64) -> *mut u8 {
-    let p = arr_alloc(n);
+    let p = arr_alloc(n, 1);
     let data = unsafe { (p.add(8)) as *mut i64 };
     for i in 0..n as usize {
         unsafe { *data.add(i) = init };
@@ -133,8 +153,8 @@ pub extern "C" fn lu_arr_new_i64(n: i64, init: i64) -> *mut u8 {
 
 /// Uninitialized array of `n` 8-byte slots (JIT emits the fill loop — record
 /// arrays are laid out SoA, a decision the compiler owns, not the runtime).
-pub extern "C" fn lu_arr_new_raw(n: i64) -> *mut u8 {
-    arr_alloc(n)
+pub extern "C" fn lu_arr_new_raw(n: i64, stride: i64) -> *mut u8 {
+    arr_alloc(n, stride)
 }
 
 pub extern "C" fn lu_str_eq(ap: *const u8, al: i64, bp: *const u8, bl: i64) -> i64 {
@@ -149,6 +169,26 @@ pub extern "C" fn lu_str_eq(ap: *const u8, al: i64, bp: *const u8, bl: i64) -> i
 pub extern "C" fn lu_oob(idx: i64, len: i64) {
     eprintln!("error: index {} out of bounds (length {})", idx, len);
     std::process::exit(1);
+}
+
+fn checked_int_div(lhs: i64, rhs: i64, remainder: bool) -> i64 {
+    if rhs == 0 {
+        eprintln!("error: integer division by zero");
+        std::process::exit(1);
+    }
+    if lhs == i64::MIN && rhs == -1 {
+        eprintln!("error: integer division overflow: {} / {}", lhs, rhs);
+        std::process::exit(1);
+    }
+    if remainder { lhs % rhs } else { lhs / rhs }
+}
+
+pub extern "C" fn lu_i64_div(lhs: i64, rhs: i64) -> i64 {
+    checked_int_div(lhs, rhs, false)
+}
+
+pub extern "C" fn lu_i64_rem(lhs: i64, rhs: i64) -> i64 {
+    checked_int_div(lhs, rhs, true)
 }
 
 pub extern "C" fn lu_sin(x: f64) -> f64 {

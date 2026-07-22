@@ -17,7 +17,9 @@ TRIPLE=$(echo 'int lu_probe;' | clang -x c - -S -emit-llvm -o - 2>/dev/null |
   sed -n 's/^target triple = "\(.*\)"$/\1/p')
 TMP=${TMPDIR:-/tmp}
 RT="$TMP/lu_selfhost_runtime.o"
-[ -f "$RT" ] || clang -O3 -mcpu=native -c src/lu_runtime.c -o "$RT"
+# The runtime ABI evolves with codegen.lu; rebuilding this small object avoids
+# silently linking a stale cache entry after declarations change.
+clang -O3 -mcpu=native -c src/lu_runtime.c -o "$RT"
 
 if [ "$1" = "--bootstrap" ]; then
   echo "stage 1: lu run codegen.lu codegen.lu (interpreted self-compilation)"

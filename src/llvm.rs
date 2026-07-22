@@ -8,8 +8,11 @@
 //  - loop-range bounds checks are hoisted by the same trusted-index scan the JIT
 //    uses, leaving check-free hot loops for the vectorizer.
 use crate::ast::*;
+use crate::backend::abi::return_components;
+use crate::backend::layout::{components as layout_components, field_offset, Component};
+use crate::backend::optimization::{scan_trusted, scan_trusted_expr};
 use crate::check::{resolve_type, Type as CType};
-use crate::jit::{field_offset, scan_trusted, scan_trusted_expr};
+use crate::ir::TypedProgram;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -17,32 +20,23 @@ const RTOL: f64 = 9.094947017729282e-13; // 2^-40
 const ATOL: f64 = 7.888609052210118e-31; // 2^-100
 
 fn lty(p: &Program, t: &CType) -> Result<Vec<&'static str>, String> {
-    Ok(match t {
-        CType::F64 => vec!["double"],
-        CType::I64 | CType::Bool | CType::Enum(_) => vec!["i64"],
-        CType::Str => vec!["ptr", "i64"],
-        CType::Arr(_) => vec!["ptr"],
-        CType::Unit => vec![],
-        CType::Rec(ti) => {
-            let mut out = Vec::new();
-            for (_, ft) in &p.types[*ti].fields {
-                out.extend(lty(p, &resolve_type(p, ft)?)?);
-            }
-            out
-        }
-    })
+    Ok(layout_components(p, t)?
+        .into_iter()
+        .map(llvm_component)
+        .collect())
 }
 
 /// ABI return components of a function: declared return + inout param comps.
 fn abi_ret_comps<'x>(p: &Program, f: &FnDecl) -> Result<Vec<&'x str>, String> {
-    let ret = resolve_type(p, &f.ret)?;
-    let mut c = lty(p, &ret)?;
-    for ((_, tstr), &io) in f.params.iter().zip(f.inouts.iter()) {
-        if io {
-            c.extend(lty(p, &resolve_type(p, tstr)?)?);
-        }
+    Ok(return_components(p, f)?.into_iter().map(llvm_component).collect())
+}
+
+fn llvm_component(component: Component) -> &'static str {
+    match component {
+        Component::I64 => "i64",
+        Component::F64 => "double",
+        Component::Ptr => "ptr",
     }
-    Ok(c)
 }
 
 fn comps_ty(c: &[&str]) -> String {
@@ -61,6 +55,7 @@ struct EV {
 
 struct Emit<'a> {
     p: &'a Program,
+    expr_types: &'a [Option<CType>],
     out: String,
     tmp: u32,
     lbl: u32,
@@ -77,9 +72,11 @@ struct Emit<'a> {
     in_main: bool,
 }
 
-pub fn build(p: &Program, src_path: &str, out_path: Option<&str>) -> Result<String, String> {
+pub fn build(ir: &TypedProgram, src_path: &str, out_path: Option<&str>) -> Result<String, String> {
+    let p = ir.program();
     let mut e = Emit {
         p,
+        expr_types: ir.expression_types(),
         out: String::new(),
         tmp: 0,
         lbl: 0,
@@ -123,10 +120,11 @@ pub fn build(p: &Program, src_path: &str, out_path: Option<&str>) -> Result<Stri
          declare void @lu_print_f64(double)\ndeclare void @lu_print_i64(i64)\n\
          declare void @lu_print_bool(i64)\ndeclare void @lu_print_str(ptr, i64)\n\
          declare void @lu_print_sep()\ndeclare void @lu_print_nl()\n\
-         declare ptr @lu_arr_new_raw(i64)\n\
+         declare ptr @lu_arr_new_raw(i64, i64)\n\
          declare i64 @lu_str_eq(ptr, i64, ptr, i64) #0\n\
          declare ptr @lu_arr_new_f64(i64, double)\ndeclare ptr @lu_arr_new_i64(i64, i64)\n\
          declare void @lu_oob(i64, i64) #1\n\
+         declare i64 @lu_i64_div(i64, i64)\ndeclare i64 @lu_i64_rem(i64, i64)\n\
          declare i64 @lu_nargs()\ndeclare ptr @lu_arg(i64)\n\
          declare ptr @lu_read_file(ptr, i64)\ndeclare i64 @lu_last_len()\n\
          declare void @lu_write_file(ptr, i64, ptr, i64)\n\
@@ -156,7 +154,8 @@ pub fn build(p: &Program, src_path: &str, out_path: Option<&str>) -> Result<Stri
         .and_then(|s| s.to_str())
         .unwrap_or("out");
     let out_bin = out_path.map(String::from).unwrap_or_else(|| stem.to_string());
-    let ll_path = std::env::temp_dir().join(format!("lu_{}.ll", stem));
+    let pid = std::process::id();
+    let ll_path = std::env::temp_dir().join(format!("lu_{}_{}.ll", stem, pid));
     std::fs::write(&ll_path, &module).map_err(|e| e.to_string())?;
     // compile the runtime once per source revision, then just link the object
     let rt_src = include_str!("lu_runtime.c");
@@ -165,17 +164,25 @@ pub fn build(p: &Program, src_path: &str, out_path: Option<&str>) -> Result<Stri
     });
     let runtime_o = std::env::temp_dir().join(format!("lu_runtime_{:016x}.o", rt_hash));
     if !runtime_o.exists() {
-        let runtime_c = std::env::temp_dir().join("lu_runtime.c");
+        let runtime_c = std::env::temp_dir().join(format!("lu_runtime_{}.c", pid));
+        let runtime_tmp_o = std::env::temp_dir().join(format!("lu_runtime_{:016x}_{}.o", rt_hash, pid));
         std::fs::write(&runtime_c, rt_src).map_err(|e| e.to_string())?;
         let st = std::process::Command::new("clang")
             .args(["-O3", "-mcpu=native", "-c", "-o"])
-            .arg(&runtime_o)
+            .arg(&runtime_tmp_o)
             .arg(&runtime_c)
             .status()
             .map_err(|e| format!("failed to invoke clang: {}", e))?;
         if !st.success() {
             return Err("clang failed compiling the runtime".into());
         }
+        if let Err(e) = std::fs::rename(&runtime_tmp_o, &runtime_o) {
+            if !runtime_o.exists() {
+                return Err(format!("failed to install runtime object: {}", e));
+            }
+            let _ = std::fs::remove_file(&runtime_tmp_o);
+        }
+        let _ = std::fs::remove_file(&runtime_c);
     }
     let status = std::process::Command::new("clang")
         .args(["-O3", "-mcpu=native", "-o", &out_bin])
@@ -748,9 +755,13 @@ impl<'a> Emit<'a> {
                     .ok_or("cannot lower an empty array literal")?;
                 let comps = lty(self.p, &elem)?;
                 let logical = values.len() as i64;
-                let slots = logical * comps.len() as i64;
                 let base = self.t();
-                self.line(format!("{} = call ptr @lu_arr_new_raw(i64 {})", base, slots));
+                self.line(format!(
+                    "{} = call ptr @lu_arr_new_raw(i64 {}, i64 {})",
+                    base,
+                    logical,
+                    comps.len()
+                ));
                 for (i, v) in values.into_iter().enumerate() {
                     let regs = if elem == CType::F64 && v.ty == CType::I64 {
                         vec![self.to_f64(&v)?]
@@ -807,6 +818,9 @@ impl<'a> Emit<'a> {
                 Ok(EV { ty: CType::Enum(ei), regs: vec![tag.to_string()] })
             }
             Expr::Sum { var, lo, hi, body } => {
+                let expected_body_ty = self.expr_types[*body as usize]
+                    .clone()
+                    .expect("reachable sum body has a checked type");
                 let lov = self.emit_expr(*lo)?;
                 let hiv = self.emit_expr(*hi)?;
                 let scan = {
@@ -850,6 +864,7 @@ impl<'a> Emit<'a> {
                 self.label(&lb);
                 let bv = self.emit_expr(*body)?;
                 let bty = bv.ty.clone();
+                debug_assert_eq!(bty, expected_body_ty);
                 let cur = self.t();
                 let nx = self.t();
                 if bty == CType::I64 {
@@ -928,8 +943,14 @@ impl<'a> Emit<'a> {
                         "+" => "add",
                         "-" => "sub",
                         "*" => "mul",
-                        "/" => "sdiv",
-                        _ => "srem",
+                        "/" | "%" => {
+                            return self.emit_checked_int_div(
+                                &lv.regs[0],
+                                &rv.regs[0],
+                                op == "%",
+                            )
+                        }
+                        _ => unreachable!(),
                     };
                     let t = self.t();
                     self.line(format!("{} = {} i64 {}, {}", t, o, lv.regs[0], rv.regs[0]));
@@ -1032,6 +1053,13 @@ impl<'a> Emit<'a> {
             }
             op => Err(format!("unknown operator `{}`", op)),
         }
+    }
+
+    fn emit_checked_int_div(&mut self, lhs: &str, rhs: &str, remainder: bool) -> Result<EV, String> {
+        let out = self.t();
+        let callee = if remainder { "lu_i64_rem" } else { "lu_i64_div" };
+        self.line(format!("{} = call i64 @{}(i64 {}, i64 {})", out, callee, lhs, rhs));
+        Ok(EV { ty: CType::I64, regs: vec![out] })
     }
 
     fn emit_user_call(
@@ -1317,10 +1345,11 @@ impl<'a> Emit<'a> {
                     t @ (CType::Rec(_) | CType::Str) => {
                         let elem = t.clone();
                         let stride = lty(self.p, &elem)? .len() as i64;
-                        let slots = self.t();
-                        self.line(format!("{} = mul i64 {}, {}", slots, n, stride));
                         let base = self.t();
-                        self.line(format!("{} = call ptr @lu_arr_new_raw(i64 {})", base, slots));
+                        self.line(format!(
+                            "{} = call ptr @lu_arr_new_raw(i64 {}, i64 {})",
+                            base, n, stride
+                        ));
                         // fill loop over logical elements, SoA planes by default
                         let iptr = self.t();
                         self.line(format!("{} = alloca i64", iptr));

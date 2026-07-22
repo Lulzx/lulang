@@ -37,6 +37,26 @@ Records declare with `type Name { … }`; literals are positional `Vec3 { 1, 2, 
 or named `Ket { v: v }`. Field access `a.x`. Array literals `[1.0, 2.0, 3.0]`,
 indexing `a[i]` (bounds-checked in JIT/debug; checks removable by properties later).
 
+### 3.1 Edge semantics
+
+- **Integer overflow.** `i64` unary negation, addition, subtraction,
+  multiplication, and integer `sum` use two's-complement wrapping modulo 2^64.
+  Integer division and remainder trap on a zero divisor and on
+  `i64::MIN / -1` (or `i64::MIN % -1`); they never invoke backend undefined
+  behavior.
+- **Allocation.** Array lengths are logical element counts and must be
+  non-negative. A negative length, a byte-size/stride overflow, or allocation
+  failure terminates execution with a diagnostic and a non-zero status. No
+  partially initialized array becomes observable.
+- **Strings.** Runtime `str` values are byte sequences. Source string literals
+  contribute their UTF-8 bytes, but `len`, indexing, and `substr` operate on
+  bytes and may produce non-UTF-8 values. Equality and output preserve those
+  bytes exactly; decoding is a tool/UI concern, not a language operation.
+- **Evaluation order.** Function arguments, binary operands, array elements,
+  record fields, and call receivers evaluate left-to-right exactly once.
+  `and` and `or` short-circuit; the untaken operand is not evaluated. Assignment
+  evaluates its right-hand side before mutating the target.
+
 ## 4. Declarations
 
 ```

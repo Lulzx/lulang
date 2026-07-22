@@ -2384,6 +2384,13 @@ fn emit_bin(p: P, inout g: G, op: str, l: i64, r: i64): R {
   let rv = emit_expr(p, g, r)
   if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" {
     if lv.t == 0 and rv.t == 0 {
+      if op == "/" or op == "%" {
+        var callee = "lu_i64_rem"
+        if op == "/" { callee = "lu_i64_div" }
+        let t = newt(g)
+        eline(c8(t, " = call i64 @", callee, "(i64 ", g.rs[lv.o], ", i64 ", g.rs[rv.o], ")"))
+        return rpush1(g, 0, t)
+      }
       var o2 = "srem"
       if op == "+" { o2 = "add" }
       if op == "-" { o2 = "sub" }
@@ -2707,10 +2714,8 @@ fn emit_call(p: P, inout g: G, e: i64): R {
     // logical elements, SoA planes by default
     let elem = at[1]
     let stride = wcount(p, elem)
-    let slots = newt(g)
-    eline(c6(slots, " = mul i64 ", n, ", ", i2s(stride), ""))
     let base = newt(g)
-    eline(c4(base, " = call ptr @lu_arr_new_raw(i64 ", slots, ")"))
+    eline(c6(base, " = call ptr @lu_arr_new_raw(i64 ", n, ", i64 ", i2s(stride), ")"))
     let iptr = newt(g)
     eline(c2str(iptr, " = alloca i64"))
     eline(c2str("store i64 0, ptr ", iptr))
@@ -3048,7 +3053,7 @@ fn emit_module(p: P, inout g: G, triple: str) {
   putnl()
   puts("declare void @lu_print_nl()")
   putnl()
-  puts("declare ptr @lu_arr_new_raw(i64)")
+  puts("declare ptr @lu_arr_new_raw(i64, i64)")
   putnl()
   puts("declare i64 @lu_str_eq(ptr, i64, ptr, i64) #0")
   putnl()
@@ -3057,6 +3062,10 @@ fn emit_module(p: P, inout g: G, triple: str) {
   puts("declare ptr @lu_arr_new_i64(i64, i64)")
   putnl()
   puts("declare void @lu_oob(i64, i64) #1")
+  putnl()
+  puts("declare i64 @lu_i64_div(i64, i64)")
+  putnl()
+  puts("declare i64 @lu_i64_rem(i64, i64)")
   putnl()
   puts("declare i64 @lu_nargs()")
   putnl()

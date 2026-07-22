@@ -63,7 +63,8 @@ flat arena AST, then dispatches:
               │        FRONT END           │
               │  lexer.rs  → tokens        │
               │  parser.rs → flat AST      │   (arena tables, ExprId indices;
-              │  check.rs  → typed ok      │    match/sum desugared at parse)
+              │  check.rs  → validation    │    match desugared at parse)
+              │  ir.rs     → typed program │   (type for every reachable expr)
               └─────────────┬──────────────┘
                             │
       ┌──────────────┬──────┴───────┬──────────────┐
@@ -82,6 +83,13 @@ flat arena AST, then dispatches:
                │ math krnls│  │lu_runtime.c
                └───────────┘  └───────────┘
 ```
+
+Execution APIs accept only `TypedProgram`; unchecked parser output cannot reach
+an interpreter or code generator. Lowering/validation lives in `ir.rs`; shared
+component layout, flattened ABI, and optimization analysis live under
+`src/backend/`, separate from the Cranelift and LLVM emission modules.
+`tests/conformance.rs` generates small programs and diffs reference
+interpreter, JIT, AOT, and self-hosted-interpreter output automatically.
 
 The same architecture is rewritten in lulang itself as a ladder — each rung
 written in lulang, run by the tier below:

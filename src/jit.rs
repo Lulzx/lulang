@@ -5,7 +5,10 @@
 // `sum` is emitted with 4 independent accumulators: the language defines
 // reductions as order-free, so the reassociation is legal by construction.
 use crate::ast::*;
+use crate::backend::layout::{components as layout_components, field_offset, Component};
+use crate::backend::optimization::{licm, scan_trusted, scan_trusted_expr};
 use crate::check::{resolve_type, Type as CType};
+use crate::ir::TypedProgram;
 use crate::runtime;
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Value};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -18,33 +21,13 @@ const RTOL: f64 = 9.094947017729282e-13; // 2^-40
 const ATOL: f64 = 7.888609052210118e-31; // 2^-100
 
 fn comps(p: &Program, t: &CType) -> Result<Vec<cranelift_codegen::ir::Type>, String> {
-    Ok(match t {
-        CType::F64 => vec![types::F64],
-        CType::I64 | CType::Bool | CType::Enum(_) => vec![types::I64],
-        CType::Str => vec![types::I64, types::I64], // ptr, len
-        CType::Arr(_) => vec![types::I64],          // ptr to header+data
-        CType::Unit => vec![],
-        CType::Rec(ti) => {
-            let mut out = Vec::new();
-            for (_, ft) in &p.types[*ti].fields {
-                out.extend(comps(p, &resolve_type(p, ft)?)?);
-            }
-            out
-        }
-    })
-}
-
-pub fn field_offset(p: &Program, ti: usize, field: &str) -> Result<(usize, CType), String> {
-    let mut off = 0;
-    for (n, ft) in &p.types[ti].fields {
-        let t = resolve_type(p, ft)?;
-        let w = comps(p, &t)?.len();
-        if n == field {
-            return Ok((off, t));
-        }
-        off += w;
-    }
-    Err(format!("type `{}` has no field `{}`", p.types[ti].name, field))
+    Ok(layout_components(p, t)?
+        .into_iter()
+        .map(|component| match component {
+            Component::F64 => types::F64,
+            Component::I64 | Component::Ptr => types::I64,
+        })
+        .collect())
 }
 
 struct FnInfo {
@@ -55,6 +38,7 @@ struct FnInfo {
 
 pub struct Jit<'a> {
     p: &'a Program,
+    expr_types: &'a [Option<CType>],
     module: JITModule,
     opt_isa: cranelift_codegen::isa::OwnedTargetIsa,
     soa: bool,
@@ -68,7 +52,8 @@ pub struct Jit<'a> {
 }
 
 impl<'a> Jit<'a> {
-    pub fn run(p: &'a Program) -> Result<(), String> {
+    pub fn run(ir: &'a TypedProgram) -> Result<(), String> {
+        let p = ir.program();
         use cranelift_codegen::settings::Configurable as _;
         // The module ISA stays at opt_level=none: we run the egraph optimizer
         // manually per-function and then our own LICM pass on its output —
@@ -99,6 +84,8 @@ impl<'a> Jit<'a> {
             ("lu_arr_new_raw", runtime::lu_arr_new_raw as *const u8),
             ("lu_str_eq", runtime::lu_str_eq as *const u8),
             ("lu_oob", runtime::lu_oob as *const u8),
+            ("lu_i64_div", runtime::lu_i64_div as *const u8),
+            ("lu_i64_rem", runtime::lu_i64_rem as *const u8),
             ("lu_sin", runtime::lu_sin as *const u8),
             ("lu_cos", runtime::lu_cos as *const u8),
             ("lu_acos", runtime::lu_acos as *const u8),
@@ -124,6 +111,7 @@ impl<'a> Jit<'a> {
         let inline_math = std::env::var("LU_MATH").map(|v| v != "call").unwrap_or(true);
         let mut jit = Jit {
             p,
+            expr_types: ir.expression_types(),
             module,
             opt_isa,
             soa,
@@ -158,9 +146,11 @@ impl<'a> Jit<'a> {
             ("lu_print_nl", 0, &[], false),
             ("lu_arr_new_f64", 1, &[types::I64, types::F64], false),
             ("lu_arr_new_i64", 1, &[types::I64, types::I64], false),
-            ("lu_arr_new_raw", 1, &[types::I64], false),
+            ("lu_arr_new_raw", 1, &[types::I64, types::I64], false),
             ("lu_str_eq", 1, &[types::I64, types::I64, types::I64, types::I64], false),
             ("lu_oob", 0, &[types::I64, types::I64], false),
+            ("lu_i64_div", 1, &[types::I64, types::I64], false),
+            ("lu_i64_rem", 1, &[types::I64, types::I64], false),
             ("lu_sin", 2, &[types::F64], true),
             ("lu_cos", 2, &[types::F64], true),
             ("lu_acos", 2, &[types::F64], true),
@@ -258,6 +248,7 @@ impl<'a> Jit<'a> {
             let entry_params: Vec<Value> = b.block_params(entry).to_vec();
             let mut g = Gen {
                 p: self.p,
+                expr_types: self.expr_types,
                 b,
                 module: &mut self.module,
                 fns: &self.fns,
@@ -336,6 +327,7 @@ impl<'a> Jit<'a> {
             let b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
             let mut g = Gen {
                 p: self.p,
+                expr_types: self.expr_types,
                 b,
                 module: &mut self.module,
                 fns: &self.fns,
@@ -375,117 +367,6 @@ impl<'a> Jit<'a> {
     }
 }
 
-/// M5 middle-end pass: loop-invariant code motion at the CLIF level.
-///
-/// Cranelift's egraph optimizer GVNs and folds pure code but (as measured on
-/// the slerp kernel) leaves invariant chains fed by rematerialized constants
-/// inside loops. We own the pass instead: for every loop with a dedicated
-/// preheader at a shallower loop depth, move pure non-trapping instructions
-/// whose operands are all defined outside the loop to the preheader, to a
-/// fixpoint. Speculation is safe by construction — hoisted instructions
-/// cannot trap, load, store, or call, with one exception: calls to the
-/// runtime's pure math imports (`pure_imports`, sin/cos/acos/atan2/pow/fmod —
-/// total over f64, non-trapping, no observable state), which under
-/// `LU_MATH=call` are what keep slerp's invariant `acos(d)`/`sin(th)` chain
-/// pinned inside the loop.
-fn licm(func: &mut cranelift_codegen::ir::Function, pure_imports: &std::collections::HashSet<u32>) {
-    use cranelift_codegen::dominator_tree::DominatorTree;
-    use cranelift_codegen::flowgraph::ControlFlowGraph;
-    use cranelift_codegen::ir::Block;
-    use cranelift_codegen::loop_analysis::LoopAnalysis;
-
-    // A call is hoistable iff its target is one of the whitelisted pure
-    // math imports (module namespace 0, FuncId index in `pure_imports`).
-    let pure_call = |func: &cranelift_codegen::ir::Function,
-                     inst: cranelift_codegen::ir::Inst| {
-        use cranelift_codegen::ir::{ExternalName, InstructionData};
-        let InstructionData::Call { func_ref, .. } = func.dfg.insts[inst] else {
-            return false;
-        };
-        match func.dfg.ext_funcs[func_ref].name {
-            ExternalName::User(r) => func
-                .params
-                .user_named_funcs()
-                .get(r)
-                .is_some_and(|n| n.namespace == 0 && pure_imports.contains(&n.index)),
-            _ => false,
-        }
-    };
-
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
-    let mut la = LoopAnalysis::new();
-    la.compute(func, &cfg, &domtree);
-
-    let loops: Vec<_> = la.loops().collect();
-    for lp in loops {
-        let header = la.loop_header(lp);
-        // dedicated preheader: the unique predecessor outside the loop,
-        // strictly shallower (never hoist into a sibling loop's body)
-        let outside: Vec<Block> = cfg
-            .pred_iter(header)
-            .map(|p| p.block)
-            .filter(|b| !la.is_in_loop(*b, lp))
-            .collect();
-        let [pre] = outside[..] else { continue };
-        if la.loop_level(pre).level() >= la.loop_level(header).level() {
-            continue;
-        }
-        let Some(term) = func.layout.last_inst(pre) else { continue };
-
-        let in_loop_blocks: Vec<Block> = func
-            .layout
-            .blocks()
-            .filter(|b| la.is_in_loop(*b, lp))
-            .collect();
-        loop {
-            let mut changed = false;
-            for &block in &in_loop_blocks {
-                let mut next = func.layout.first_inst(block);
-                while let Some(inst) = next {
-                    next = func.layout.next_inst(inst);
-                    let op = func.dfg.insts[inst].opcode();
-                    if (op.is_branch()
-                        || op.is_call()
-                        || op.is_return()
-                        || op.is_terminator()
-                        || op.can_load()
-                        || op.can_store()
-                        || op.can_trap()
-                        || op.other_side_effects())
-                        && !(op.is_call() && pure_call(func, inst))
-                    {
-                        continue;
-                    }
-                    let args: Vec<_> = func.dfg.inst_args(inst).to_vec();
-                    let invariant = args.into_iter().all(|v| {
-                        let v = func.dfg.resolve_aliases(v);
-                        let def_block = match func.dfg.value_def(v) {
-                            cranelift_codegen::ir::ValueDef::Result(i, _) => {
-                                func.layout.inst_block(i)
-                            }
-                            cranelift_codegen::ir::ValueDef::Param(b, _) => Some(b),
-                            _ => None,
-                        };
-                        match def_block {
-                            Some(b) => !la.is_in_loop(b, lp),
-                            None => false,
-                        }
-                    });
-                    if invariant {
-                        func.layout.remove_inst(inst);
-                        func.layout.insert_inst(inst, term);
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-    }
-}
-
 /// Statement count of a body including nested blocks — the unit of the
 /// per-function inlining budget.
 fn body_size(p: &Program, stmts: &[StmtId]) -> usize {
@@ -508,6 +389,7 @@ struct InlineFrame {
 
 struct Gen<'a, 'b> {
     p: &'a Program,
+    expr_types: &'a [Option<CType>],
     b: FunctionBuilder<'b>,
     module: &'a mut JITModule,
     fns: &'a HashMap<String, FnInfo>,
@@ -533,104 +415,6 @@ struct Gen<'a, 'b> {
     // stored through the pointer at every outlined return
     inout_outs: Vec<(Value, Vec<Variable>)>,
 }
-
-/// Find arrays indexed as `a[i]` (i = the loop variable) in a loop body, so the
-/// bounds check can be hoisted to loop entry. Returns None (trust nothing) if the
-/// body shadows the loop variable or rebinds/reassigns any candidate array.
-pub fn scan_trusted_expr(p: &Program, e: ExprId, var: &str, arrays: &mut Vec<String>, ok: &mut bool) {
-    walk_e(p, e, var, arrays, ok)
-}
-
-pub fn scan_trusted(p: &Program, stmts: &[StmtId], var: &str) -> Option<Vec<String>> {
-    let mut arrays = Vec::new();
-    let mut ok = true;
-    walk_s(p, stmts, var, &mut arrays, &mut ok);
-    if ok && !arrays.is_empty() {
-        Some(arrays)
-    } else {
-        None
-    }
-}
-
-fn walk_e(p: &Program, e: ExprId, var: &str, arrays: &mut Vec<String>, ok: &mut bool) {
-        match p.expr(e) {
-            Expr::Index(a, i) => {
-                if let (Expr::Ident(an), Expr::Ident(inm)) = (p.expr(*a), p.expr(*i)) {
-                    if inm == var && !arrays.contains(an) {
-                        arrays.push(an.clone());
-                    }
-                }
-                walk_e(p, *a, var, arrays, ok);
-                walk_e(p, *i, var, arrays, ok);
-            }
-            Expr::Bin(_, l, r) => {
-                walk_e(p, *l, var, arrays, ok);
-                walk_e(p, *r, var, arrays, ok);
-            }
-            Expr::Un(_, x) | Expr::Circum(_, x) | Expr::Field(x, _) => walk_e(p, *x, var, arrays, ok),
-            Expr::Call(name, args) => {
-                // a call with inout params may rebind a candidate array
-                if p.find_fn(name).is_some_and(|f| f.has_inout()) {
-                    *ok = false;
-                }
-                args.iter().for_each(|&a| walk_e(p, a, var, arrays, ok));
-            }
-            Expr::Array(items) => items.iter().for_each(|&a| walk_e(p, a, var, arrays, ok)),
-            Expr::Record(_, inits) => inits.iter().for_each(|(_, a)| walk_e(p, *a, var, arrays, ok)),
-            Expr::Sum { var: v2, lo, hi, body } => {
-                walk_e(p, *lo, var, arrays, ok);
-                walk_e(p, *hi, var, arrays, ok);
-                if v2 == var {
-                    *ok = false; // shadowed
-                } else {
-                    walk_e(p, *body, var, arrays, ok);
-                }
-            }
-            _ => {}
-        }
-    }
-fn walk_s(p: &Program, stmts: &[StmtId], var: &str, arrays: &mut Vec<String>, ok: &mut bool) {
-        for &sid in stmts {
-            match p.stmt(sid) {
-                Stmt::Let(n, e) | Stmt::Var(n, e) => {
-                    if n == var {
-                        *ok = false;
-                    }
-                    walk_e(p, *e, var, arrays, ok);
-                }
-                Stmt::Assign(t, e) => {
-                    if let Expr::Ident(n) = p.expr(*t) {
-                        // rebinding an array variable invalidates its hoisted check
-                        if arrays.contains(n) {
-                            *ok = false;
-                        }
-                    }
-                    walk_e(p, *t, var, arrays, ok);
-                    walk_e(p, *e, var, arrays, ok);
-                }
-                Stmt::If(c, a, b) => {
-                    walk_e(p, *c, var, arrays, ok);
-                    walk_s(p, a, var, arrays, ok);
-                    walk_s(p, b, var, arrays, ok);
-                }
-                Stmt::For(v2, lo, hi, body) => {
-                    walk_e(p, *lo, var, arrays, ok);
-                    walk_e(p, *hi, var, arrays, ok);
-                    if v2 == var {
-                        *ok = false;
-                    } else {
-                        walk_s(p, body, var, arrays, ok);
-                    }
-                }
-                Stmt::While(c, body) => {
-                    walk_e(p, *c, var, arrays, ok);
-                    walk_s(p, body, var, arrays, ok);
-                }
-                Stmt::Return(Some(e)) | Stmt::Expr(e) => walk_e(p, *e, var, arrays, ok),
-                Stmt::Return(None) => {}
-            }
-        }
-    }
 
 fn collect_assigned(p: &Program, stmts: &[StmtId], out: &mut Vec<String>) {
     for &sid in stmts {
@@ -1086,8 +870,8 @@ impl<'a, 'b> Gen<'a, 'b> {
                     .ok_or("cannot lower an empty array literal")?;
                 let stride = comps(self.p, &elem)?.len() as i64;
                 let logical = self.b.ins().iconst(types::I64, generated.len() as i64);
-                let slots = self.b.ins().imul_imm(logical, stride);
-                let base = self.call_import("lu_arr_new_raw", &[slots])[0];
+                let stride_val = self.b.ins().iconst(types::I64, stride);
+                let base = self.call_import("lu_arr_new_raw", &[logical, stride_val])[0];
                 for (i, (ty, mut vals)) in generated.into_iter().enumerate() {
                     if elem == CType::F64 && ty == CType::I64 {
                         vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
@@ -1203,8 +987,8 @@ impl<'a, 'b> Gen<'a, 'b> {
                         "+" => self.b.ins().iadd(lv[0], rv[0]),
                         "-" => self.b.ins().isub(lv[0], rv[0]),
                         "*" => self.b.ins().imul(lv[0], rv[0]),
-                        "/" => self.b.ins().sdiv(lv[0], rv[0]),
-                        _ => self.b.ins().srem(lv[0], rv[0]),
+                        "/" => self.checked_int_div(lv[0], rv[0], false),
+                        _ => self.checked_int_div(lv[0], rv[0], true),
                     };
                     Ok((CType::I64, vec![v]))
                 } else {
@@ -1275,7 +1059,15 @@ impl<'a, 'b> Gen<'a, 'b> {
         }
     }
 
+    fn checked_int_div(&mut self, lhs: Value, rhs: Value, remainder: bool) -> Value {
+        let name = if remainder { "lu_i64_rem" } else { "lu_i64_div" };
+        self.call_import(name, &[lhs, rhs])[0]
+    }
+
     fn gen_sum(&mut self, var: String, lo: ExprId, hi: ExprId, body: ExprId) -> Result<(CType, Vec<Value>), String> {
+        let expected_body_ty = self.expr_types[body as usize]
+            .clone()
+            .expect("reachable sum body has a checked type");
         let (_, lov) = self.gen_expr(lo)?;
         let (_, hiv) = self.gen_expr(hi)?;
         let expr_stmt_scan = {
@@ -1358,6 +1150,7 @@ impl<'a, 'b> Gen<'a, 'b> {
 
         self.b.switch_to_block(body1);
         let (body_ty, vals) = self.gen_expr(body)?;
+        debug_assert_eq!(body_ty, expected_body_ty);
         if body_ty == CType::I64 {
             let cur = self.b.use_var(iaccs[0]);
             let nxt = self.b.ins().iadd(cur, vals[0]);
@@ -2234,8 +2027,8 @@ impl<'a, 'b> Gen<'a, 'b> {
                     t @ (CType::Rec(_) | CType::Str) => {
                         let elem = t.clone();
                         let stride = comps(self.p, &elem)?.len() as i64;
-                        let slots = self.b.ins().imul_imm(n, stride);
-                        let base = self.call_import("lu_arr_new_raw", &[slots])[0];
+                        let stride_val = self.b.ins().iconst(types::I64, stride);
+                        let base = self.call_import("lu_arr_new_raw", &[n, stride_val])[0];
                         // fill loop: SoA planes (or AoS under LU_LAYOUT=aos)
                         let ivar = self.b.declare_var(types::I64);
                         let zero = self.b.ins().iconst(types::I64, 0);

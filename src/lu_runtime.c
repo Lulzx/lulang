@@ -1,5 +1,6 @@
 // Native runtime linked into lu-built binaries.
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,25 +61,31 @@ void lu_print_str(const char *p, long long n) { fwrite(p, 1, (size_t)n, stdout);
 void lu_print_sep(void) { putchar(' '); }
 void lu_print_nl(void) { putchar('\n'); }
 
-static char *arr_alloc(long long n) {
-  char *p = malloc(8 + (size_t)n * 8);
+static char *arr_alloc(long long n, long long stride) {
+  if (n < 0 || stride <= 0 ||
+      (unsigned long long)n > (SIZE_MAX - 8) / 8 / (unsigned long long)stride) {
+    fprintf(stderr, "error: invalid array length %lld with stride %lld\n", n, stride);
+    exit(1);
+  }
+  long long slots = n * stride;
+  char *p = malloc(8 + (size_t)slots * 8);
   if (!p) {
     fprintf(stderr, "error: out of memory allocating array of %lld elements\n", n);
     exit(1);
   }
-  *(long long *)p = n;
+  *(long long *)p = slots;
   return p;
 }
 
 char *lu_arr_new_f64(long long n, double init) {
-  char *p = arr_alloc(n);
+  char *p = arr_alloc(n, 1);
   double *d = (double *)(p + 8);
   for (long long i = 0; i < n; i++) d[i] = init;
   return p;
 }
 
 char *lu_arr_new_i64(long long n, long long init) {
-  char *p = arr_alloc(n);
+  char *p = arr_alloc(n, 1);
   long long *d = (long long *)(p + 8);
   for (long long i = 0; i < n; i++) d[i] = init;
   return p;
@@ -86,7 +93,7 @@ char *lu_arr_new_i64(long long n, long long init) {
 
 /* Uninitialized array of n 8-byte slots; the compiler emits the fill loop
    (record arrays are laid out SoA — a compiler decision, not a runtime one). */
-char *lu_arr_new_raw(long long n) { return arr_alloc(n); }
+char *lu_arr_new_raw(long long n, long long stride) { return arr_alloc(n, stride); }
 
 long long lu_str_eq(const char *ap, long long al, const char *bp, long long bl) {
   if (al != bl) return 0;
@@ -98,6 +105,26 @@ long long lu_str_eq(const char *ap, long long al, const char *bp, long long bl) 
 void lu_oob(long long idx, long long len) {
   fprintf(stderr, "error: index %lld out of bounds (length %lld)\n", idx, len);
   exit(1);
+}
+
+static long long checked_int_div(long long lhs, long long rhs, int remainder) {
+  if (rhs == 0) {
+    fprintf(stderr, "error: integer division by zero\n");
+    exit(1);
+  }
+  if (lhs == INT64_MIN && rhs == -1) {
+    fprintf(stderr, "error: integer division overflow: %lld / %lld\n", lhs, rhs);
+    exit(1);
+  }
+  return remainder ? lhs % rhs : lhs / rhs;
+}
+
+long long lu_i64_div(long long lhs, long long rhs) {
+  return checked_int_div(lhs, rhs, 0);
+}
+
+long long lu_i64_rem(long long lhs, long long rhs) {
+  return checked_int_div(lhs, rhs, 1);
 }
 
 /* program arguments (argv after the binary name) and the str-returning
