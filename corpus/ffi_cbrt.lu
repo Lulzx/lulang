@@ -1,0 +1,6 @@
+extern fn llabs(x: i64): i64
+extern "m" fn cbrt(x: f64): f64
+
+main {
+  print(llabs(-42), cbrt(27.0))
+}

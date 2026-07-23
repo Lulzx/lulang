@@ -40,9 +40,9 @@ testing.
 
 | Milestone | Status |
 |---|---|
-| M8 C imports (`extern`) | Host interpreter, JIT, AOT, and self-hosted code generation complete |
+| M8 C imports (`extern`) | Complete across host interpreter, JIT, AOT, and self-hosted interpreter |
 | M8 C exports (`export fn`) | Static/shared libraries, C headers, JSON manifests, and array copy-in/out complete |
-| M8 self-hosted extern execution | Next: close the final interpreter gap using the runtime trampoline |
+| M8 C ABI / FFI | Complete; C and `ctypes` integration tests plus four-tier import conformance |
 
 ## Usage
 

@@ -129,7 +129,11 @@ impl<'a> Checker<'a> {
             expr_types: RefCell::new(vec![None; p.exprs.len()]),
         };
         for e in &p.externs {
-            if e.name.starts_with("lu_") {
+            let selfhost_bridge = matches!(
+                e.name.as_str(),
+                "lu_ffi_prepare" | "lu_ffi_call_i" | "lu_ffi_call_f"
+            );
+            if e.name.starts_with("lu_") && !selfhost_bridge {
                 return Err(format!(
                     "extern name `{}` uses reserved `lu_` prefix",
                     e.name

@@ -60,6 +60,27 @@ fn exported_library_works_from_c_and_ctypes() {
     let output = run(&mut Command::new(&c_binary));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "72 12 24 36\n");
 
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let selfhost_ir = directory.join("selfhost_kernel_saxpy.ll");
+    let generated = run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .arg("run")
+        .arg(repository.join("selfhost/codegen.lu"))
+        .arg(&source));
+    std::fs::write(&selfhost_ir, generated.stdout).expect("write self-hosted LLVM IR");
+    let selfhost_binary = directory.join("selfhost_saxpy_c");
+    run(Command::new("clang")
+        .arg("-O2")
+        .arg("-DLU_LIB")
+        .arg(&selfhost_ir)
+        .arg(repository.join("src/lu_runtime.c"))
+        .arg(&c_source)
+        .arg("-I")
+        .arg(&directory)
+        .arg("-o")
+        .arg(&selfhost_binary));
+    let output = run(&mut Command::new(&selfhost_binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "72 12 24 36\n");
+
     if Command::new("python3").arg("--version").output().is_ok() {
         run(Command::new(env!("CARGO_BIN_EXE_lu"))
             .args(["build", "--lib", "--shared", "-o"])

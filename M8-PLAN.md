@@ -154,7 +154,7 @@ region and byte-copy it into codegen.lu (don't hardcode line numbers).
 - **B — export (complete)**: `--lib` CLI, wrappers, header + manifest, `-DLU_LIB`
   runtime guard, C and ctypes integration tests, codegen.lu wrapper
   byte-diff.
-- **C — close the gap (in progress)**: interp.lu extern execution, delete the skip mask,
+- **C — close the gap (complete)**: interp.lu extern execution, delete the skip mask,
   full four-tier FFI conformance.
 
 ## Test plan

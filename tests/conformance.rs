@@ -235,8 +235,8 @@ fn inlined_inout_record_mutation_preserves_array_snapshots() {
 }
 
 #[test]
-fn scalar_ffi_imports_match_across_host_tiers() {
-    assert_host_success(
+fn scalar_ffi_imports_match_across_all_tiers() {
+    assert_success(
         "scalar_ffi_imports",
         "extern fn llabs(x: i64): i64\n\
          extern \"m\" fn cbrt(x: f64): f64\n\
@@ -246,7 +246,7 @@ fn scalar_ffi_imports_match_across_host_tiers() {
 }
 
 #[test]
-fn ffi_array_copyout_matches_across_host_tiers() {
+fn ffi_arrays_and_strings_match_across_all_tiers() {
     let dir = CaseDir::new("ffi_array_copyout", "");
     let extension = if cfg!(target_os = "macos") {
         "dylib"
@@ -260,6 +260,14 @@ fn ffi_array_copyout_matches_across_host_tiers() {
         "#include <stdint.h>\n\
          void bump(int64_t *data, int64_t n) {\n\
            for (int64_t i = 0; i < n; ++i) data[i] += 10;\n\
+         }\n\
+         void scale(double *data, int64_t n, double factor) {\n\
+           for (int64_t i = 0; i < n; ++i) data[i] *= factor;\n\
+         }\n\
+         int64_t byte_sum(const char *data, int64_t n) {\n\
+           int64_t total = 0;\n\
+           for (int64_t i = 0; i < n; ++i) total += (unsigned char)data[i];\n\
+           return total;\n\
          }\n",
     )
     .expect("write FFI fixture");
@@ -276,11 +284,21 @@ fn ffi_array_copyout_matches_across_host_tiers() {
         dir.source(),
         format!(
             "extern \"{}\" fn bump(data: [i64])\n\
+             extern \"{}\" fn scale(data: [f64], factor: f64)\n\
+             extern \"{}\" fn byte_sum(data: str): i64\n\
              main {{\n\
-               var data = [1, 2, 3]\n\
+               var data = arr(3, 0)\n\
+               data[0] = 1\n\
+               data[1] = 2\n\
+               data[2] = 3\n\
                bump(data)\n\
-               print(data[0], data[2])\n\
+               var values = arr(2, 1.5)\n\
+               scale(values, 2.0)\n\
+               print(data[0], data[2], byte_sum(\"ABC\"))\n\
+               print(values[0], values[1])\n\
              }}\n",
+            library.display(),
+            library.display(),
             library.display()
         ),
     )
@@ -289,13 +307,17 @@ fn ffi_array_copyout_matches_across_host_tiers() {
         ("interpreter", host("interp", &dir.source())),
         ("JIT", host("run", &dir.source())),
         ("AOT", aot(&dir)),
+        ("self-hosted", selfhost(&dir.source())),
     ] {
         assert!(
             output.status.success(),
             "FFI array case failed in {backend}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(output.stdout, b"11 13\n", "FFI array mismatch in {backend}");
+        assert_eq!(
+            output.stdout, b"11 13 198\n3 3\n",
+            "FFI array/string mismatch in {backend}"
+        );
     }
 }
 

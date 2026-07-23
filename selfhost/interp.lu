@@ -21,6 +21,10 @@
 // where the checker permits it; `print` reproduces host formatting through
 // the put* builtins.
 
+extern fn lu_ffi_prepare(library: str, symbol: str): i64
+extern fn lu_ffi_call_i(control: [i64], floats: [f64]): i64
+extern fn lu_ffi_call_f(control: [i64], floats: [f64]): f64
+
 // ---------- lexer (same as selfhost/lexer.lu) ----------
 
 enum Kind { KIdent, KInt, KFloat, KStr, KSym, KNewline, KEof, KError }
@@ -1847,6 +1851,99 @@ fn eval_bin(inout m: M, op: str, l: V, r: V): V {
   return vbool(res)
 }
 
+fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
+  var control_len = 1 + p.fnp[f] * 3
+  var float_len = 0
+  for j in 0..p.fnp[f] {
+    let v = vals[j]
+    if v.t == 1 { float_len = float_len + 1 }
+    if v.t == 3 { control_len = control_len + len(v.s) }
+    if v.t == 1024 { control_len = control_len + v.n }
+    if v.t == 1025 { float_len = float_len + v.n }
+  }
+  var control = arr(control_len, 0)
+  var floats = arr(float_len, 0.0)
+  control[0] = p.fnp[f]
+  var control_data = 1 + p.fnp[f] * 3
+  var float_data = 0
+  for j in 0..p.fnp[f] {
+    let v = vals[j]
+    let descriptor = 1 + j * 3
+    if v.t == 1 {
+      control[descriptor] = 1
+      control[descriptor + 1] = float_data
+      floats[float_data] = v.f
+      float_data = float_data + 1
+    } else {
+      if v.t == 3 {
+        control[descriptor] = 2
+        control[descriptor + 1] = control_data
+        control[descriptor + 2] = len(v.s)
+        for k in 0..len(v.s) {
+          control[control_data + k] = v.s[k]
+        }
+        control_data = control_data + len(v.s)
+      } else {
+        if v.t == 1024 {
+          control[descriptor] = 3
+          control[descriptor + 1] = control_data
+          control[descriptor + 2] = v.n
+          for k in 0..v.n {
+            control[control_data + k] = m.heap[v.o + k].i
+          }
+          control_data = control_data + v.n
+        } else {
+          if v.t == 1025 {
+            control[descriptor] = 4
+            control[descriptor + 1] = float_data
+            control[descriptor + 2] = v.n
+            for k in 0..v.n {
+              floats[float_data + k] = m.heap[v.o + k].f
+            }
+            float_data = float_data + v.n
+          } else {
+            control[descriptor] = 0
+            control[descriptor + 1] = v.i
+          }
+        }
+      }
+    }
+  }
+  if lu_ffi_prepare(p.flib[f], p.fname[f]) == 0 {
+    m.halt = 1
+    return vunit()
+  }
+  var integer_result = 0
+  var float_result = 0.0
+  if p.fret[f] == 1 {
+    float_result = lu_ffi_call_f(control, floats)
+  } else {
+    integer_result = lu_ffi_call_i(control, floats)
+  }
+  for j in 0..p.fnp[f] {
+    let v = vals[j]
+    let descriptor = 1 + j * 3
+    let offset = control[descriptor + 1]
+    if v.t == 1024 {
+      for k in 0..v.n {
+        m.heap[v.o + k] = vint(control[offset + k])
+      }
+    }
+    if v.t == 1025 {
+      for k in 0..v.n {
+        m.heap[v.o + k] = vfloat(floats[offset + k])
+      }
+    }
+  }
+  if p.fret[f] == 0 { return vint(integer_result) }
+  if p.fret[f] == 1 { return vfloat(float_result) }
+  if p.fret[f] == 2 { return vbool(integer_result) }
+  if is_enumt(p.fret[f]) {
+    return V { t: p.fret[f], i: integer_result, f: 0.0, s: "", o: 0, n: 0 }
+  }
+  return vunit()
+}
+
 fn eval_call(p: P, inout m: M, e: i64): V {
   let node = p.en[e]
   let name = node.text
@@ -1970,11 +2067,6 @@ fn eval_call(p: P, inout m: M, e: i64): V {
   }
   // user function
   let f = find_fn(p, name)
-  if p.fextern[f] == 1 {
-    print("runtime error: extern calls are not supported by selfhost/interp.lu yet:", name)
-    m.halt = 1
-    return vunit()
-  }
   var vals = arr(16, vunit())
   for j in 0..p.fnp[f] {
     vals[j] = coerce(eval_expr(p, m, argv[j]), p.ptype[p.fpo[f] + j])
@@ -1983,6 +2075,7 @@ fn eval_call(p: P, inout m: M, e: i64): V {
     }
   }
   if m.halt == 1 { return vunit() }
+  if p.fextern[f] == 1 { return eval_extern(p, m, f, vals) }
   let base = m.nv
   let oldfp = m.fp
   for j in 0..p.fnp[f] {

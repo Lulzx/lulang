@@ -1,5 +1,6 @@
 // Native runtime linked into lu-built binaries.
 #include <pthread.h>
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -218,6 +219,150 @@ const char *lu_concat(const char *ap, long long al, const char *bp, long long bl
   memcpy(p + al, bp, (size_t)bl);
   g_last_len = al + bl;
   return p;
+}
+
+/* Packed dynamic-call bridge used by the self-hosted interpreter.  The
+   language-level bridge stays inside the ordinary 6-GPR/8-FPR boundary cap:
+   one packed i64 control array and one packed f64 data array. */
+static void *lu_ffi_prepared;
+
+long long lu_ffi_prepare(const char *lib, long long ll,
+                         const char *symbol, long long sl) {
+  char *library = malloc((size_t)ll + 1);
+  char *name = malloc((size_t)sl + 1);
+  memcpy(library, lib, (size_t)ll);
+  memcpy(name, symbol, (size_t)sl);
+  library[ll] = 0;
+  name[sl] = 0;
+  void *handle = RTLD_DEFAULT;
+  if (ll != 0) {
+    char candidate[1024];
+    if (strchr(library, '/') || strstr(library, ".so") ||
+        strstr(library, ".dylib")) {
+      snprintf(candidate, sizeof candidate, "%s", library);
+    } else {
+#ifdef __APPLE__
+      snprintf(candidate, sizeof candidate, "lib%s.dylib", library);
+#else
+      snprintf(candidate, sizeof candidate, "lib%s.so", library);
+#endif
+    }
+    handle = dlopen(candidate, RTLD_LAZY);
+#ifndef __APPLE__
+    if (!handle && !strchr(library, '/') && !strstr(library, ".so"))
+      {
+        snprintf(candidate, sizeof candidate, "lib%s.so.6", library);
+        handle = dlopen(candidate, RTLD_LAZY);
+      }
+#endif
+    if (!handle) {
+      fprintf(stderr, "runtime error: cannot load FFI library `%s`: %s\n",
+              library, dlerror());
+      free(library);
+      free(name);
+      return 0;
+    }
+  }
+  dlerror();
+  lu_ffi_prepared = dlsym(handle, name);
+  const char *error = dlerror();
+  if (error) {
+    fprintf(stderr, "runtime error: cannot resolve FFI symbol `%s`: %s\n",
+            name, error);
+    lu_ffi_prepared = 0;
+  }
+  free(library);
+  free(name);
+  return lu_ffi_prepared != 0;
+}
+
+typedef long long (*lu_ffi_i_fn)(
+    long long, long long, long long, long long, long long, long long,
+    double, double, double, double, double, double, double, double);
+typedef double (*lu_ffi_f_fn)(
+    long long, long long, long long, long long, long long, long long,
+    double, double, double, double, double, double, double, double);
+
+static int lu_ffi_unpack(long long *control, long long control_len,
+                         double *floats, long long float_len,
+                         long long ints[6], double fp[8],
+                         unsigned char *strings[6], int *string_count) {
+  if (!control || control_len < 1 || float_len < 0) return 0;
+  long long nargs = control[0], ni = 0, nf = 0;
+  if (nargs < 0 || 1 + nargs * 3 > control_len) return 0;
+  for (long long argument = 0; argument < nargs; argument++) {
+    long long descriptor = 1 + argument * 3;
+    long long kind = control[descriptor];
+    long long value = control[descriptor + 1];
+    long long length = control[descriptor + 2];
+    if (kind == 0) {
+      if (ni >= 6) return 0;
+      ints[ni++] = value;
+    } else if (kind == 1) {
+      if (nf >= 8 || value < 0 || value >= float_len) return 0;
+      fp[nf++] = floats[value];
+    } else if (kind == 2) {
+      if (ni + 2 > 6 || value < 0 || length < 0 ||
+          value + length > control_len || *string_count >= 6) return 0;
+      unsigned char *bytes = malloc((size_t)length);
+      for (long long i = 0; i < length; i++)
+        bytes[i] = (unsigned char)control[value + i];
+      strings[(*string_count)++] = bytes;
+      ints[ni++] = (long long)(intptr_t)bytes;
+      ints[ni++] = length;
+    } else if (kind == 3) {
+      if (ni + 2 > 6 || value < 0 || length < 0 ||
+          value + length > control_len) return 0;
+      ints[ni++] = (long long)(intptr_t)(control + value);
+      ints[ni++] = length;
+    } else if (kind == 4) {
+      if (ni + 2 > 6 || value < 0 || length < 0 ||
+          value + length > float_len) return 0;
+      ints[ni++] = (long long)(intptr_t)(floats + value);
+      ints[ni++] = length;
+    } else {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+long long lu_ffi_call_i(long long *control, long long control_len,
+                        double *floats, long long float_len) {
+  long long ints[6] = {0};
+  double fp[8] = {0};
+  unsigned char *strings[6] = {0};
+  int string_count = 0;
+  if (!lu_ffi_prepared ||
+      !lu_ffi_unpack(control, control_len, floats, float_len, ints, fp,
+                     strings, &string_count)) {
+    fprintf(stderr, "runtime error: invalid packed FFI call\n");
+    return 0;
+  }
+  long long result = ((lu_ffi_i_fn)lu_ffi_prepared)(
+      ints[0], ints[1], ints[2], ints[3], ints[4], ints[5],
+      fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7]);
+  for (int i = 0; i < string_count; i++) free(strings[i]);
+  return result;
+}
+
+double lu_ffi_call_f(long long *control, long long control_len,
+                     double *floats, long long float_len) {
+  long long ints[6] = {0};
+  double fp[8] = {0};
+  unsigned char *strings[6] = {0};
+  int string_count = 0;
+  if (!lu_ffi_prepared ||
+      !lu_ffi_unpack(control, control_len, floats, float_len, ints, fp,
+                     strings, &string_count)) {
+    fprintf(stderr, "runtime error: invalid packed FFI call\n");
+    return 0.0;
+  }
+  double result = ((lu_ffi_f_fn)lu_ffi_prepared)(
+      ints[0], ints[1], ints[2], ints[3], ints[4], ints[5],
+      fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7]);
+  for (int i = 0; i < string_count; i++) free(strings[i]);
+  return result;
 }
 
 /* Compiled programs enter through lu_entry; main runs it on a 512 MiB stack
