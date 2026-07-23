@@ -88,11 +88,14 @@ module = pylulang.compile(open("corpus/kernel_saxpy.lu").read())
 x = [1.0, 2.0, 3.0]
 y = [10.0, 20.0, 30.0]
 total = module.saxpy(2.0, x, y, 3)  # y is copied back: [12, 24, 36]
+# A lulang `str` result is returned as exact bytes, including embedded NULs.
 ```
 
 Writable contiguous NumPy `float64`/`int64` arrays and compatible Python
 buffers are passed directly to the generated C shim. Install the local package
-with `python3 -m pip install python/pylulang`.
+with `python3 -m pip install python/pylulang`. Exported `str` results become
+Python `bytes`, preserving their explicit length rather than decoding or
+stopping at a NUL byte.
 
 ### C header imports
 
@@ -119,6 +122,11 @@ Borrowed `c_slice[i64]` and `c_slice[f64]` parameters cross as
 `(const T *data, int64_t length)`. They are read-only, cannot escape by
 returning, and let exported kernels consume C and NumPy buffers without an
 array copy.
+Returned strings use `const char *fn(..., int64_t *out_len)`: the hidden
+length pointer is the final C argument. Imports copy the returned bytes into
+lulang-owned storage before the foreign call completes. Exports return
+library-lifetime storage and write the exact byte count, so strings are
+length-delimited and may contain embedded NUL bytes.
 This works in the interpreter, JIT, LLVM AOT, and self-hosted compiler without
 making compiler-owned record layout part of the C ABI. The reproducible
 adapter source is written beside the bindings as `*.bindgen.c`; use

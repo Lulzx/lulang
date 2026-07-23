@@ -32,6 +32,10 @@ export fn half32(x: f32): f32 {
 export fn vec2_sum(value: Vec2): f64 {
   return value.x + value.y
 }
+
+export fn greeting(prefix: str): str {
+  return concat(prefix, "\\0!")
+}
 """
 
 
@@ -49,6 +53,7 @@ class PyLulangTest(unittest.TestCase):
         self.assertAlmostEqual(module.half32(9.0), 4.5)
         self.assertEqual(module.vec2_sum((2.5, 4.5)), 7.0)
         self.assertEqual(module.vec2_sum({"x": 3.0, "y": 4.0}), 7.0)
+        self.assertEqual(module.greeting("A"), b"A\x00!")
         module.close()
 
     def test_numpy_without_copying_the_boundary_buffer(self):

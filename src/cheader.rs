@@ -111,6 +111,9 @@ fn c_params(
             ty => params.push(format!("{} {}", c_scalar_type(ty)?, local.name)),
         }
     }
+    if function.ret == Type::Str {
+        params.push("int64_t *out_len".into());
+    }
     if params.is_empty() {
         params.push("void".into());
     }
@@ -170,10 +173,15 @@ pub fn emit_header(program: &LoweredProgram, guard_name: &str) -> Result<String,
             params,
             lu_type_name(program, &function.ret)
         );
+        let return_type = if function.ret == Type::Str {
+            "const char *"
+        } else {
+            c_scalar_type(&function.ret)?
+        };
         let _ = writeln!(
             out,
             "{} {}({});\n",
-            c_scalar_type(&function.ret)?,
+            return_type,
             function.name,
             c_params(program, function)?.join(", ")
         );

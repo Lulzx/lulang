@@ -197,6 +197,15 @@ call. Converting an ordinary scalar array to a slice passes its existing data
 buffer without copying; an exported function receives the caller's C buffer
 directly. This does not expose the layout of ordinary arrays or records.
 
+String parameters cross as `(const char *data, int64_t length)`. A function
+returning `str` has the C signature `const char *fn(..., int64_t *out_len)`;
+the length pointer is an additional final integer-class argument and counts
+toward the six-integer register cap. The bytes are length-delimited and may
+contain NUL. An imported return is copied into lulang-owned storage before the
+foreign call completes, so the source pointer need only remain valid through
+the call. An exported return points to library-lifetime storage and writes the
+exact byte length through `out_len`.
+
 `@c_layout type Name { ... }` opts a record into stable C field order and
 layout metadata. Its fields are restricted to exact-width boundary scalars,
 `c_ptr[T]`, and nested `@c_layout` records; empty records, layout cycles,

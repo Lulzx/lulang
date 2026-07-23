@@ -131,6 +131,7 @@ impl<'a> Jit<'a> {
             ("lu_arr_clone", runtime::lu_arr_clone as *const u8),
             ("lu_arr_cow", runtime::lu_arr_cow as *const u8),
             ("lu_str_eq", runtime::lu_str_eq as *const u8),
+            ("lu_str_copy", runtime::lu_str_copy as *const u8),
             ("lu_oob", runtime::lu_oob as *const u8),
             ("lu_i64_div", runtime::lu_i64_div as *const u8),
             ("lu_i64_rem", runtime::lu_i64_rem as *const u8),
@@ -229,6 +230,7 @@ impl<'a> Jit<'a> {
                 &[types::I64, types::I64, types::I64, types::I64],
                 false,
             ),
+            ("lu_str_copy", 1, &[types::I64, types::I64], false),
             ("lu_oob", 0, &[types::I64, types::I64], false),
             ("lu_i64_div", 1, &[types::I64, types::I64], false),
             ("lu_i64_rem", 1, &[types::I64, types::I64], false),
@@ -335,8 +337,13 @@ impl<'a> Jit<'a> {
                     }
                 }
             }
-            for component in comps(self.p, &ret)? {
-                sig.returns.push(AbiParam::new(component));
+            if ret == CType::Str {
+                sig.params.push(AbiParam::new(types::I64));
+                sig.returns.push(AbiParam::new(types::I64));
+            } else {
+                for component in comps(self.p, &ret)? {
+                    sig.returns.push(AbiParam::new(component));
+                }
             }
             let id = self
                 .module
@@ -1662,6 +1669,22 @@ impl<'a, 'b> Gen<'a, 'b> {
                 }
                 _ => flat.extend(values),
             }
+        }
+        if ret == CType::Str {
+            use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+            let length_slot = self.b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+            let length_pointer = self.b.ins().stack_addr(types::I64, length_slot, 0);
+            flat.push(length_pointer);
+            let callee = self.module.declare_func_in_func(info.id, self.b.func);
+            let call = self.b.ins().call(callee, &flat);
+            let pointer = self.b.inst_results(call)[0];
+            let length = self.b.ins().stack_load(types::I64, length_slot, 0);
+            let copy = self.call_import("lu_str_copy", &[pointer, length])[0];
+            return Ok((ret, vec![copy, length]));
         }
         let callee = self.module.declare_func_in_func(info.id, self.b.func);
         let call = self.b.ins().call(callee, &flat);

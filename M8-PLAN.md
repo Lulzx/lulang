@@ -38,7 +38,7 @@ export fn saxpy(a: f64, x: [f64], y: [f64], n: i64): f64 { ... }
 | `bool` | `int64_t` (0/1) | I64 | yes | yes | yes | yes |
 | `enum E` | `int64_t` tag | I64 | yes | yes | yes | yes |
 | `()` | `void` | — | — | yes | — | yes |
-| `str` | `const char* p, int64_t n` (two params, not NUL-terminated) | Ptr+I64 | yes | no | yes | no |
+| `str` | arg: `const char* p, int64_t n`; ret: `const char *` + final `int64_t *out_len` | Ptr+I64 arg; Ptr ret + hidden I64 arg | yes | yes | yes | yes |
 | `[f64]`/`[i64]` | `T* data, int64_t n` | Ptr | yes (data ptr = handle+8) | no | yes (copy-in/out wrapper) | no |
 | `c_slice[f64]`/`c_slice[i64]` | `const T* data, int64_t n` | Ptr+I64 | yes | no | yes (borrowed, no copy) | no |
 | `f32` | `float` | F32 | yes | yes | yes | yes |
@@ -52,6 +52,10 @@ export fn saxpy(a: f64, x: [f64], y: [f64], n: i64): f64 { ... }
 - `c_slice[T]` is a post-M8 borrowed-view extension for 64-bit scalar
   elements. It is read-only, cannot be returned, and preserves the caller's
   `(const T*, length)` without constructing an ordinary lulang array.
+- String returns are a post-M8 length-delimited extension. The hidden
+  `int64_t *out_len` is appended to the C parameter list and consumes one
+  integer register. Imports copy the returned bytes immediately; exports
+  return library-lifetime storage. Embedded NUL bytes are preserved.
 - Direct `@c_layout` parameters are a post-M8 compatible extension limited to
   flat records with one or two 64-bit fields in one register class. This is
   the subset whose register placement is identical on SysV x86-64 and

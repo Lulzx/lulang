@@ -156,7 +156,11 @@ impl<'a> Checker<'a> {
         for e in &p.externs {
             let selfhost_bridge = matches!(
                 e.name.as_str(),
-                "lu_ffi_prepare" | "lu_ffi_call_i" | "lu_ffi_call_f" | "lu_ffi_call_f32"
+                "lu_ffi_prepare"
+                    | "lu_ffi_call_i"
+                    | "lu_ffi_call_f"
+                    | "lu_ffi_call_f32"
+                    | "lu_ffi_call_str"
             );
             if e.name.starts_with("lu_") && !selfhost_bridge {
                 return Err(format!(
@@ -312,16 +316,20 @@ impl<'a> Checker<'a> {
                 | Type::Bool
                 | Type::Enum(_)
                 | Type::CPtr(_)
+                | Type::Str
         ) {
             return Err(format!(
-                "FFI signature `{}` has unsupported return type; returns are limited to (), i64, f32, f64, bool, enums, and c_ptr[T]",
+                "FFI signature `{}` has unsupported return type; returns are limited to (), i64, f32, f64, bool, enums, c_ptr[T], and str",
                 name
             ));
         }
-        let (ints, floats) = params.iter().try_fold((0usize, 0usize), |acc, ty| {
+        let (mut ints, floats) = params.iter().try_fold((0usize, 0usize), |acc, ty| {
             let classes = self.ffi_param_classes(ty)?;
             Ok::<_, String>((acc.0 + classes.0, acc.1 + classes.1))
         })?;
+        if *ret == Type::Str {
+            ints += 1;
+        }
         if ints > 6 || floats > 8 {
             return Err(format!(
                 "FFI signature `{}` needs {} integer-class and {} float-class argument registers; maximum is 6 and 8",

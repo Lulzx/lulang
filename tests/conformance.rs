@@ -356,6 +356,74 @@ fn by_value_c_layout_imports_use_the_portable_register_subset() {
 }
 
 #[test]
+fn returned_ffi_strings_are_length_delimited_and_copied() {
+    let dir = CaseDir::new("ffi_string_return", "");
+    let library = dir.0.join(if cfg!(target_os = "macos") {
+        "libstring_return_fixture.dylib"
+    } else {
+        "libstring_return_fixture.so"
+    });
+    let c_source = dir.0.join("string_return_fixture.c");
+    fs::write(
+        &c_source,
+        "#include <stdint.h>\n\
+         const char *make_label(const char *prefix, int64_t prefix_len, int64_t *out_len) {\n\
+           static char bytes[3];\n\
+           bytes[0] = prefix_len == 0 ? '?' : prefix[0];\n\
+           bytes[1] = '\\0';\n\
+           bytes[2] = '!';\n\
+           *out_len = 3;\n\
+           return bytes;\n\
+         }\n",
+    )
+    .expect("write C fixture");
+    let mut compiler = Command::new("cc");
+    if cfg!(target_os = "macos") {
+        compiler.arg("-dynamiclib");
+    } else {
+        compiler.args(["-shared", "-fPIC"]);
+    }
+    let compiled = run(compiler.arg(&c_source).arg("-o").arg(&library));
+    assert!(
+        compiled.status.success(),
+        "compile string-return fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::write(
+        dir.source(),
+        format!(
+            "extern {:?} fn make_label(prefix: str): str\n\
+             main {{\n\
+               let first = make_label(\"A\")\n\
+               let second = make_label(\"B\")\n\
+               print(len(first), first[0], first[1], first[2])\n\
+               print(len(second), second[0], second[1], second[2])\n\
+             }}\n",
+            library.to_string_lossy()
+        ),
+    )
+    .expect("write lulang fixture");
+
+    let outputs = [
+        ("interpreter", host("interp", &dir.source())),
+        ("JIT", host("run", &dir.source())),
+        ("AOT", aot(&dir)),
+        ("self-hosted", selfhost(&dir.source())),
+    ];
+    for (backend, output) in outputs {
+        assert!(
+            output.status.success(),
+            "string return failed in {backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout, b"3 65 0 33\n3 66 0 33\n",
+            "string return disagreed in {backend}"
+        );
+    }
+}
+
+#[test]
 fn arrays_nested_in_records_still_have_value_semantics() {
     assert_host_success(
         "nested_array_value_semantics",

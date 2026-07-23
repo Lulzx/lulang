@@ -52,6 +52,10 @@ never cross the boundary. The invariant is exercised by
   homogeneous two-`f64` and two-`i64` records execute in all four tiers,
   generated exports are called from C without adapters, bindgen removes the
   safe record shim, and `pylulang` builds the matching ctypes structure.
+- Length-delimited `str` returns are a shipped compatible extension:
+  imports copy exact bytes from `const char *fn(..., int64_t *out_len)`,
+  generated exports use the same hidden-length contract, embedded NULs survive
+  C and Python callers, and host/selfhost LLVM remains byte-identical.
 - `tests/selfhost_sync.rs` byte-compares the shared frontend region and the
   host/selfhost LLVM for an import and a scalar export.
 - `selfhost/build.sh --bootstrap` proves stage 1 = stage 2 and stage 2 =
@@ -94,9 +98,9 @@ plus scaled reference-interpreter corpus agreement.
 
 ## Explicitly deferred by the roadmap
 
-String returns, callbacks, owning zero-copy array export handles, reverse-mode
-AD, native WASM SIMD parity, a package registry, and the broader bindgen C
-surface remain later work. The browser's current
+Callbacks, owning zero-copy array export handles, reverse-mode AD, native WASM
+SIMD parity, a package registry, and the broader bindgen C surface remain
+later work. The browser's current
 interpreter is local TypeScript; compiling the reference CFG evaluator to
 WASM plus property/IR panels and permalinks is the next playground increment.
 These are not silently claimed by the shipped v0.1/foundation slices.

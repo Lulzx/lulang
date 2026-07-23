@@ -217,6 +217,19 @@ pub extern "C" fn lu_str_eq(ap: *const u8, al: i64, bp: *const u8, bl: i64) -> i
     (a == b) as i64
 }
 
+pub extern "C" fn lu_str_copy(pointer: *const u8, length: i64) -> *const u8 {
+    if length < 0 || (pointer.is_null() && length != 0) {
+        eprintln!("error: invalid returned FFI string");
+        std::process::exit(1);
+    }
+    let source = if length == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(pointer, length as usize) }
+    };
+    Box::leak(source.to_vec().into_boxed_slice()).as_ptr()
+}
+
 pub extern "C" fn lu_oob(idx: i64, len: i64) {
     eprintln!("error: index {} out of bounds (length {})", idx, len);
     std::process::exit(1);

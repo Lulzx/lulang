@@ -368,3 +368,83 @@ fn exported_c_layout_record_is_passed_by_value_without_an_adapter() {
 
     let _ = std::fs::remove_dir_all(directory);
 }
+
+#[test]
+fn exported_string_return_uses_pointer_and_hidden_length() {
+    let directory =
+        std::env::temp_dir().join(format!("lulang_ffi_string_return_{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create fixture directory");
+    let source = directory.join("string_return.lu");
+    std::fs::write(
+        &source,
+        "export fn greeting(prefix: str): str {\n\
+           return concat(prefix, \"\\0!\")\n\
+         }\n\
+         main { print(0) }\n",
+    )
+    .expect("write source");
+    let base = directory.join("string_return");
+
+    run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .args(["build", "--lib", "-o"])
+        .arg(&base)
+        .arg(&source));
+    let header = std::fs::read_to_string(directory.join("string_return.h")).expect("read header");
+    assert!(header.contains(
+        "const char * greeting(const char *prefix_data, int64_t prefix_len, int64_t *out_len);"
+    ));
+    let manifest =
+        std::fs::read_to_string(directory.join("string_return.json")).expect("read manifest");
+    assert!(manifest.contains("\"ret\": \"str\""));
+
+    let c_source = directory.join("caller.c");
+    std::fs::write(
+        &c_source,
+        "#include <stdint.h>\n\
+         #include <stdio.h>\n\
+         #include \"string_return.h\"\n\
+         int main(void) {\n\
+           int64_t length = -1;\n\
+           const char *value = greeting(\"A\", 1, &length);\n\
+           printf(\"%lld %d %d %d\\n\", (long long)length,\n\
+                  (unsigned char)value[0], (unsigned char)value[1],\n\
+                  (unsigned char)value[2]);\n\
+           return 0;\n\
+         }\n",
+    )
+    .expect("write C caller");
+    let binary = directory.join("caller");
+    run(Command::new("clang")
+        .arg("-O2")
+        .arg("-I")
+        .arg(&directory)
+        .arg(&c_source)
+        .arg(directory.join("libstring_return.a"))
+        .arg("-o")
+        .arg(&binary));
+    let output = run(&mut Command::new(&binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "3 65 0 33\n");
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let selfhost_ir = directory.join("selfhost-string-return.ll");
+    let generated = run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .arg("run")
+        .arg(repository.join("selfhost/codegen.lu"))
+        .arg(&source));
+    std::fs::write(&selfhost_ir, generated.stdout).expect("write self-hosted LLVM IR");
+    let selfhost_binary = directory.join("selfhost-caller");
+    run(Command::new("clang")
+        .arg("-O2")
+        .arg("-DLU_LIB")
+        .arg(&selfhost_ir)
+        .arg(repository.join("src/lu_runtime.c"))
+        .arg(&c_source)
+        .arg("-I")
+        .arg(&directory)
+        .arg("-o")
+        .arg(&selfhost_binary));
+    let output = run(&mut Command::new(&selfhost_binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "3 65 0 33\n");
+
+    let _ = std::fs::remove_dir_all(directory);
+}

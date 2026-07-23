@@ -208,6 +208,21 @@ void lu_write_file(const char *p, long long n, const char *data, long long dn) {
 
 long long lu_last_len(void) { return g_last_len; }
 
+const char *lu_str_copy(const char *p, long long n) {
+  if (n < 0 || (!p && n != 0)) {
+    fprintf(stderr, "error: invalid returned FFI string\n");
+    exit(1);
+  }
+  char *copy = malloc((size_t)n + 1);
+  if (!copy) {
+    fprintf(stderr, "error: string allocation failed\n");
+    exit(1);
+  }
+  if (n != 0) memcpy(copy, p, (size_t)n);
+  copy[n] = 0;
+  return copy;
+}
+
 const char *lu_chr(long long c) {
   char *p = malloc(1);
   p[0] = (char)c;
@@ -289,7 +304,8 @@ typedef double (*lu_ffi_f_fn)(
 static int lu_ffi_unpack(long long *control, long long control_len,
                          double *floats, long long float_len,
                          long long ints[6], double fp[8],
-                         unsigned char *strings[6], int *string_count) {
+                         unsigned char *strings[6], int *string_count,
+                         long long *integer_count) {
   if (!control || control_len < 1 || float_len < 0) return 0;
   long long nargs = control[0], ni = 0, nf = 0;
   if (nargs < 0 || 1 + nargs * 3 > control_len) return 0;
@@ -345,6 +361,7 @@ static int lu_ffi_unpack(long long *control, long long control_len,
       return 0;
     }
   }
+  *integer_count = ni;
   return 1;
 }
 
@@ -354,9 +371,10 @@ long long lu_ffi_call_i(long long *control, long long control_len,
   double fp[8] = {0};
   unsigned char *strings[6] = {0};
   int string_count = 0;
+  long long integer_count = 0;
   if (!lu_ffi_prepared ||
       !lu_ffi_unpack(control, control_len, floats, float_len, ints, fp,
-                     strings, &string_count)) {
+                     strings, &string_count, &integer_count)) {
     fprintf(stderr, "runtime error: invalid packed FFI call\n");
     return 0;
   }
@@ -373,9 +391,10 @@ double lu_ffi_call_f(long long *control, long long control_len,
   double fp[8] = {0};
   unsigned char *strings[6] = {0};
   int string_count = 0;
+  long long integer_count = 0;
   if (!lu_ffi_prepared ||
       !lu_ffi_unpack(control, control_len, floats, float_len, ints, fp,
-                     strings, &string_count)) {
+                     strings, &string_count, &integer_count)) {
     fprintf(stderr, "runtime error: invalid packed FFI call\n");
     return 0.0;
   }
@@ -392,9 +411,10 @@ double lu_ffi_call_f32(long long *control, long long control_len,
   double fp[8] = {0};
   unsigned char *strings[6] = {0};
   int string_count = 0;
+  long long integer_count = 0;
   if (!lu_ffi_prepared ||
       !lu_ffi_unpack(control, control_len, floats, float_len, ints, fp,
-                     strings, &string_count)) {
+                     strings, &string_count, &integer_count)) {
     fprintf(stderr, "runtime error: invalid packed FFI call\n");
     return 0.0;
   }
@@ -409,6 +429,37 @@ double lu_ffi_call_f32(long long *control, long long control_len,
   memcpy(&result, &bits, sizeof result);
   for (int i = 0; i < string_count; i++) free(strings[i]);
   return (double)result;
+}
+
+const char *lu_ffi_call_str(long long *control, long long control_len,
+                            double *floats, long long float_len,
+                            long long *out_length) {
+  long long ints[6] = {0};
+  double fp[8] = {0};
+  unsigned char *strings[6] = {0};
+  int string_count = 0;
+  long long integer_count = 0;
+  if (!lu_ffi_prepared ||
+      !lu_ffi_unpack(control, control_len, floats, float_len, ints, fp,
+                     strings, &string_count, &integer_count) ||
+      integer_count >= 6) {
+    fprintf(stderr, "runtime error: invalid packed FFI string call\n");
+    if (out_length) *out_length = 0;
+    return "";
+  }
+  long long returned_length = 0;
+  ints[integer_count] = (long long)(intptr_t)&returned_length;
+  const char *returned = (const char *)(intptr_t)((lu_ffi_i_fn)lu_ffi_prepared)(
+      ints[0], ints[1], ints[2], ints[3], ints[4], ints[5],
+      fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7]);
+  for (int i = 0; i < string_count; i++) free(strings[i]);
+  if (returned_length < 0 || (!returned && returned_length != 0)) {
+    fprintf(stderr, "runtime error: invalid returned FFI string\n");
+    if (out_length) *out_length = 0;
+    return "";
+  }
+  if (out_length) *out_length = returned_length;
+  return lu_str_copy(returned, returned_length);
 }
 #else
 long long lu_ffi_prepare(const char *lib, long long ll,
@@ -434,6 +485,14 @@ double lu_ffi_call_f32(long long *control, long long control_len,
                        double *floats, long long float_len) {
   (void)control; (void)control_len; (void)floats; (void)float_len;
   return 0.0;
+}
+
+const char *lu_ffi_call_str(long long *control, long long control_len,
+                            double *floats, long long float_len,
+                            long long *out_length) {
+  (void)control; (void)control_len; (void)floats; (void)float_len;
+  if (out_length) *out_length = 0;
+  return "";
 }
 #endif
 

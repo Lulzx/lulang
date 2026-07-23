@@ -970,6 +970,10 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        let mut returned_length = 0i64;
+        if declaration.ret == Type::Str {
+            ints[int_index] = (&mut returned_length as *mut i64) as i64;
+        }
         let result = unsafe {
             match &declaration.ret {
                 Type::F32 => Value::Float32(crate::ffi::call_f32(pointer, ints, floats)),
@@ -984,6 +988,18 @@ impl<'a> Interp<'a> {
                     Value::Enum(*enumeration, crate::ffi::call_i64(pointer, ints, floats))
                 }
                 Type::CPtr(_) => Value::CPtr(crate::ffi::call_i64(pointer, ints, floats) as usize),
+                Type::Str => {
+                    let returned = crate::ffi::call_i64(pointer, ints, floats) as *const u8;
+                    if returned_length < 0 || (returned.is_null() && returned_length != 0) {
+                        return Err("invalid returned FFI string".into());
+                    }
+                    let bytes = if returned_length == 0 {
+                        Vec::new()
+                    } else {
+                        std::slice::from_raw_parts(returned, returned_length as usize).to_vec()
+                    };
+                    Value::Str(Rc::new(bytes))
+                }
                 ty => return Err(format!("cannot return FFI type {:?}", ty)),
             }
         };
