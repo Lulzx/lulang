@@ -121,9 +121,7 @@ fn canonicalize_operator_calls(source: &str) -> String {
         let rest: String = chars[i..].iter().collect();
         if rest.starts_with("operator_u") && (i == 0 || !chars[i - 1].is_ascii_alphanumeric()) {
             let mut end = i;
-            while end < chars.len()
-                && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
-            {
+            while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
                 end += 1;
             }
             let name: String = chars[i..end].iter().collect();

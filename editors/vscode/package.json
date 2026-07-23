@@ -1,0 +1,40 @@
+{
+  "name": "lulang",
+  "displayName": "lulang",
+  "description": "Language support for the lulang numerical kernel language",
+  "version": "0.1.0",
+  "publisher": "lulang",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:lulang"],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [{
+      "id": "lulang",
+      "aliases": ["lulang", "lu"],
+      "extensions": [".lu"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "lulang",
+      "scopeName": "source.lulang",
+      "path": "./syntaxes/lulang.tmLanguage.json"
+    }],
+    "configuration": {
+      "title": "lulang",
+      "properties": {
+        "lulang.compilerPath": {
+          "type": "string",
+          "default": "lu",
+          "description": "Path to the lulang compiler executable"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --check extension.js"
+  },
+  "license": "MIT"
+}

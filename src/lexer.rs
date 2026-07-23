@@ -41,7 +41,9 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     i += 1;
                 }
                 let t: String = cs[s..i].iter().collect();
-                out.push(Tok::Float(t.parse().map_err(|e| format!("bad float: {e}"))?));
+                out.push(Tok::Float(
+                    t.parse().map_err(|e| format!("bad float: {e}"))?,
+                ));
             } else {
                 let t: String = cs[s..i].iter().collect();
                 out.push(Tok::Int(t.parse().map_err(|e| format!("bad int: {e}"))?));

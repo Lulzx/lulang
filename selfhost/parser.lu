@@ -540,7 +540,7 @@ fn dump_stmts(p: P, s0: i64, d: i64) {
 // ---------- driver ----------
 
 main {
-  let src = "// mini program in the parsed subset\nfn dot(a: [f64], b: [f64], n: i64): f64 {\n  var acc = 0.0\n  for i in 0..n {\n    acc = acc + a[i] * b[i]\n  }\n  return acc\n}\n\nfn clamp(x: f64, lo: f64, hi: f64): f64 {\n  if x < lo { return lo }\n  if x > hi { return hi }\n  return x\n}\n\nfn fill(inout v: [f64], n: i64) {\n  var i = 0\n  while i < n and v[i] ~= 0.0 {\n    v[i] = float(i) * 0.5 + 1.0\n    i = i + 1\n  }\n}\n\nmain {\n  let n = 100\n  var v = arr(n, 0.0)\n  fill(v, n)\n  print(\"dot:\", dot(v, v, n), clamp(-2.5, 0.0, 1.0), not (1 > 2))\n}\n"
+  let src = "// mini program in the parsed subset\nextern \"m\" fn cbrt(x: f64): f64\n\nfn dot(a: [f64], b: [f64], n: i64): f64 {\n  var acc = 0.0\n  for i in 0..n {\n    acc = acc + a[i] * b[i]\n  }\n  return acc\n}\n\nexport fn clamp(x: f64, lo: f64, hi: f64): f64 {\n  if x < lo { return lo }\n  if x > hi { return hi }\n  return x\n}\n\nfn fill(inout v: [f64], n: i64) {\n  var i = 0\n  while i < n and v[i] ~= 0.0 {\n    v[i] = float(i) * 0.5 + 1.0\n    i = i + 1\n  }\n}\n\nmain {\n  let n = 100\n  var v = arr(n, 0.0)\n  fill(v, n)\n  print(\"dot:\", dot(v, v, n), clamp(-2.5, 0.0, 1.0), not (1 > 2))\n}\n"
 
   // lex everything up front
   var lx = Lexer { src: src, pos: 0 }
@@ -578,6 +578,11 @@ main {
     if p.toks[p.pos].kind == Kind.KEof {
       going = false
     } else {
+      var exported = false
+      if cur_is_kw(p, "export") {
+        exported = true
+        p.pos = p.pos + 1
+      }
       if cur_is_kw(p, "fn") {
         p.pos = p.pos + 1
         let name = take_ident(p)
@@ -592,11 +597,31 @@ main {
         fparams[nf] = np
         nf = nf + 1
       } else {
-        if cur_is_kw(p, "main") {
+        if cur_is_kw(p, "extern") {
+          p.pos = p.pos + 1
+          if p.toks[p.pos].kind == Kind.KStr { p.pos = p.pos + 1 }
+          if cur_is_kw(p, "fn") {
+            p.pos = p.pos + 1
+            let name = take_ident(p)
+            let np = parse_params(p)
+            if cur_is_sym(p, ":") {
+              p.pos = p.pos + 1
+              parse_type(p)
+            }
+            fnames[nf] = name
+            fbodies[nf] = -1
+            fparams[nf] = np
+            nf = nf + 1
+          } else {
+            fail(p, "fn")
+          }
+        } else {
+        if cur_is_kw(p, "main") and not exported {
           p.pos = p.pos + 1
           mainbody = parse_block(p)
         } else {
           fail(p, "fn or main")
+        }
         }
       }
     }

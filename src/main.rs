@@ -8,7 +8,8 @@ use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: lu <run|build|interp> <file.lu> [program args...]\n\
+        "usage: lu <run|build|check|interp> <file.lu> [program args...]\n\
+         \x20      lu build --lib [--shared] [-o name] <file.lu>\n\
          \x20      lu test [--runs N] <file.lu>\n\
          \x20      lu fmt [--check] <file.lu>"
     );
@@ -24,13 +25,18 @@ fn main() -> ExitCode {
     };
     let mut runs = 100u32;
     let mut check_format = false;
+    let mut build_library = false;
+    let mut build_shared = false;
+    let mut output_name = None;
     let mut positionals = Vec::new();
     let mut i = if args.len() == 2 { 1 } else { 2 };
     while i < args.len() {
         match args[i].as_str() {
             "--runs" if mode == "test" => {
                 let value = args.get(i + 1).ok_or("--runs needs a value");
-                runs = match value.and_then(|s| s.parse::<u32>().map_err(|_| "invalid --runs value")) {
+                runs = match value
+                    .and_then(|s| s.parse::<u32>().map_err(|_| "invalid --runs value"))
+                {
                     Ok(n) if n > 0 => n,
                     _ => {
                         eprintln!("error: --runs must be a positive integer");
@@ -43,7 +49,23 @@ fn main() -> ExitCode {
                 check_format = true;
                 i += 1;
             }
-            arg if arg.starts_with("--") && matches!(mode, "test" | "fmt") => {
+            "--lib" if mode == "build" => {
+                build_library = true;
+                i += 1;
+            }
+            "--shared" if mode == "build" => {
+                build_shared = true;
+                i += 1;
+            }
+            "-o" if mode == "build" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("error: -o needs a value");
+                    return ExitCode::FAILURE;
+                };
+                output_name = Some(value.clone());
+                i += 2;
+            }
+            arg if arg.starts_with('-') && matches!(mode, "test" | "fmt" | "build") => {
                 eprintln!("error: unknown option `{}`", arg);
                 return ExitCode::FAILURE;
             }
@@ -102,9 +124,20 @@ fn main() -> ExitCode {
     let src_owned = src.clone();
     let mode_owned = mode.to_string();
     let path_owned = path.to_string();
+    let output_name_owned = output_name.clone();
     let result = std::thread::Builder::new()
         .stack_size(512 << 20)
-        .spawn(move || run_pipeline(&mode_owned, &path_owned, &src_owned, runs))
+        .spawn(move || {
+            run_pipeline(
+                &mode_owned,
+                &path_owned,
+                &src_owned,
+                runs,
+                build_library,
+                build_shared,
+                output_name_owned.as_deref(),
+            )
+        })
         .expect("spawn")
         .join()
         .expect("join");
@@ -118,7 +151,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_pipeline(mode: &str, path: &str, src: &str, property_runs: u32) -> Result<bool, String> {
+fn run_pipeline(
+    mode: &str,
+    path: &str,
+    src: &str,
+    property_runs: u32,
+    build_library: bool,
+    build_shared: bool,
+    output_name: Option<&str>,
+) -> Result<bool, String> {
     (|| -> Result<bool, String> {
         let toks = lexer::lex(src)?;
         let mut p = parser::Parser::new(toks);
@@ -134,11 +175,21 @@ fn run_pipeline(mode: &str, path: &str, src: &str, property_runs: u32) -> Result
                 Ok(true)
             }
             "build" => {
-                let out = llvm::build(&ir, path, None)?;
-                eprintln!("built ./{}", out);
+                if build_shared && !build_library {
+                    return Err("`--shared` requires `--lib`".into());
+                }
+                if build_library {
+                    for out in llvm::build_library(&ir, path, output_name, build_shared)? {
+                        eprintln!("built {}", out);
+                    }
+                } else {
+                    let out = llvm::build(&ir, path, output_name)?;
+                    eprintln!("built ./{}", out);
+                }
                 Ok(true)
             }
             "test" => interp::Interp::new(&ir).run_properties(property_runs),
+            "check" => Ok(true),
             m => Err(format!("unknown mode `{}`", m)),
         }
     })()

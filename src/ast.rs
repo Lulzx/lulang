@@ -17,8 +17,13 @@ pub enum Expr {
     Index(ExprId, ExprId),
     Record(String, Vec<(Option<String>, ExprId)>),
     Array(Vec<ExprId>),
-    Sum { var: String, lo: ExprId, hi: ExprId, body: ExprId },
-    Circum(String, ExprId), // key = open glyph, operand
+    Sum {
+        var: String,
+        lo: ExprId,
+        hi: ExprId,
+        body: ExprId,
+    },
+    Circum(String, ExprId),  // key = open glyph, operand
     EnumVal(String, String), // EnumName.Variant
 }
 
@@ -42,12 +47,22 @@ pub struct FnDecl {
     pub inouts: Vec<bool>,
     pub ret: String,
     pub body: Vec<StmtId>,
+    pub exported: bool,
 }
 
 impl FnDecl {
     pub fn has_inout(&self) -> bool {
         self.inouts.iter().any(|&b| b)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternDecl {
+    pub name: String,
+    pub lib: Option<String>,
+    pub params: Vec<(String, String)>,
+    pub inouts: Vec<bool>,
+    pub ret: String,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +82,7 @@ pub struct Program {
     pub exprs: Vec<Expr>,
     pub stmts: Vec<Stmt>,
     pub fns: Vec<FnDecl>,
+    pub externs: Vec<ExternDecl>,
     pub types: Vec<TypeDecl>,
     pub enums: Vec<EnumDecl>,
     pub props: Vec<FnDecl>,

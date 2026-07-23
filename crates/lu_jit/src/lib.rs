@@ -11,7 +11,9 @@ pub mod ir {
 
 #[path = "../../../src/backend/mod.rs"]
 pub mod backend;
-#[path = "../../../src/runtime.rs"]
-pub mod runtime;
+#[path = "../../../src/ffi.rs"]
+pub mod ffi;
 #[path = "../../../src/jit.rs"]
 pub mod jit;
+#[path = "../../../src/runtime.rs"]
+pub mod runtime;

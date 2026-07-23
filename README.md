@@ -1,5 +1,7 @@
 # lulang
 
+[Website and online interpreter](https://lulang.lulzx.space)
+
 A numerics-first programming language built from scratch to test a thesis: that the
 extraordinary performance claims of [Rysana's unreleased AE
 language](ae-research.md) fall out of **language semantics**, not compiler magic —
@@ -32,6 +34,17 @@ testing.
 | [DESIGN.md](DESIGN.md) | Reverse-engineering AE's architecture; three revisions deep |
 | [SPEC.md](SPEC.md) | The frozen lulang v0.1 language specification |
 | [experiments/RESULTS.md](experiments/RESULTS.md) | Measurements validating the semantics thesis (~1.9× over idiomatic C++ from defaults alone) |
+| [ROADMAP.md](ROADMAP.md) | Ecosystem growth plan: C ABI boundary, pylulang, bindgen, tooling, playground, showcase apps |
+| [M8-PLAN.md](M8-PLAN.md) | Implementation plan for the C ABI milestone (extern/export, per-tier, slices, test plan) |
+| [KNOWN-ISSUES.md](KNOWN-ISSUES.md) | Fixed JIT correctness and bootstrap-memory regressions |
+
+## Milestone status
+
+| Milestone | Status |
+|---|---|
+| M8 C imports (`extern`) | Complete across host interpreter, JIT, AOT, and self-hosted interpreter |
+| M8 C exports (`export fn`) | Static/shared libraries, C headers, JSON manifests, and array copy-in/out complete |
+| M8 C ABI / FFI | Complete; C and `ctypes` integration tests plus four-tier import conformance |
 
 ## Usage
 
@@ -40,6 +53,8 @@ cargo build --release
 ./target/release/lu run  corpus/slerp.lu   # execute main
 ./target/release/lu test --runs 1000 corpus/slerp.lu # property tests, configurable runs
 ./target/release/lu build corpus/slerp.lu  # AOT-compile via LLVM
+./target/release/lu build --lib -o kernel corpus/kernel_saxpy.lu
+./target/release/lu build --lib --shared -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu fmt corpus/slerp.lu    # canonical Unicode operators + layout
 ./target/release/lu fmt --check corpus/slerp.lu
 ./target/release/lu run selfhost/lexer.lu  # the lulang lexer, written in lulang
@@ -52,6 +67,32 @@ cargo build --release
 ./selfhost/build.sh prog.lu          # AOT-compile prog.lu with the compiler written in lulang
 ./selfhost/build.sh --bootstrap      # 3-stage self-compilation; verifies the IR fixpoint
 ```
+
+### Python kernels
+
+The pure-Python `pylulang` package compiles source through the generated ABI
+manifest and exposes each `export fn` as a callable:
+
+```python
+import pylulang
+
+module = pylulang.compile(open("corpus/kernel_saxpy.lu").read())
+x = [1.0, 2.0, 3.0]
+y = [10.0, 20.0, 30.0]
+total = module.saxpy(2.0, x, y, 3)  # y is copied back: [12, 24, 36]
+```
+
+Writable contiguous NumPy `float64`/`int64` arrays and compatible Python
+buffers are passed directly to the generated C shim. Install the local package
+with `python3 -m pip install python/pylulang`.
+
+### Editor tooling
+
+`tools/lulang_lsp.py` is a dependency-free Language Server with live
+diagnostics, formatting, symbols, completion, hover, and go-to-definition.
+Set `LULANG_BIN` if `lu` is not on `PATH`. A VS Code extension with syntax
+highlighting and native editor providers lives in `editors/vscode`; the
+tree-sitter grammar and highlight query live in `editors/tree-sitter-lulang`.
 
 ## Architecture
 

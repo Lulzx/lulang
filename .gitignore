@@ -6,6 +6,8 @@ experiments/bench-fast
 experiments/tiny.cpp
 *.o
 *.ll
+__pycache__/
+*.py[cod]
 /slerp
 /dot
 /qnorm

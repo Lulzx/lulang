@@ -19,6 +19,22 @@ path = "../../tests/conformance.rs"
 name = "frontend_perf"
 path = "../../tests/frontend_perf.rs"
 
+[[test]]
+name = "ffi_export"
+path = "../../tests/ffi_export.rs"
+
+[[test]]
+name = "pylulang"
+path = "../../tests/pylulang.rs"
+
+[[test]]
+name = "lsp"
+path = "../../tests/lsp.rs"
+
+[[test]]
+name = "numerics"
+path = "../../tests/numerics.rs"
+
 [dependencies]
 lu_syntax.workspace = true
 lu_ir.workspace = true

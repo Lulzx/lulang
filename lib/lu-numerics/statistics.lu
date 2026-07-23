@@ -1,0 +1,12 @@
+export fn mean(x: [f64], n: i64): f64 {
+  return (sum(i in 0..n) x[i]) / float(n)
+}
+
+export fn variance(x: [f64], n: i64): f64 {
+  let center = mean(x, n)
+  return (sum(i in 0..n) (x[i] - center) * (x[i] - center)) / float(n)
+}
+
+export fn mse(x: [f64], y: [f64], n: i64): f64 {
+  return (sum(i in 0..n) (x[i] - y[i]) * (x[i] - y[i])) / float(n)
+}

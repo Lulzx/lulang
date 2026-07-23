@@ -85,8 +85,13 @@ pub struct Jit<'a> {
     do_licm: bool,
     inline_math: bool,
     fns: HashMap<String, FnInfo>,
+    externs: Vec<FnInfo>,
     imports: HashMap<&'static str, FuncId>,
     pure_imports: std::collections::HashSet<u32>,
+    // String constants are addressed directly by generated code. Optimized
+    // functions are temporary IR clones, so keep copies alive until execution
+    // finishes instead of embedding pointers into those short-lived clones.
+    strings: Vec<Box<[u8]>>,
 }
 
 impl<'a> Jit<'a> {
@@ -123,6 +128,7 @@ impl<'a> Jit<'a> {
             ("lu_arr_new_i64", runtime::lu_arr_new_i64 as *const u8),
             ("lu_arr_new_raw", runtime::lu_arr_new_raw as *const u8),
             ("lu_arr_clone", runtime::lu_arr_clone as *const u8),
+            ("lu_arr_cow", runtime::lu_arr_cow as *const u8),
             ("lu_str_eq", runtime::lu_str_eq as *const u8),
             ("lu_oob", runtime::lu_oob as *const u8),
             ("lu_i64_div", runtime::lu_i64_div as *const u8),
@@ -143,6 +149,10 @@ impl<'a> Jit<'a> {
         ];
         for (n, ptr) in syms {
             jb.symbol(*n, *ptr);
+        }
+        for e in &p.externs {
+            let pointer = crate::ffi::resolve(e.lib.as_deref(), &e.name)?;
+            jb.symbol(&e.name, pointer as *const u8);
         }
         let module = JITModule::new(jb);
         let soa = std::env::var("LU_LAYOUT")
@@ -166,10 +176,13 @@ impl<'a> Jit<'a> {
             do_licm,
             inline_math,
             fns: HashMap::new(),
+            externs: Vec::new(),
             imports: HashMap::new(),
             pure_imports: std::collections::HashSet::new(),
+            strings: Vec::new(),
         };
         jit.declare_imports()?;
+        jit.declare_externs()?;
         jit.declare_fns()?;
         for (index, f) in p.fns.iter().enumerate() {
             let mut function = inline_calls(&ir.functions[index], &ir.functions, 3000);
@@ -208,6 +221,7 @@ impl<'a> Jit<'a> {
             ("lu_arr_new_i64", 1, &[types::I64, types::I64], false),
             ("lu_arr_new_raw", 1, &[types::I64, types::I64], false),
             ("lu_arr_clone", 1, &[types::I64], false),
+            ("lu_arr_cow", 1, &[types::I64], false),
             (
                 "lu_str_eq",
                 1,
@@ -298,6 +312,40 @@ impl<'a> Jit<'a> {
         Ok(())
     }
 
+    fn declare_externs(&mut self) -> Result<(), String> {
+        for e in &self.p.externs {
+            let params = e
+                .params
+                .iter()
+                .map(|(_, ty)| resolve_type(self.p, ty))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ret = resolve_type(self.p, &e.ret)?;
+            let mut sig = self.module.make_signature();
+            for ty in &params {
+                match ty {
+                    CType::Arr(_) => {
+                        sig.params.push(AbiParam::new(types::I64));
+                        sig.params.push(AbiParam::new(types::I64));
+                    }
+                    _ => {
+                        for component in comps(self.p, ty)? {
+                            sig.params.push(AbiParam::new(component));
+                        }
+                    }
+                }
+            }
+            for component in comps(self.p, &ret)? {
+                sig.returns.push(AbiParam::new(component));
+            }
+            let id = self
+                .module
+                .declare_function(&e.name, Linkage::Import, &sig)
+                .map_err(|error| error.to_string())?;
+            self.externs.push(FnInfo { id, params, ret });
+        }
+        Ok(())
+    }
+
     fn compile_ir_fn(&mut self, function: &ir::Function, decl: &FnDecl) -> Result<(), String> {
         let analysis = analyze_cfg(function);
         let info_id = self.fns[&decl.name].id;
@@ -333,6 +381,7 @@ impl<'a> Jit<'a> {
                 b,
                 module: &mut self.module,
                 fns: &self.fns,
+                externs: &self.externs,
                 imports: &self.imports,
                 env: vec![HashMap::new()],
                 refs: HashMap::new(),
@@ -344,18 +393,13 @@ impl<'a> Jit<'a> {
                 cfg_trusted: HashMap::new(),
                 location: (0, 0),
                 skipped_cfg_blocks: std::collections::HashSet::new(),
+                strings: &mut self.strings,
             };
             g.declare_ir_locals(function)?;
             let mut cursor = 0;
             for &local in &function.params {
                 let n = comps(g.p, &function.locals[local as usize].ty)?.len();
-                let mut values = incoming[cursor..cursor + n].to_vec();
-                for offset in array_component_offsets(
-                    g.p,
-                    &function.locals[local as usize].ty,
-                )? {
-                    values[offset] = g.call_import("lu_arr_clone", &[values[offset]])[0];
-                }
+                let values = incoming[cursor..cursor + n].to_vec();
                 g.define_ir_local(local, &values)?;
                 cursor += n;
             }
@@ -404,6 +448,7 @@ impl<'a> Jit<'a> {
                 b,
                 module: &mut self.module,
                 fns: &self.fns,
+                externs: &self.externs,
                 imports: &self.imports,
                 env: vec![HashMap::new()],
                 refs: HashMap::new(),
@@ -415,6 +460,7 @@ impl<'a> Jit<'a> {
                 cfg_trusted: HashMap::new(),
                 location: (0, 0),
                 skipped_cfg_blocks: std::collections::HashSet::new(),
+                strings: &mut self.strings,
             };
             g.declare_ir_locals(function)?;
             g.gen_ir_body(function, &blocks)?;
@@ -442,6 +488,7 @@ struct Gen<'a, 'b> {
     b: FunctionBuilder<'b>,
     module: &'a mut JITModule,
     fns: &'a HashMap<String, FnInfo>,
+    externs: &'a [FnInfo],
     imports: &'a HashMap<&'static str, FuncId>,
     env: Vec<HashMap<String, (CType, Vec<Variable>)>>,
     refs: HashMap<String, cranelift_codegen::ir::FuncRef>,
@@ -457,6 +504,7 @@ struct Gen<'a, 'b> {
     cfg_trusted: HashMap<(usize, ir::LocalId), Value>,
     location: (ir::BlockId, usize),
     skipped_cfg_blocks: std::collections::HashSet<ir::BlockId>,
+    strings: &'a mut Vec<Box<[u8]>>,
 }
 
 impl<'a, 'b> Gen<'a, 'b> {
@@ -1014,13 +1062,19 @@ impl<'a, 'b> Gen<'a, 'b> {
                     CType::Bool,
                     vec![self.b.ins().iconst(types::I64, *v as i64)],
                 ),
-                Constant::Bytes(bytes) => (
-                    CType::Str,
-                    vec![
-                        self.b.ins().iconst(types::I64, bytes.as_ptr() as i64),
-                        self.b.ins().iconst(types::I64, bytes.len() as i64),
-                    ],
-                ),
+                Constant::Bytes(bytes) => {
+                    let bytes = bytes.clone().into_boxed_slice();
+                    let ptr = bytes.as_ptr();
+                    let len = bytes.len();
+                    self.strings.push(bytes);
+                    (
+                        CType::Str,
+                        vec![
+                            self.b.ins().iconst(types::I64, ptr as i64),
+                            self.b.ins().iconst(types::I64, len as i64),
+                        ],
+                    )
+                }
                 Constant::Unit => (CType::Unit, vec![]),
             }),
             InstKind::Load(local) => {
@@ -1029,12 +1083,18 @@ impl<'a, 'b> Gen<'a, 'b> {
                     .ok_or("invalid IR local")?;
                 Some((ty, vars.iter().map(|v| self.b.use_var(*v)).collect()))
             }
-            InstKind::Store { local, value: id } => {
+            InstKind::Store {
+                local,
+                value: id,
+                retain_arrays,
+            } => {
                 let (got, vals) = value(*id)?;
                 let want = &function.locals[*local as usize].ty;
                 let mut vals = self.coerce(want, &got, vals)?;
-                for offset in array_component_offsets(self.p, want)? {
-                    vals[offset] = self.call_import("lu_arr_clone", &[vals[offset]])[0];
+                if *retain_arrays {
+                    for offset in array_component_offsets(self.p, want)? {
+                        vals[offset] = self.call_import("lu_arr_clone", &[vals[offset]])[0];
+                    }
                 }
                 self.define_ir_local(*local, &vals)?;
                 None
@@ -1087,6 +1147,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                         self.gen_call(name, types, vals)?
                     }
                     Callee::Function(id) => self.gen_ir_user_call(*id, args, inout)?,
+                    Callee::Extern(id) => self.gen_ir_extern_call(*id, args)?,
                 })
             }
             InstKind::Field {
@@ -1136,10 +1197,11 @@ impl<'a, 'b> Gen<'a, 'b> {
                 vec![self.b.ins().iconst(types::I64, *tag)],
             )),
             InstKind::SetIndex {
+                root,
+                path,
                 base,
                 index,
                 value: stored,
-                ..
             } => {
                 let base_id = *base;
                 let (base_ty, base) = value(*base)?;
@@ -1156,7 +1218,25 @@ impl<'a, 'b> Gen<'a, 'b> {
                             let array = array_local_for_value(function, base_id)?;
                             self.cfg_trusted.get(&(*loop_index, array)).copied()
                         });
-                let addrs = self.elem_addrs(base[0], index[0], &elem, trusted)?;
+                let unique = self.call_import("lu_arr_cow", &[base[0]])[0];
+                let (mut current, vars) = self
+                    .lookup(&Self::ir_local(*root))
+                    .ok_or("invalid indexed root")?;
+                let mut offset = 0;
+                for &field in path {
+                    let CType::Rec(record) = current else {
+                        return Err("indexed path crosses non-record".into());
+                    };
+                    let name = &self.p.types[record].fields[field].0;
+                    let (add, next) = field_offset(self.p, record, name)?;
+                    offset += add;
+                    current = next;
+                }
+                if !matches!(current, CType::Arr(_)) {
+                    return Err("indexed path does not end at an array".into());
+                }
+                self.b.def_var(vars[offset], unique);
+                let addrs = self.elem_addrs(unique, index[0], &elem, trusted)?;
                 for (reg, addr) in stored.iter().zip(addrs) {
                     self.b.ins().store(MemFlags::trusted(), *reg, addr, 0);
                 }
@@ -1463,7 +1543,11 @@ impl<'a, 'b> Gen<'a, 'b> {
         let params = info.params.clone();
         let mut flat = Vec::new();
         for ((got, vals), want) in args.into_iter().zip(&params) {
-            flat.extend(self.coerce(want, &got, vals)?);
+            let mut values = self.coerce(want, &got, vals)?;
+            if decl.exported && matches!(want, CType::Arr(_)) {
+                values[0] = self.call_import("lu_arr_clone", &[values[0]])[0];
+            }
+            flat.extend(values);
         }
         let mut slots = Vec::new();
         for (i, (&io, ty)) in decl.inouts.iter().zip(&params).enumerate() {
@@ -1491,6 +1575,41 @@ impl<'a, 'b> Gen<'a, 'b> {
             self.define_ir_local(target, &loaded)?;
         }
         Ok((ret, result))
+    }
+
+    fn gen_ir_extern_call(
+        &mut self,
+        id: ir::ExternId,
+        args: Vec<(CType, Vec<Value>)>,
+    ) -> Result<(CType, Vec<Value>), String> {
+        let info = &self.externs[id as usize];
+        let params = info.params.clone();
+        let ret = info.ret.clone();
+        let mut flat = Vec::new();
+        for ((got, values), want) in args.into_iter().zip(&params) {
+            let values = self.coerce(want, &got, values)?;
+            match want {
+                CType::Arr(element) => {
+                    let handle = values[0];
+                    let slots = self
+                        .b
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), handle, 0);
+                    let stride = comps(self.p, element)?.len() as i64;
+                    let length = if stride == 1 {
+                        slots
+                    } else {
+                        self.b.ins().sdiv_imm(slots, stride)
+                    };
+                    flat.push(self.b.ins().iadd_imm(handle, 8));
+                    flat.push(length);
+                }
+                _ => flat.extend(values),
+            }
+        }
+        let callee = self.module.declare_func_in_func(info.id, self.b.func);
+        let call = self.b.ins().call(callee, &flat);
+        Ok((ret, self.b.inst_results(call).to_vec()))
     }
 
     fn checked_int_div(&mut self, lhs: Value, rhs: Value, remainder: bool) -> Value {

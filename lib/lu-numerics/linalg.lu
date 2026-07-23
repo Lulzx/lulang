@@ -1,0 +1,18 @@
+export fn gemv_inplace(matrix: [f64], x: [f64], rows: i64, columns: i64) {
+  let input = x
+  for row in 0..rows {
+    x[row] = sum(column in 0..columns) matrix[row * columns + column] * input[column]
+  }
+}
+
+export fn matmul_inplace(a: [f64], b: [f64], shape: [i64]) {
+  let input = a
+  let rows = shape[0]
+  let inner = shape[1]
+  let columns = shape[2]
+  for row in 0..rows {
+    for column in 0..columns {
+      a[row * columns + column] = sum(k in 0..inner) input[row * inner + k] * b[k * columns + column]
+    }
+  }
+}

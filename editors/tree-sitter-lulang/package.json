@@ -1,0 +1,7 @@
+{
+  "name": "tree-sitter-lulang",
+  "version": "0.1.0",
+  "main": "bindings/node",
+  "keywords": ["parser", "tree-sitter", "lulang"],
+  "license": "MIT"
+}

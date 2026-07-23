@@ -1,0 +1,19 @@
+export fn dot(x: [f64], y: [f64], n: i64): f64 {
+  return sum(i in 0..n) x[i] * y[i]
+}
+
+export fn norm2(x: [f64], n: i64): f64 {
+  return sqrt(sum(i in 0..n) x[i] * x[i])
+}
+
+export fn axpy(a: f64, x: [f64], y: [f64], n: i64) {
+  for i in 0..n {
+    y[i] = a * x[i] + y[i]
+  }
+}
+
+export fn scale(a: f64, x: [f64], n: i64) {
+  for i in 0..n {
+    x[i] = a * x[i]
+  }
+}

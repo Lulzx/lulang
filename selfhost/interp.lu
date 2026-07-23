@@ -21,6 +21,10 @@
 // where the checker permits it; `print` reproduces host formatting through
 // the put* builtins.
 
+extern fn lu_ffi_prepare(library: str, symbol: str): i64
+extern fn lu_ffi_call_i(control: [i64], floats: [f64]): i64
+extern fn lu_ffi_call_f(control: [i64], floats: [f64]): f64
+
 // ---------- lexer (same as selfhost/lexer.lu) ----------
 
 enum Kind { KIdent, KInt, KFloat, KStr, KSym, KNewline, KEof, KError }
@@ -218,7 +222,8 @@ type P {
   toks: [Token], nt: i64, pos: i64,
   en: [ENode], ne: i64,
   sn: [SNode], ns: i64,
-  fname: [str], fret: [i64], fpo: [i64], fnp: [i64], fbody: [i64], fisprop: [i64], nf: i64,
+  fname: [str], fret: [i64], fpo: [i64], fnp: [i64], fbody: [i64], fisprop: [i64],
+  fextern: [i64], fexported: [i64], flib: [str], nf: i64,
   pname: [str], ptype: [i64], pmut: [i64], np: i64,
   opglyph: [str], opfname: [str], opprec: [i64], nops: i64,
   copen: [str], cclose: [str], cfname: [str], ncirc: i64,
@@ -808,6 +813,9 @@ fn add_fn(inout p: P, name: str, ret: i64, po: i64, np2: i64, body: i64, isprop:
   p.fnp[p.nf] = np2
   p.fbody[p.nf] = body
   p.fisprop[p.nf] = isprop
+  p.fextern[p.nf] = 0
+  p.fexported[p.nf] = 0
+  p.flib[p.nf] = ""
   p.nf = p.nf + 1
 }
 
@@ -889,6 +897,80 @@ fn parse_property(inout p: P) {
   add_fn(p, name, ret, po, np2, body, 1)
 }
 
+fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
+  var ni = 0
+  var nflo = 0
+  for i in 0..np2 {
+    let t = p.ptype[po + i]
+    if p.pmut[po + i] == 1 {
+      print("type error: FFI function", name, "cannot use inout")
+      p.err = 1
+    }
+    if t == 1 {
+      nflo = nflo + 1
+    } else {
+      if t == 3 or t == 1024 or t == 1025 {
+        ni = ni + 2
+      } else {
+        if t == 0 or t == 2 or is_enumt(t) {
+          ni = ni + 1
+        } else {
+          print("type error: unsupported FFI parameter in", name)
+          p.err = 1
+        }
+      }
+    }
+  }
+  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or is_enumt(ret)) {
+    print("type error: unsupported FFI return in", name)
+    p.err = 1
+  }
+  if ni > 6 or nflo > 8 {
+    print("type error: FFI register cap exceeded in", name)
+    p.err = 1
+  }
+}
+
+fn parse_named_fn(inout p: P, exported: i64) {
+  let name = take_ident(p)
+  let po = p.np
+  let np2 = parse_params(p)
+  var ret = 4
+  if cur_is_sym(p, ":") {
+    p.pos = p.pos + 1
+    ret = parse_type(p)
+  }
+  let body = parse_block(p)
+  add_fn(p, name, ret, po, np2, body, 0)
+  p.fexported[p.nf - 1] = exported
+  if exported == 1 { validate_ffi_sig(p, name, po, np2, ret) }
+}
+
+fn parse_extern(inout p: P) {
+  var lib = ""
+  if p.toks[p.pos].kind == Kind.KStr {
+    lib = p.toks[p.pos].text
+    p.pos = p.pos + 1
+  }
+  if not cur_is_kw(p, "fn") {
+    fail(p, "fn")
+    return
+  }
+  p.pos = p.pos + 1
+  let name = take_ident(p)
+  let po = p.np
+  let np2 = parse_params(p)
+  var ret = 4
+  if cur_is_sym(p, ":") {
+    p.pos = p.pos + 1
+    ret = parse_type(p)
+  }
+  add_fn(p, name, ret, po, np2, -1, 0)
+  p.fextern[p.nf - 1] = 1
+  p.flib[p.nf - 1] = lib
+  validate_ffi_sig(p, name, po, np2, ret)
+}
+
 fn parse_top(inout p: P) {
   var going = true
   while going and p.err == 0 {
@@ -898,17 +980,21 @@ fn parse_top(inout p: P) {
     } else {
       if cur_is_kw(p, "fn") {
         p.pos = p.pos + 1
-        let name = take_ident(p)
-        let po = p.np
-        let np = parse_params(p)
-        var ret = 4
-        if cur_is_sym(p, ":") {
-          p.pos = p.pos + 1
-          ret = parse_type(p)
-        }
-        let body = parse_block(p)
-        add_fn(p, name, ret, po, np, body, 0)
+        parse_named_fn(p, 0)
       } else {
+        if cur_is_kw(p, "export") {
+          p.pos = p.pos + 1
+          if cur_is_kw(p, "fn") {
+            p.pos = p.pos + 1
+            parse_named_fn(p, 1)
+          } else {
+            fail(p, "fn")
+          }
+        } else {
+          if cur_is_kw(p, "extern") {
+            p.pos = p.pos + 1
+            parse_extern(p)
+          } else {
         if cur_is_kw(p, "type") {
           p.pos = p.pos + 1
           parse_type_decl(p)
@@ -933,6 +1019,8 @@ fn parse_top(inout p: P) {
                 }
               }
             }
+          }
+        }
           }
         }
       }
@@ -1594,7 +1682,9 @@ fn check_block(p: P, inout c: C, s0: i64, ret: i64): i64 {
 fn check_fn(p: P, inout c: C, f: i64) {
   c.nsym = 0
   for i in 0..p.fnp[f] {
-    define(c, p.pname[p.fpo[f] + i], p.ptype[p.fpo[f] + i], p.pmut[p.fpo[f] + i])
+    var mutable = p.pmut[p.fpo[f] + i]
+    if p.fexported[f] == 1 and is_arrt(p.ptype[p.fpo[f] + i]) { mutable = 1 }
+    define(c, p.pname[p.fpo[f] + i], p.ptype[p.fpo[f] + i], mutable)
   }
   let ret = p.fret[f]
   let last = check_block(p, c, p.fbody[f], ret)
@@ -1609,7 +1699,7 @@ fn check_fn(p: P, inout c: C, f: i64) {
 fn check_program(p: P, inout c: C) {
   var f = 0
   while f < p.nf and c.err == 0 {
-    check_fn(p, c, f)
+    if p.fextern[f] == 0 { check_fn(p, c, f) }
     f = f + 1
   }
   if c.err == 0 and p.mainbody >= 0 {
@@ -1680,6 +1770,21 @@ fn copy_val(inout m: M, v: V): V {
   return V { t: v.t, i: 0, f: 0.0, s: "", o: o2, n: v.n }
 }
 
+fn copy_array_val(inout m: M, v: V): V {
+  if not is_arrt(v.t) { return v }
+  if v.n > len(m.heap) - m.hp {
+    print("runtime error: interpreter heap exhausted copying export array")
+    m.halt = 1
+    return vunit()
+  }
+  let o2 = m.hp
+  m.hp = m.hp + v.n
+  for j in 0..v.n {
+    m.heap[o2 + j] = copy_val(m, m.heap[v.o + j])
+  }
+  return V { t: v.t, i: 0, f: 0.0, s: "", o: o2, n: v.n }
+}
+
 fn put_v(v: V) {
   if v.t == 0 { puti(v.i) }
   if v.t == 1 { putf(v.f) }
@@ -1744,6 +1849,99 @@ fn eval_bin(inout m: M, op: str, l: V, r: V): V {
   if op == ">" and a > b { res = 1 }
   if op == ">=" and a >= b { res = 1 }
   return vbool(res)
+}
+
+fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
+  var control_len = 1 + p.fnp[f] * 3
+  var float_len = 0
+  for j in 0..p.fnp[f] {
+    let v = vals[j]
+    if v.t == 1 { float_len = float_len + 1 }
+    if v.t == 3 { control_len = control_len + len(v.s) }
+    if v.t == 1024 { control_len = control_len + v.n }
+    if v.t == 1025 { float_len = float_len + v.n }
+  }
+  var control = arr(control_len, 0)
+  var floats = arr(float_len, 0.0)
+  control[0] = p.fnp[f]
+  var control_data = 1 + p.fnp[f] * 3
+  var float_data = 0
+  for j in 0..p.fnp[f] {
+    let v = vals[j]
+    let descriptor = 1 + j * 3
+    if v.t == 1 {
+      control[descriptor] = 1
+      control[descriptor + 1] = float_data
+      floats[float_data] = v.f
+      float_data = float_data + 1
+    } else {
+      if v.t == 3 {
+        control[descriptor] = 2
+        control[descriptor + 1] = control_data
+        control[descriptor + 2] = len(v.s)
+        for k in 0..len(v.s) {
+          control[control_data + k] = v.s[k]
+        }
+        control_data = control_data + len(v.s)
+      } else {
+        if v.t == 1024 {
+          control[descriptor] = 3
+          control[descriptor + 1] = control_data
+          control[descriptor + 2] = v.n
+          for k in 0..v.n {
+            control[control_data + k] = m.heap[v.o + k].i
+          }
+          control_data = control_data + v.n
+        } else {
+          if v.t == 1025 {
+            control[descriptor] = 4
+            control[descriptor + 1] = float_data
+            control[descriptor + 2] = v.n
+            for k in 0..v.n {
+              floats[float_data + k] = m.heap[v.o + k].f
+            }
+            float_data = float_data + v.n
+          } else {
+            control[descriptor] = 0
+            control[descriptor + 1] = v.i
+          }
+        }
+      }
+    }
+  }
+  if lu_ffi_prepare(p.flib[f], p.fname[f]) == 0 {
+    m.halt = 1
+    return vunit()
+  }
+  var integer_result = 0
+  var float_result = 0.0
+  if p.fret[f] == 1 {
+    float_result = lu_ffi_call_f(control, floats)
+  } else {
+    integer_result = lu_ffi_call_i(control, floats)
+  }
+  for j in 0..p.fnp[f] {
+    let v = vals[j]
+    let descriptor = 1 + j * 3
+    let offset = control[descriptor + 1]
+    if v.t == 1024 {
+      for k in 0..v.n {
+        m.heap[v.o + k] = vint(control[offset + k])
+      }
+    }
+    if v.t == 1025 {
+      for k in 0..v.n {
+        m.heap[v.o + k] = vfloat(floats[offset + k])
+      }
+    }
+  }
+  if p.fret[f] == 0 { return vint(integer_result) }
+  if p.fret[f] == 1 { return vfloat(float_result) }
+  if p.fret[f] == 2 { return vbool(integer_result) }
+  if is_enumt(p.fret[f]) {
+    return V { t: p.fret[f], i: integer_result, f: 0.0, s: "", o: 0, n: 0 }
+  }
+  return vunit()
 }
 
 fn eval_call(p: P, inout m: M, e: i64): V {
@@ -1872,8 +2070,12 @@ fn eval_call(p: P, inout m: M, e: i64): V {
   var vals = arr(16, vunit())
   for j in 0..p.fnp[f] {
     vals[j] = coerce(eval_expr(p, m, argv[j]), p.ptype[p.fpo[f] + j])
+    if p.fexported[f] == 1 and is_arrt(vals[j].t) {
+      vals[j] = copy_array_val(m, vals[j])
+    }
   }
   if m.halt == 1 { return vunit() }
+  if p.fextern[f] == 1 { return eval_extern(p, m, f, vals) }
   let base = m.nv
   let oldfp = m.fp
   for j in 0..p.fnp[f] {
@@ -2145,7 +2347,8 @@ fn run_src(src: str, heapfac: i64, argbase: i64) {
     toks: toks, nt: nt, pos: 0,
     en: arr(cap * 2, ENode { kind: EK.ENum, a: -1, b: -1, num: 0.0, text: "" }), ne: 0,
     sn: arr(cap, SNode { kind: SK.SExpr, a: -1, b: -1, c: -1, nxt: -1, text: "" }), ns: 0,
-    fname: arr(256, ""), fret: arr(256, 4), fpo: arr(256, 0), fnp: arr(256, 0), fbody: arr(256, -1), fisprop: arr(256, 0), nf: 0,
+    fname: arr(256, ""), fret: arr(256, 4), fpo: arr(256, 0), fnp: arr(256, 0), fbody: arr(256, -1), fisprop: arr(256, 0),
+    fextern: arr(256, 0), fexported: arr(256, 0), flib: arr(256, ""), nf: 0,
     pname: arr(2048, ""), ptype: arr(2048, 5), pmut: arr(2048, 0), np: 0,
     opglyph: arr(32, ""), opfname: arr(32, ""), opprec: arr(32, 0), nops: 0,
     copen: arr(32, ""), cclose: arr(32, ""), cfname: arr(32, ""), ncirc: 0,

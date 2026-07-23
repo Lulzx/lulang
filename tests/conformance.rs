@@ -154,6 +154,9 @@ conformance_cases! {
     left_to_right_and_short_circuit:
         "fn bump(inout x: i64): i64 {\n x = x + 1\n return x\n}\nfn pair(a: i64, b: i64): i64 { return a * 10 + b }\nmain {\n var x = 0\n print(pair(bump(x), x), x)\n print(false and (1 / 0 == 0), true or (1 / 0 == 0))\n}\n"
         => b"11 1\nfalse true\n";
+    string_constants_in_outlined_functions_stay_alive:
+        "fn text(n: i64): str {\n if n == 0 { return \"stable string\" }\n return text(n - 1)\n}\nmain {\n print(text(1))\n}\n"
+        => b"stable string\n";
 }
 
 #[test]
@@ -212,5 +215,124 @@ fn arrays_nested_in_records_still_have_value_semantics() {
            print(original.values[0], snapshot.values[0])\n\
          }\n",
         b"7 0\n",
+    );
+}
+
+#[test]
+fn inlined_inout_record_mutation_preserves_array_snapshots() {
+    assert_host_success(
+        "inlined_inout_record_cow",
+        "type Bag { values: [i64] }\n\
+         fn mutate(inout bag: Bag) { bag.values[0] = 7 }\n\
+         main {\n\
+           var original = Bag { arr(1, 0) }\n\
+           let snapshot = original\n\
+           mutate(original)\n\
+           print(original.values[0], snapshot.values[0])\n\
+         }\n",
+        b"7 0\n",
+    );
+}
+
+#[test]
+fn scalar_ffi_imports_match_across_all_tiers() {
+    assert_success(
+        "scalar_ffi_imports",
+        "extern fn llabs(x: i64): i64\n\
+         extern \"m\" fn cbrt(x: f64): f64\n\
+         main { print(llabs(-42), cbrt(27.0)) }\n",
+        b"42 3\n",
+    );
+}
+
+#[test]
+fn ffi_arrays_and_strings_match_across_all_tiers() {
+    let dir = CaseDir::new("ffi_array_copyout", "");
+    let extension = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let library = dir.0.join(format!("libfixture.{}", extension));
+    let fixture = dir.0.join("fixture.c");
+    fs::write(
+        &fixture,
+        "#include <stdint.h>\n\
+         void bump(int64_t *data, int64_t n) {\n\
+           for (int64_t i = 0; i < n; ++i) data[i] += 10;\n\
+         }\n\
+         void scale(double *data, int64_t n, double factor) {\n\
+           for (int64_t i = 0; i < n; ++i) data[i] *= factor;\n\
+         }\n\
+         int64_t byte_sum(const char *data, int64_t n) {\n\
+           int64_t total = 0;\n\
+           for (int64_t i = 0; i < n; ++i) total += (unsigned char)data[i];\n\
+           return total;\n\
+         }\n",
+    )
+    .expect("write FFI fixture");
+    let compiled = run(Command::new("clang")
+        .args(["-shared", "-o"])
+        .arg(&library)
+        .arg(&fixture));
+    assert!(
+        compiled.status.success(),
+        "compile FFI fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::write(
+        dir.source(),
+        format!(
+            "extern \"{}\" fn bump(data: [i64])\n\
+             extern \"{}\" fn scale(data: [f64], factor: f64)\n\
+             extern \"{}\" fn byte_sum(data: str): i64\n\
+             main {{\n\
+               var data = arr(3, 0)\n\
+               data[0] = 1\n\
+               data[1] = 2\n\
+               data[2] = 3\n\
+               bump(data)\n\
+               var values = arr(2, 1.5)\n\
+               scale(values, 2.0)\n\
+               print(data[0], data[2], byte_sum(\"ABC\"))\n\
+               print(values[0], values[1])\n\
+             }}\n",
+            library.display(),
+            library.display(),
+            library.display()
+        ),
+    )
+    .expect("write FFI case");
+    for (backend, output) in [
+        ("interpreter", host("interp", &dir.source())),
+        ("JIT", host("run", &dir.source())),
+        ("AOT", aot(&dir)),
+        ("self-hosted", selfhost(&dir.source())),
+    ] {
+        assert!(
+            output.status.success(),
+            "FFI array case failed in {backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout, b"11 13 198\n3 3\n",
+            "FFI array/string mismatch in {backend}"
+        );
+    }
+}
+
+#[test]
+fn exported_array_body_is_mutable_without_changing_lulang_value_semantics() {
+    assert_success(
+        "exported_array_value_semantics",
+        "export fn touch(data: [i64]) {\n\
+           data[0] = 9\n\
+         }\n\
+         main {\n\
+           var data = arr(1, 0)\n\
+           touch(data)\n\
+           print(data[0])\n\
+         }\n",
+        b"0\n",
     );
 }
