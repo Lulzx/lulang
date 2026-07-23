@@ -79,6 +79,7 @@ pub fn resolve(lib: Option<&str>, symbol: &str) -> Result<usize, String> {
         "lu_ffi_prepare" => Some(lu_ffi_prepare as *const () as usize),
         "lu_ffi_call_i" => Some(lu_ffi_call_i as *const () as usize),
         "lu_ffi_call_f" => Some(lu_ffi_call_f as *const () as usize),
+        "lu_ffi_call_f32" => Some(lu_ffi_call_f32 as *const () as usize),
         _ => None,
     };
     if let Some(pointer) = bridge {
@@ -182,6 +183,17 @@ unsafe fn unpack_call(
                 float_registers[float_index] = floats[offset];
                 float_index += 1;
             }
+            5 => {
+                let offset = usize::try_from(value).map_err(|_| "invalid f32 offset")?;
+                if float_index >= float_registers.len() || offset >= floats.len() {
+                    return Err("packed FFI f32 register overflow".into());
+                }
+                // The trampoline's f64 arguments are raw FP-register carriers.
+                // A C f32 callee reads the low 32 bits of that same register.
+                float_registers[float_index] =
+                    f64::from_bits((floats[offset] as f32).to_bits() as u64);
+                float_index += 1;
+            }
             2 => {
                 let offset = usize::try_from(value).map_err(|_| "invalid string data offset")?;
                 let length = usize::try_from(length).map_err(|_| "invalid string data length")?;
@@ -267,6 +279,28 @@ pub unsafe extern "C" fn lu_ffi_call_f(
     }
 }
 
+pub unsafe extern "C" fn lu_ffi_call_f32(
+    control: *mut i64,
+    control_length: i64,
+    floats: *mut f64,
+    float_length: i64,
+) -> f64 {
+    let pointer = *PREPARED.get_or_init(|| Mutex::new(0)).lock().unwrap();
+    match unpack_call(control, control_length, floats, float_length) {
+        Ok((ints, float_registers, _strings)) if pointer != 0 => {
+            call_f32(pointer, ints, float_registers) as f64
+        }
+        Ok(_) => {
+            eprintln!("runtime error: no prepared FFI symbol");
+            0.0
+        }
+        Err(error) => {
+            eprintln!("runtime error: {}", error);
+            0.0
+        }
+    }
+}
+
 type I64Call = unsafe extern "C" fn(
     i64,
     i64,
@@ -314,4 +348,13 @@ pub unsafe fn call_f64(pointer: usize, ints: [i64; 6], floats: [f64; 8]) -> f64 
         ints[0], ints[1], ints[2], ints[3], ints[4], ints[5], floats[0], floats[1], floats[2],
         floats[3], floats[4], floats[5], floats[6], floats[7],
     )
+}
+
+pub unsafe fn call_f32(pointer: usize, ints: [i64; 6], floats: [f64; 8]) -> f32 {
+    // Integer and FP argument classes occupy independent register sequences.
+    // `F64Call` supplies all class registers; f32 arguments were encoded into
+    // the low 32 bits by the marshaller and a C callee reads those same bits.
+    // A scalar f32 return likewise arrives in the low 32 bits of the FP result.
+    let raw = call_f64(pointer, ints, floats).to_bits();
+    f32::from_bits(raw as u32)
 }

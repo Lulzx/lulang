@@ -65,14 +65,16 @@ more viral direction: nobody rewrites their app, but everyone will try a
 2×-faster kernel. The JSON manifest is the foundation for automatic bindings
 (`pylulang`, future `lu bindgen` output verification).
 
-M8 boundary subset: `i64`, `f64`, `bool` (0/1 as `int64_t`), enums (i64 tag),
+M8 boundary subset plus its first compatible extension: `i64`, `f32`, `f64`,
+`bool` (0/1 as `int64_t`), enums (i64 tag),
 `str` as `(const char*, int64_t)` parameters, `[i64]`/`[f64]` as
 `(T* data, int64_t n)`. Signatures capped at 6 integer-class + 8 float-class
 components (a language rule that keeps every argument in registers on both
 SysV x86-64 and AArch64). Boundary-only `c_ptr[T]` opaque handles now work in
 all four tiers and generated headers. Exact record metadata is opt-in through
 `@c_layout`; bindgen uses adapters rather than pretending that compiler-owned
-records have C layout. Remaining follow-ups: direct `f32` parameters,
+records have C layout. Direct `f32` parameters and returns now work in all
+four tiers and bindgen emits C `float` directly. Remaining follow-ups:
 `c_slice[T]`, by-value `@c_layout` calls without adapters, `str` returns,
 callbacks, and zero-copy array export handles.
 
@@ -161,8 +163,9 @@ and checker-valid `extern` generation. The second adds boundary-only
 `c_ptr[T]`, opaque C structs, and end-to-end pointer calls in the interpreter,
 JIT, AOT, and self-hosted compiler. Unsupported pointees degrade to the
 explicit untyped handle `c_ptr[()]`; no C layout is inferred. Narrower
-integers, `float`, C `bool`, and by-value struct parameters now use generated
-C adapter shims: public wrappers retain their logical types, while private
+integers, C `bool`, and by-value struct parameters use generated C adapter
+shims; C `float` maps directly to the stable `f32` boundary type. Public
+wrappers retain their logical types, while private
 externs use only the proven scalar boundary ABI. Exact records carry
 `@c_layout`; records containing narrow fields become logical adapter records,
 never false layout claims. The adapters run through all four tiers and avoid

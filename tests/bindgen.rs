@@ -42,14 +42,13 @@ fn bindgen_generates_checker_valid_imports_and_reports_deferred_types() {
     assert!(source.contains("x: f64"));
     assert!(source.contains("extern \"m\" fn hypot(x: f64, y: f64): f64"));
     assert!(source.contains("extern \"m\" fn clamp_index(value: i64, low: i64, high: i64): i64"));
-    assert!(!source.contains("extern \"m\" fn narrow_float"));
+    assert!(source.contains("extern \"m\" fn narrow_float(value: f32): f32"));
     assert!(source.contains("extern \"m\" fn allocate_bytes(size: i64): c_ptr[()]"));
     assert!(!source.contains("extern \"m\" fn consume_vector"));
 
     let diagnostics = String::from_utf8_lossy(&generated.stderr);
-    assert!(diagnostics.contains("C float requires direct f32 boundary support"));
     assert!(diagnostics.contains("@c_layout"));
-    assert!(diagnostics.contains("generated 3 C import(s)"));
+    assert!(diagnostics.contains("generated 4 C import(s)"));
 
     let checked = Command::new(lu())
         .args(["check"])
@@ -109,7 +108,7 @@ fn generated_imports_call_a_compiled_c_library() {
         String::from_utf8_lossy(&generated.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&generated.stderr).contains("built 5 C adapter shim(s)"),
+        String::from_utf8_lossy(&generated.stderr).contains("built 4 C adapter shim(s)"),
         "missing shim build report:\n{}",
         String::from_utf8_lossy(&generated.stderr)
     );

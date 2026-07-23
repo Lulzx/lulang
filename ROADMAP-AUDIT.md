@@ -37,9 +37,12 @@ ordinary lulang records across the boundary. The invariant is exercised by
 
 - Slices A, B, and C are represented by four-tier import conformance,
   static/shared export integration, and selfhost extern execution.
-- Invalid records, direct `f32`, `inout`, register overflow, symbol collisions,
+- Invalid records, `[f32]`, `inout`, register overflow, symbol collisions,
   reserved names, nested declarations, and unresolved symbols are negative
   tests.
+- Direct scalar `f32` is a shipped compatible extension: `cbrtf` executes in
+  all four tiers, C callers exercise generated `float` exports, bindgen maps
+  C `float` without a shim, and host/selfhost LLVM is byte-identical.
 - `tests/selfhost_sync.rs` byte-compares the shared frontend region and the
   host/selfhost LLVM for an import and a scalar export.
 - `selfhost/build.sh --bootstrap` proves stage 1 = stage 2 and stage 2 =
@@ -82,9 +85,9 @@ plus scaled reference-interpreter corpus agreement.
 
 ## Explicitly deferred by the roadmap
 
-Direct boundary `f32`, `c_slice[T]`, string returns, callbacks, zero-copy
-export handles, reverse-mode AD, native WASM SIMD parity, a package registry,
-and the broader bindgen C surface remain later work. The browser's current
+`c_slice[T]`, string returns, callbacks, zero-copy export handles,
+reverse-mode AD, native WASM SIMD parity, a package registry, and the broader
+bindgen C surface remain later work. The browser's current
 interpreter is local TypeScript; compiling the reference CFG evaluator to
 WASM plus property/IR panels and permalinks is the next playground increment.
 These are not silently claimed by the shipped v0.1/foundation slices.

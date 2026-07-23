@@ -107,5 +107,23 @@ fn ffi_import_and_export_ir_match_the_host_byte_for_byte() {
         "export wrappers drifted between host and selfhost"
     );
 
+    let f32_source = directory.join("f32-boundary.lu");
+    std::fs::write(
+        &f32_source,
+        "extern \"m\" fn cbrtf(x: f32): f32\n\
+         export fn half32(x: f32): f32 {\n\
+           return x * f32(0.5)\n\
+         }\n\
+         main { print(float(cbrtf(f32(27)))) }\n",
+    )
+    .expect("write f32 boundary fixture");
+    let host_f32_path = directory.join("host-f32.ll");
+    let host_f32 = emit_host_ir(&f32_source, &host_f32_path);
+    let selfhost_f32 = emit_selfhost_ir(&repository, &f32_source, triple);
+    assert_eq!(
+        host_f32, selfhost_f32,
+        "direct f32 imports and exports drifted between host and selfhost"
+    );
+
     let _ = std::fs::remove_dir_all(directory);
 }

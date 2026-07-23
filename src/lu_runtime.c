@@ -304,6 +304,14 @@ static int lu_ffi_unpack(long long *control, long long control_len,
     } else if (kind == 1) {
       if (nf >= 8 || value < 0 || value >= float_len) return 0;
       fp[nf++] = floats[value];
+    } else if (kind == 5) {
+      if (nf >= 8 || value < 0 || value >= float_len) return 0;
+      float narrowed = (float)floats[value];
+      unsigned int bits;
+      unsigned long long carrier = 0;
+      memcpy(&bits, &narrowed, sizeof bits);
+      carrier = bits;
+      memcpy(&fp[nf++], &carrier, sizeof carrier);
     } else if (kind == 2) {
       if (ni + 2 > 6 || value < 0 || length < 0 ||
           value + length > control_len || *string_count >= 6) return 0;
@@ -367,6 +375,31 @@ double lu_ffi_call_f(long long *control, long long control_len,
   for (int i = 0; i < string_count; i++) free(strings[i]);
   return result;
 }
+
+double lu_ffi_call_f32(long long *control, long long control_len,
+                       double *floats, long long float_len) {
+  long long ints[6] = {0};
+  double fp[8] = {0};
+  unsigned char *strings[6] = {0};
+  int string_count = 0;
+  if (!lu_ffi_prepared ||
+      !lu_ffi_unpack(control, control_len, floats, float_len, ints, fp,
+                     strings, &string_count)) {
+    fprintf(stderr, "runtime error: invalid packed FFI call\n");
+    return 0.0;
+  }
+  double raw = ((lu_ffi_f_fn)lu_ffi_prepared)(
+      ints[0], ints[1], ints[2], ints[3], ints[4], ints[5],
+      fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7]);
+  unsigned long long carrier;
+  unsigned int bits;
+  float result;
+  memcpy(&carrier, &raw, sizeof carrier);
+  bits = (unsigned int)carrier;
+  memcpy(&result, &bits, sizeof result);
+  for (int i = 0; i < string_count; i++) free(strings[i]);
+  return (double)result;
+}
 #else
 long long lu_ffi_prepare(const char *lib, long long ll,
                          const char *symbol, long long sl) {
@@ -383,6 +416,12 @@ long long lu_ffi_call_i(long long *control, long long control_len,
 
 double lu_ffi_call_f(long long *control, long long control_len,
                      double *floats, long long float_len) {
+  (void)control; (void)control_len; (void)floats; (void)float_len;
+  return 0.0;
+}
+
+double lu_ffi_call_f32(long long *control, long long control_len,
+                       double *floats, long long float_len) {
   (void)control; (void)control_len; (void)floats; (void)float_len;
   return 0.0;
 }

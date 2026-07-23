@@ -710,7 +710,8 @@ fn parse_type(inout p: P): i64 {
     return inner + 2048
   }
   if t == "i64" or t == "i32" { return 0 }
-  if t == "f64" or t == "f32" { return 1 }
+  if t == "f64" { return 1 }
+  if t == "f32" { return 5 }
   if t == "bool" { return 2 }
   if t == "str" { return 3 }
   let ei = find_enum(p, t)
@@ -906,7 +907,7 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
       print("type error: FFI function", name, "cannot use inout")
       p.err = 1
     }
-    if t == 1 {
+    if t == 1 or t == 5 {
       nflo = nflo + 1
     } else {
       if t == 3 or t == 1024 or t == 1025 {
@@ -921,7 +922,7 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
       }
     }
   }
-  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or is_enumt(ret) or is_ptrt(ret)) {
+  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or ret == 5 or is_enumt(ret) or is_ptrt(ret)) {
     print("type error: unsupported FFI return in", name)
     p.err = 1
   }
@@ -1043,6 +1044,7 @@ type C { sname: [str], stype: [i64], smut: [i64], nsym: i64, err: i64 }
 fn tname(p: P, t: i64): str {
   if t == 0 { return "i64" }
   if t == 1 { return "f64" }
+  if t == 5 { return "f32" }
   if t == 2 { return "bool" }
   if t == 3 { return "str" }
   if t == 4 { return "()" }
@@ -1058,10 +1060,10 @@ fn tname(p: P, t: i64): str {
 }
 
 fn compat(expect: i64, actual: i64): bool {
-  return expect == actual or (expect == 1 and actual == 0)
+  return expect == actual or ((expect == 1 or expect == 5) and (actual == 0 or actual == 1 or actual == 5))
 }
 
-fn is_num(t: i64): bool { return t == 0 or t == 1 }
+fn is_num(t: i64): bool { return t == 0 or t == 1 or t == 5 }
 
 fn define(inout c: C, name: str, t: i64, m: i64) {
   c.sname[c.nsym] = name
@@ -1195,6 +1197,14 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
       return 5
     }
     return 1
+  }
+  if name == "f32" {
+    if na != 1 or not is_num(att[0]) {
+      print("type error: f32 expects one numeric arg")
+      c.err = 1
+      return 5
+    }
+    return 5
   }
   if name == "int" {
     if na != 1 {
@@ -1400,6 +1410,7 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
     if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" {
       if is_num(lt) and is_num(rt) {
         if lt == 1 or rt == 1 { return 1 }
+        if lt == 5 or rt == 5 { return 5 }
         return 0
       }
       print("type error: cannot apply", op, "to", tname(p, lt), "and", tname(p, rt))
@@ -1841,7 +1852,7 @@ fn newl(inout g: G): str {
 
 // ---------- type layout (mirrors lty in src/llvm.rs) ----------
 
-// number of IR components of a type: f64/i64/bool/enum/[T] = 1,
+// number of IR components of a type: f32/f64/i64/bool/enum/[T] = 1,
 // str = 2 (ptr+len), unit = 0, record = sum of field widths
 fn wcount(p: P, t: i64): i64 {
   if t == 4 { return 0 }
@@ -1860,6 +1871,7 @@ fn wcount(p: P, t: i64): i64 {
 // IR type of the k-th component
 fn compty(p: P, t: i64, k: i64): str {
   if t == 1 { return "double" }
+  if t == 5 { return "float" }
   if is_arrt(t) { return "ptr" }
   if is_ptrt(t) { return "ptr" }
   if t == 3 {
@@ -1996,14 +2008,41 @@ fn tof64(p: P, inout g: G, v: R): str {
     eline(c4(t, " = sitofp i64 ", g.rs[v.o], " to double"))
     return t
   }
+  if v.t == 5 {
+    let t = newt(g)
+    eline(c4(t, " = fpext float ", g.rs[v.o], " to double"))
+    return t
+  }
   return g.rs[v.o]
 }
 
-// int widens to float exactly where the checker permits it
+fn tof32(p: P, inout g: G, v: R): str {
+  if v.t == 0 {
+    let t = newt(g)
+    eline(c4(t, " = sitofp i64 ", g.rs[v.o], " to float"))
+    return t
+  }
+  if v.t == 1 {
+    let t = newt(g)
+    eline(c4(t, " = fptrunc double ", g.rs[v.o], " to float"))
+    return t
+  }
+  return g.rs[v.o]
+}
+
+// Numeric values coerce exactly where the checker permits them.
 fn gcoerce(p: P, inout g: G, v: R, want: i64): R {
   if want == 1 and v.t == 0 {
     let r = tof64(p, g, v)
     return rpush1(g, 1, r)
+  }
+  if want == 1 and v.t == 5 {
+    let r = tof64(p, g, v)
+    return rpush1(g, 1, r)
+  }
+  if want == 5 and (v.t == 0 or v.t == 1) {
+    let r = tof32(p, g, v)
+    return rpush1(g, 5, r)
   }
   return v
 }
@@ -2311,7 +2350,11 @@ fn emit_expr(p: P, inout g: G, e: i64): R {
       if v.t == 1 {
         eline(c4(t, " = fneg fast double ", g.rs[v.o], ""))
       } else {
-        eline(c4(t, " = sub i64 0, ", g.rs[v.o], ""))
+        if v.t == 5 {
+          eline(c4(t, " = fneg fast float ", g.rs[v.o], ""))
+        } else {
+          eline(c4(t, " = sub i64 0, ", g.rs[v.o], ""))
+        }
       }
     } else {
       eline(c4(t, " = xor i64 ", g.rs[v.o], ", 1"))
@@ -2509,16 +2552,22 @@ fn emit_bin(p: P, inout g: G, op: str, l: i64, r: i64): R {
       eline(c8(t, " = ", o2, " i64 ", g.rs[lv.o], ", ", g.rs[rv.o], ""))
       return rpush1(g, 0, t)
     }
-    let a2 = tof64(p, g, lv)
-    let b2 = tof64(p, g, rv)
     var o2 = "frem"
     if op == "+" { o2 = "fadd" }
     if op == "-" { o2 = "fsub" }
     if op == "*" { o2 = "fmul" }
     if op == "/" { o2 = "fdiv" }
     let t = newt(g)
-    eline(c8(t, " = ", o2, " fast double ", a2, ", ", b2, ""))
-    return rpush1(g, 1, t)
+    if lv.t == 1 or rv.t == 1 {
+      let a2 = tof64(p, g, lv)
+      let b2 = tof64(p, g, rv)
+      eline(c8(t, " = ", o2, " fast double ", a2, ", ", b2, ""))
+      return rpush1(g, 1, t)
+    }
+    let a2 = tof32(p, g, lv)
+    let b2 = tof32(p, g, rv)
+    eline(c8(t, " = ", o2, " fast float ", a2, ", ", b2, ""))
+    return rpush1(g, 5, t)
   }
   if (op == "==" or op == "!=") and lv.t == 3 and rv.t == 3 {
     let eq = newt(g)
@@ -2699,6 +2748,10 @@ fn emit_call(p: P, inout g: G, e: i64): R {
     for i in 0..na {
       if i > 0 { eline("call void @lu_print_sep()") }
       if at[i] == 1 { eline(c3("call void @lu_print_f64(double ", g.rs[ao[i]], ")")) }
+      if at[i] == 5 {
+        let widened = tof64(p, g, R { t: 5, o: ao[i], n: 1 })
+        eline(c3("call void @lu_print_f64(double ", widened, ")"))
+      }
       if at[i] == 0 { eline(c3("call void @lu_print_i64(i64 ", g.rs[ao[i]], ")")) }
       if at[i] == 2 { eline(c3("call void @lu_print_bool(i64 ", g.rs[ao[i]], ")")) }
       if at[i] == 3 { eline(c5("call void @lu_print_str(ptr ", g.rs[ao[i]], ", i64 ", g.rs[ao[i] + 1], ")")) }
@@ -2799,10 +2852,14 @@ fn emit_call(p: P, inout g: G, e: i64): R {
     let x = tof64(p, g, R { t: at[0], o: ao[0], n: 1 })
     return rpush1(g, 1, x)
   }
+  if name == "f32" {
+    let x = tof32(p, g, R { t: at[0], o: ao[0], n: 1 })
+    return rpush1(g, 5, x)
+  }
   if name == "int" {
-    if at[0] == 1 {
+    if at[0] == 1 or at[0] == 5 {
       let t = newt(g)
-      eline(c4(t, " = fptosi double ", g.rs[ao[0]], " to i64"))
+      eline(c6(t, " = fptosi ", compty(p, at[0], 0), " ", g.rs[ao[0]], " to i64"))
       return rpush1(g, 0, t)
     }
     // i64, bool, enum tag: already an integer register
@@ -3055,8 +3112,7 @@ fn emit_stmt(p: P, inout g: G, s: i64): R {
   if n.kind == SK.SReturn {
     if n.a >= 0 {
       var v = emit_expr(p, g, n.a)
-      // promote int literal returns into float fns
-      if g.ret == 1 and v.t == 0 { v = gcoerce(p, g, v, 1) }
+      v = gcoerce(p, g, v, g.ret)
       emit_ret(p, g, v)
     } else {
       if g.ret == 4 { emit_ret(p, g, runit()) }

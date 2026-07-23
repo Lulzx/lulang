@@ -204,6 +204,16 @@ fn f32_is_a_distinct_width_in_all_host_tiers() {
 }
 
 #[test]
+fn direct_f32_c_import_uses_single_precision_in_all_tiers() {
+    assert_success(
+        "ffi_f32",
+        "extern \"m\" fn cbrtf(x: f32): f32\n\
+         main { print(float(cbrtf(f32(27)))) }\n",
+        b"3\n",
+    );
+}
+
+#[test]
 fn arrays_nested_in_records_still_have_value_semantics() {
     assert_host_success(
         "nested_array_value_semantics",

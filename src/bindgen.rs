@@ -709,7 +709,7 @@ fn map_type(
             "C bool is not the lulang boundary bool (`int64_t`); a conversion shim is required"
                 .into(),
         ),
-        "float" => Err("C float requires direct f32 boundary support".into()),
+        "float" => Ok("f32".into()),
         base if base.starts_with("enum ") => Err(
             "C enums use implementation-defined integer width; a conversion shim is required"
                 .into(),
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_types_without_exact_boundary_representations() {
+    fn imports_f32_and_refuses_other_inexact_boundary_representations() {
         let header = r#"
             float narrow(float x);
             int ordinary_int(int x);
@@ -1384,11 +1384,10 @@ mod tests {
             int64_t callback(int64_t (*f)(int64_t));
         "#;
         let generated = generate(header, Path::new("unsafe.h"), "unsafe", None).unwrap();
-        assert_eq!(generated.imported_functions, 0);
+        assert_eq!(generated.imported_functions, 1);
         assert!(generated
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("float")));
+            .source
+            .contains("extern \"unsafe\" fn narrow(x: f32): f32"));
         assert!(generated
             .warnings
             .iter()
