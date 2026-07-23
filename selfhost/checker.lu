@@ -142,7 +142,8 @@ type P {
   toks: [Token], nt: i64, pos: i64,
   en: [ENode], ne: i64,
   sn: [SNode], ns: i64,
-  fname: [str], fret: [i64], fpo: [i64], fnp: [i64], fbody: [i64], nf: i64,
+  fname: [str], fret: [i64], fpo: [i64], fnp: [i64], fbody: [i64],
+  fextern: [i64], fexported: [i64], nf: i64,
   pname: [str], ptype: [i64], pmut: [i64], np: i64,
   mainbody: i64,
   err: i64
@@ -466,6 +467,48 @@ fn parse_params(inout p: P): i64 {
   return np
 }
 
+fn add_fn(inout p: P, name: str, ret: i64, po: i64, np2: i64, body: i64, external: i64, exported: i64) {
+  p.fname[p.nf] = name
+  p.fret[p.nf] = ret
+  p.fpo[p.nf] = po
+  p.fnp[p.nf] = np2
+  p.fbody[p.nf] = body
+  p.fextern[p.nf] = external
+  p.fexported[p.nf] = exported
+  p.nf = p.nf + 1
+}
+
+fn parse_named_fn(inout p: P, exported: i64) {
+  let name = take_ident(p)
+  let po = p.np
+  let np2 = parse_params(p)
+  var ret = 4
+  if cur_is_sym(p, ":") {
+    p.pos = p.pos + 1
+    ret = parse_type(p)
+  }
+  let body = parse_block(p)
+  add_fn(p, name, ret, po, np2, body, 0, exported)
+}
+
+fn parse_extern(inout p: P) {
+  if p.toks[p.pos].kind == Kind.KStr { p.pos = p.pos + 1 }
+  if not cur_is_kw(p, "fn") {
+    fail(p, "fn")
+    return
+  }
+  p.pos = p.pos + 1
+  let name = take_ident(p)
+  let po = p.np
+  let np2 = parse_params(p)
+  var ret = 4
+  if cur_is_sym(p, ":") {
+    p.pos = p.pos + 1
+    ret = parse_type(p)
+  }
+  add_fn(p, name, ret, po, np2, -1, 1, 0)
+}
+
 fn parse_top(inout p: P) {
   var going = true
   while going and p.err == 0 {
@@ -475,27 +518,28 @@ fn parse_top(inout p: P) {
     } else {
       if cur_is_kw(p, "fn") {
         p.pos = p.pos + 1
-        let name = take_ident(p)
-        let po = p.np
-        let np = parse_params(p)
-        var ret = 4
-        if cur_is_sym(p, ":") {
-          p.pos = p.pos + 1
-          ret = parse_type(p)
-        }
-        let body = parse_block(p)
-        p.fname[p.nf] = name
-        p.fret[p.nf] = ret
-        p.fpo[p.nf] = po
-        p.fnp[p.nf] = np
-        p.fbody[p.nf] = body
-        p.nf = p.nf + 1
+        parse_named_fn(p, 0)
       } else {
+        if cur_is_kw(p, "export") {
+          p.pos = p.pos + 1
+          if cur_is_kw(p, "fn") {
+            p.pos = p.pos + 1
+            parse_named_fn(p, 1)
+          } else {
+            fail(p, "fn")
+          }
+        } else {
+          if cur_is_kw(p, "extern") {
+            p.pos = p.pos + 1
+            parse_extern(p)
+          } else {
         if cur_is_kw(p, "main") {
           p.pos = p.pos + 1
           p.mainbody = parse_block(p)
         } else {
           fail(p, "fn or main")
+        }
+          }
         }
       }
     }
@@ -919,7 +963,7 @@ fn check_fn(p: P, inout c: C, f: i64) {
 fn check_program(p: P, inout c: C) {
   var f = 0
   while f < p.nf and c.err == 0 {
-    check_fn(p, c, f)
+    if p.fextern[f] == 0 { check_fn(p, c, f) }
     f = f + 1
   }
   if c.err == 0 and p.mainbody >= 0 {
@@ -953,7 +997,8 @@ fn run(label: str, src: str) {
     toks: toks, nt: nt, pos: 0,
     en: arr(cap * 2, ENode { kind: EK.ENum, a: -1, b: -1, num: 0.0, text: "" }), ne: 0,
     sn: arr(cap, SNode { kind: SK.SExpr, a: -1, b: -1, c: -1, nxt: -1, text: "" }), ns: 0,
-    fname: arr(32, ""), fret: arr(32, 4), fpo: arr(32, 0), fnp: arr(32, 0), fbody: arr(32, -1), nf: 0,
+    fname: arr(32, ""), fret: arr(32, 4), fpo: arr(32, 0), fnp: arr(32, 0), fbody: arr(32, -1),
+    fextern: arr(32, 0), fexported: arr(32, 0), nf: 0,
     pname: arr(64, ""), ptype: arr(64, 5), pmut: arr(64, 0), np: 0,
     mainbody: -1,
     err: 0
@@ -969,6 +1014,7 @@ fn run(label: str, src: str) {
 }
 
 main {
+  run("good: FFI declarations", "extern \"m\" fn cbrt(x: f64): f64\nexport fn twice(x: i64): i64 { return x * 2 }\nmain { print(twice(21)) }\n")
   run("good: dot/clamp/fill", "fn dot(a: [f64], b: [f64], n: i64): f64 {\n  var acc = 0.0\n  for i in 0..n {\n    acc = acc + a[i] * b[i]\n  }\n  return acc\n}\n\nfn clamp(x: f64, lo: f64, hi: f64): f64 {\n  if x < lo { return lo }\n  if x > hi { return hi }\n  return x\n}\n\nfn fill(inout v: [f64], n: i64) {\n  var i = 0\n  while i < n and v[i] ~= 0.0 {\n    v[i] = float(i) * 0.5 + 1.0\n    i = i + 1\n  }\n}\n\nmain {\n  let n = 100\n  var v = arr(n, 0.0)\n  fill(v, n)\n  print(\"dot:\", dot(v, v, n), clamp(-2.5, 0.0, 1.0), not (1 > 2))\n}\n")
   run("good: int widens to float", "fn scale(x: f64): f64 { return x * 2.0 }\nmain {\n  print(scale(3))\n  var y = 1.5\n  y = 2\n  print(y)\n}\n")
   run("bad: return type mismatch", "fn f(x: i64): i64 { return x * 0.5 }\nmain { print(f(2)) }\n")
