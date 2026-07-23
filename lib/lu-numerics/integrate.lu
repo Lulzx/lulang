@@ -1,0 +1,14 @@
+export fn trapz_uniform(y: [f64], dx: f64, n: i64): f64 {
+  if n < 2 {
+    return 0.0
+  }
+  let interior = sum(i in 1..n - 1) y[i]
+  return dx * (0.5 * y[0] + interior + 0.5 * y[n - 1])
+}
+
+export fn trapz_xy(x: [f64], y: [f64], n: i64): f64 {
+  if n < 2 {
+    return 0.0
+  }
+  return sum(i in 0..n - 1) 0.5 * (x[i + 1] - x[i]) * (y[i] + y[i + 1])
+}

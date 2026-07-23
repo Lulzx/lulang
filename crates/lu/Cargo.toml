@@ -31,6 +31,10 @@ path = "../../tests/pylulang.rs"
 name = "lsp"
 path = "../../tests/lsp.rs"
 
+[[test]]
+name = "numerics"
+path = "../../tests/numerics.rs"
+
 [dependencies]
 lu_syntax.workspace = true
 lu_ir.workspace = true
