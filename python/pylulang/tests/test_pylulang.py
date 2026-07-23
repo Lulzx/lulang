@@ -18,6 +18,14 @@ export fn saxpy(a: f64, x: [f64], y: [f64], n: i64): f64 {
 export fn positive(x: i64): bool {
   return x > 0
 }
+
+export fn borrowed_sum(values: c_slice[f64]): f64 {
+  return sum(i in 0..len(values)) values[i]
+}
+
+export fn half32(x: f32): f32 {
+  return x * f32(0.5)
+}
 """
 
 
@@ -32,6 +40,7 @@ class PyLulangTest(unittest.TestCase):
         self.assertEqual(y, [12.0, 24.0, 36.0])
         self.assertTrue(module.positive(1))
         self.assertFalse(module.positive(-1))
+        self.assertAlmostEqual(module.half32(9.0), 4.5)
         module.close()
 
     def test_numpy_without_copying_the_boundary_buffer(self):
@@ -46,6 +55,8 @@ class PyLulangTest(unittest.TestCase):
             y = numpy.array([10.0, 20.0, 30.0])
             self.assertEqual(module.saxpy(2.0, x, y, 3), 72.0)
             numpy.testing.assert_array_equal(y, [12.0, 24.0, 36.0])
+            x.setflags(write=False)
+            self.assertEqual(module.borrowed_sum(x), 6.0)
 
 
 if __name__ == "__main__":

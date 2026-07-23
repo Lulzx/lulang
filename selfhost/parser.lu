@@ -419,9 +419,9 @@ fn parse_type(inout p: P) {
   } else {
     let t = take_ident(p)
     if t == "" { fail(p, "type") }
-    if t == "c_ptr" {
+    if t == "c_ptr" or t == "c_slice" {
       expect_sym(p, "[")
-      if cur_is_sym(p, "(") {
+      if t == "c_ptr" and cur_is_sym(p, "(") {
         p.pos = p.pos + 1
         expect_sym(p, ")")
       } else {

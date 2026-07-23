@@ -76,6 +76,7 @@ fn lu_type_name(program: &LoweredProgram, ty: &Type) -> String {
         Type::Str => "str".into(),
         Type::Unit => "()".into(),
         Type::Arr(element) => format!("[{}]", lu_type_name(program, element)),
+        Type::CSlice(element) => format!("c_slice[{}]", lu_type_name(program, element)),
         Type::CPtr(element) => format!("c_ptr[{}]", lu_type_name(program, element)),
         Type::Rec(index) => program.records[*index].name.clone(),
         Type::Enum(index) => program.enums[*index].name.clone(),
@@ -97,6 +98,11 @@ fn c_params(
             Type::Arr(element) => {
                 let element = c_scalar_type(element)?;
                 params.push(format!("{} *{}_data", element, local.name));
+                params.push(format!("int64_t {}_len", local.name));
+            }
+            Type::CSlice(element) => {
+                let element = c_scalar_type(element)?;
+                params.push(format!("const {} *{}_data", element, local.name));
                 params.push(format!("int64_t {}_len", local.name));
             }
             Type::Rec(index) if program.records[*index].c_layout => {

@@ -214,6 +214,84 @@ fn direct_f32_c_import_uses_single_precision_in_all_tiers() {
 }
 
 #[test]
+fn borrowed_c_slice_is_read_only_and_indexable_in_all_tiers() {
+    assert_success(
+        "c_slice",
+        "fn slice_sum(values: c_slice[f64]): f64 {\n\
+           return sum(i in 0..len(values)) values[i]\n\
+         }\n\
+         main {\n\
+           let values = arr(3, 2.0)\n\
+           print(slice_sum(values))\n\
+         }\n",
+        b"6\n",
+    );
+}
+
+#[test]
+fn borrowed_c_slice_imports_cross_all_tiers() {
+    let dir = CaseDir::new("ffi_c_slice", "");
+    let library = dir.0.join(if cfg!(target_os = "macos") {
+        "libc_slice_fixture.dylib"
+    } else {
+        "libc_slice_fixture.so"
+    });
+    let c_source = dir.0.join("c_slice_fixture.c");
+    fs::write(
+        &c_source,
+        "#include <stdint.h>\n\
+         double c_slice_sum(const double *values, int64_t length) {\n\
+           double total = 0.0;\n\
+           for (int64_t i = 0; i < length; i++) total += values[i];\n\
+           return total;\n\
+         }\n",
+    )
+    .expect("write C fixture");
+    let mut compiler = Command::new("cc");
+    if cfg!(target_os = "macos") {
+        compiler.arg("-dynamiclib");
+    } else {
+        compiler.args(["-shared", "-fPIC"]);
+    }
+    let compiled = run(compiler.arg(&c_source).arg("-o").arg(&library));
+    assert!(
+        compiled.status.success(),
+        "compile c_slice fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::write(
+        dir.source(),
+        format!(
+            "extern {:?} fn c_slice_sum(values: c_slice[f64]): f64\n\
+             main {{\n\
+               let values = arr(3, 2.0)\n\
+               print(c_slice_sum(values))\n\
+             }}\n",
+            library.to_string_lossy()
+        ),
+    )
+    .expect("write lulang fixture");
+
+    let outputs = [
+        ("interpreter", host("interp", &dir.source())),
+        ("JIT", host("run", &dir.source())),
+        ("AOT", aot(&dir)),
+        ("self-hosted", selfhost(&dir.source())),
+    ];
+    for (backend, output) in outputs {
+        assert!(
+            output.status.success(),
+            "c_slice import failed in {backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout, b"6\n",
+            "c_slice import disagreed in {backend}"
+        );
+    }
+}
+
+#[test]
 fn arrays_nested_in_records_still_have_value_semantics() {
     assert_host_success(
         "nested_array_value_semantics",

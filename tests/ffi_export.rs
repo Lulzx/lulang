@@ -171,6 +171,93 @@ fn exported_f32_is_exact_in_headers_manifests_and_c_callers() {
 }
 
 #[test]
+fn exported_c_slice_borrows_c_memory_without_an_array_copy() {
+    let directory = std::env::temp_dir().join(format!("lulang_ffi_c_slice_{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create fixture directory");
+    let source = directory.join("borrowed_sum.lu");
+    std::fs::write(
+        &source,
+        "export fn borrowed_sum(values: c_slice[f64]): f64 {\n\
+           return sum(i in 0..len(values)) values[i]\n\
+         }\n\
+         main { print(0) }\n",
+    )
+    .expect("write source");
+    let base = directory.join("borrowed_sum");
+
+    run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .args(["build", "--lib", "-o"])
+        .arg(&base)
+        .arg(&source));
+    let header = std::fs::read_to_string(directory.join("borrowed_sum.h")).expect("read header");
+    assert!(header.contains("double borrowed_sum(const double *values_data, int64_t values_len);"));
+    let manifest =
+        std::fs::read_to_string(directory.join("borrowed_sum.json")).expect("read manifest");
+    assert!(manifest.contains("\"type\": \"c_slice[f64]\""));
+
+    let llvm_path = directory.join("borrowed_sum.ll");
+    run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .args(["build", "--emit-llvm", "-o"])
+        .arg(&llvm_path)
+        .arg(&source));
+    let llvm = std::fs::read_to_string(&llvm_path).expect("read LLVM");
+    let wrapper = llvm
+        .split("define dso_local double @\"borrowed_sum\"")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("borrowed_sum export wrapper");
+    assert!(!wrapper.contains("lu_arr_new_raw"));
+    assert!(wrapper.contains("ptr %c0, i64 %c1"));
+
+    let c_source = directory.join("borrowed_sum.c");
+    std::fs::write(
+        &c_source,
+        "#include <stdio.h>\n\
+         #include \"borrowed_sum.h\"\n\
+         int main(void) {\n\
+           const double values[] = { 1.5, 2.5, 3.0 };\n\
+           printf(\"%.1f\\n\", borrowed_sum(values, 3));\n\
+           return 0;\n\
+         }\n",
+    )
+    .expect("write C harness");
+    let c_binary = directory.join("borrowed_sum_c");
+    run(Command::new("clang")
+        .arg("-O2")
+        .arg("-I")
+        .arg(&directory)
+        .arg(&c_source)
+        .arg(directory.join("libborrowed_sum.a"))
+        .arg("-o")
+        .arg(&c_binary));
+    let output = run(&mut Command::new(&c_binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "7.0\n");
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let selfhost_ir = directory.join("selfhost_borrowed_sum.ll");
+    let generated = run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .arg("run")
+        .arg(repository.join("selfhost/codegen.lu"))
+        .arg(&source));
+    std::fs::write(&selfhost_ir, generated.stdout).expect("write self-hosted LLVM IR");
+    let selfhost_binary = directory.join("selfhost_borrowed_sum_c");
+    run(Command::new("clang")
+        .arg("-O2")
+        .arg("-DLU_LIB")
+        .arg(&selfhost_ir)
+        .arg(repository.join("src/lu_runtime.c"))
+        .arg(&c_source)
+        .arg("-I")
+        .arg(&directory)
+        .arg("-o")
+        .arg(&selfhost_binary));
+    let output = run(&mut Command::new(&selfhost_binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "7.0\n");
+
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
 fn exported_opaque_pointer_uses_void_pointer_header_abi() {
     let directory = std::env::temp_dir().join(format!("lulang_ffi_pointer_{}", std::process::id()));
     std::fs::create_dir_all(&directory).expect("create fixture directory");

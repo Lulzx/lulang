@@ -427,6 +427,12 @@ fn parse_type(inout p: P): i64 {
     return t + 8
   }
   let t = take_ident(p)
+  if t == "c_slice" {
+    expect_sym(p, "[")
+    let inner = parse_type(p)
+    expect_sym(p, "]")
+    return inner + 48
+  }
   if t == "c_ptr" {
     expect_sym(p, "[")
     var inner = 4
@@ -574,6 +580,7 @@ fn tname(t: i64): str {
   if t == 9 { return "[f64]" }
   if t == 10 { return "[bool]" }
   if t == 11 { return "[str]" }
+  if t >= 48 { return "c_slice[..]" }
   if t >= 32 { return "c_ptr[..]" }
   if t >= 16 { return "[[..]]" }
   return "<error>"
@@ -669,7 +676,7 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
     return 0
   }
   if name == "len" {
-    if na != 1 or (att[0] != 3 and att[0] < 8) {
+    if na != 1 or (att[0] != 3 and not (att[0] >= 8 and att[0] < 32) and att[0] < 48) {
       print("type error: len expects an array or str")
       c.err = 1
       return 5
@@ -817,7 +824,8 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
       c.err = 1
       return 5
     }
-    if bt >= 8 { return bt - 8 }
+    if bt >= 48 { return bt - 48 }
+    if bt >= 8 and bt < 32 { return bt - 8 }
     if bt == 3 { return 0 }
     print("type error: cannot index into", tname(bt))
     c.err = 1

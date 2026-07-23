@@ -9,6 +9,7 @@ module.exports = grammar({
     number: _ => /\d+(\.\d+)?([eE][+-]?\d+)?/,
     string: _ => seq('"', repeat(choice(/[^"\\]/, /\\./)), '"'),
     type: $ => choice("i32", "i64", "f32", "f64", "bool", "str", "()",
+      seq(choice("c_ptr", "c_slice"), "[", $.type, "]"),
       $.identifier, seq("[", $.type, "]")),
     declaration: $ => choice($.function_declaration, $.extern_declaration,
       $.type_declaration, $.enum_declaration, $.property_declaration),

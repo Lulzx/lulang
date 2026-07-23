@@ -1365,6 +1365,41 @@ impl<'a> Emit<'a> {
                 regs: vec![out],
             });
         }
+        if let CType::CSlice(elem) = base.ty {
+            let bad = self.t();
+            self.line(format!(
+                "{} = icmp uge i64 {}, {}",
+                bad, index.regs[0], base.regs[1]
+            ));
+            let fail = self.l();
+            let ok = self.l();
+            self.line(format!("br i1 {}, label %{}, label %{}", bad, fail, ok));
+            self.label(&fail);
+            self.line(format!(
+                "call void @lu_oob(i64 {}, i64 {})",
+                index.regs[0], base.regs[1]
+            ));
+            self.line("unreachable".into());
+            self.label(&ok);
+            let components = lty(self.p, &elem)?;
+            if components.len() != 1 {
+                return Err("c_slice elements must have one ABI component".into());
+            }
+            let address = self.t();
+            self.line(format!(
+                "{} = getelementptr {}, ptr {}, i64 {}",
+                address, components[0], base.regs[0], index.regs[0]
+            ));
+            let result = self.t();
+            self.line(format!(
+                "{} = load {}, ptr {}",
+                result, components[0], address
+            ));
+            return Ok(EV {
+                ty: *elem,
+                regs: vec![result],
+            });
+        }
         let CType::Arr(elem) = base.ty else {
             return Err("IR index on non-array".into());
         };
@@ -1633,6 +1668,29 @@ impl<'a> Emit<'a> {
                 out
             }
             (CType::F64, CType::F32) => self.to_f64(&value)?,
+            (CType::CSlice(want_element), CType::Arr(got_element))
+                if want_element == got_element =>
+            {
+                let slots = self.t();
+                self.line(format!("{} = load i64, ptr {}", slots, value.regs[0]));
+                let stride = lty(self.p, want_element)?.len();
+                let length = if stride == 1 {
+                    slots
+                } else {
+                    let length = self.t();
+                    self.line(format!("{} = sdiv i64 {}, {}", length, slots, stride));
+                    length
+                };
+                let data = self.t();
+                self.line(format!(
+                    "{} = getelementptr i8, ptr {}, i64 8",
+                    data, value.regs[0]
+                ));
+                return Ok(EV {
+                    ty: CType::CSlice(want_element.clone()),
+                    regs: vec![data, length],
+                });
+            }
             _ => {
                 return Err(format!(
                     "cannot coerce LLVM value {:?} to {:?}",
@@ -2021,6 +2079,12 @@ impl<'a> Emit<'a> {
             "len" => {
                 let elem = match &args[0].ty {
                     CType::Arr(e) => e.as_ref().clone(),
+                    CType::CSlice(_) => {
+                        return Ok(EV {
+                            ty: CType::I64,
+                            regs: vec![args[0].regs[1].clone()],
+                        });
+                    }
                     _ => return Err("`len` expects array".into()),
                 };
                 let stride = lty(self.p, &elem)?.len() as i64;

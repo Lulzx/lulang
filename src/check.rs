@@ -11,6 +11,7 @@ pub enum Type {
     Str,
     Unit,
     Arr(Box<Type>),
+    CSlice(Box<Type>),
     CPtr(Box<Type>),
     Rec(usize),
     Enum(usize),
@@ -60,6 +61,11 @@ pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
         _ => {
             if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
                 Ok(Type::Arr(Box::new(resolve_type(p, inner)?)))
+            } else if let Some(inner) = s
+                .strip_prefix("c_slice[")
+                .and_then(|inner| inner.strip_suffix(']'))
+            {
+                Ok(Type::CSlice(Box::new(resolve_type(p, inner)?)))
             } else if let Some(inner) = s
                 .strip_prefix("c_ptr[")
                 .and_then(|inner| inner.strip_suffix(']'))
@@ -135,6 +141,14 @@ impl<'a> Checker<'a> {
             expr_types: RefCell::new(vec![None; p.exprs.len()]),
         };
         for (record_index, record) in p.types.iter().enumerate() {
+            for (field, source) in &record.fields {
+                if matches!(c.resolve(source)?, Type::CSlice(_)) {
+                    return Err(format!(
+                        "record field `{}.{}` cannot store a borrowed c_slice",
+                        record.name, field
+                    ));
+                }
+            }
             if record.c_layout {
                 c.validate_c_layout_record(record_index, &mut Vec::new())?;
             }
@@ -181,6 +195,23 @@ impl<'a> Checker<'a> {
                 f.params.iter().map(|(_, t)| c.resolve(t)).collect();
             let params = params?;
             let ret = c.resolve(&f.ret)?;
+            for param in &params {
+                if let Type::CSlice(element) = param {
+                    if !matches!(element.as_ref(), Type::I64 | Type::F64) {
+                        return Err(format!(
+                            "function `{}` has unsupported c_slice element {}; allowed elements are i64 and f64",
+                            f.name,
+                            c.name(element)
+                        ));
+                    }
+                }
+            }
+            if matches!(ret, Type::CSlice(_)) {
+                return Err(format!(
+                    "function `{}` cannot return a borrowed c_slice",
+                    f.name
+                ));
+            }
             if f.exported {
                 if f.has_inout() {
                     return Err(format!(
@@ -236,6 +267,11 @@ impl<'a> Checker<'a> {
             _ => {
                 if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
                     Ok(Type::Arr(Box::new(self.resolve(inner)?)))
+                } else if let Some(inner) = s
+                    .strip_prefix("c_slice[")
+                    .and_then(|inner| inner.strip_suffix(']'))
+                {
+                    Ok(Type::CSlice(Box::new(self.resolve(inner)?)))
                 } else if let Some(inner) = s
                     .strip_prefix("c_ptr[")
                     .and_then(|inner| inner.strip_suffix(']'))
@@ -300,9 +336,13 @@ impl<'a> Checker<'a> {
             Type::I64 | Type::Bool | Type::Enum(_) | Type::CPtr(_) => Ok((1, 0)),
             Type::F32 | Type::F64 => Ok((0, 1)),
             Type::Str => Ok((2, 0)),
+            Type::CSlice(element) if matches!(element.as_ref(), Type::I64 | Type::F64) =>
+            {
+                Ok((2, 0))
+            }
             Type::Arr(element) if matches!(element.as_ref(), Type::I64 | Type::F64) => Ok((2, 0)),
             _ => Err(
-                "allowed boundary types are i64, f32, f64, bool, enums, c_ptr[T], str, [i64], and [f64]; @c_layout by-value calls are not enabled yet"
+                "allowed boundary types are i64, f32, f64, bool, enums, c_ptr[T], c_slice[i64|f64], str, [i64], and [f64]; @c_layout by-value calls are not enabled yet"
                     .into(),
             ),
         }
@@ -364,6 +404,7 @@ impl<'a> Checker<'a> {
             Type::Str => "str".into(),
             Type::Unit => "()".into(),
             Type::Arr(t) => format!("[{}]", self.name(t)),
+            Type::CSlice(t) => format!("c_slice[{}]", self.name(t)),
             Type::CPtr(t) => format!("c_ptr[{}]", self.name(t)),
             Type::Rec(i) => self.p.types[*i].name.clone(),
             Type::Enum(i) => self.p.enums[*i].name.clone(),
@@ -375,6 +416,10 @@ impl<'a> Checker<'a> {
             || (matches!(expected, Type::F32 | Type::F64) && *actual == Type::I64)
             || (*expected == Type::F32 && *actual == Type::F64)
             || (*expected == Type::F64 && *actual == Type::F32)
+            || matches!(
+                (expected, actual),
+                (Type::CSlice(expected), Type::Arr(actual)) if expected == actual
+            )
     }
 
     fn check_fn(&self, f: &FnDecl) -> Result<(), String> {
@@ -468,6 +513,9 @@ impl<'a> Checker<'a> {
                                         self.name(&el)
                                     ));
                                 }
+                            }
+                            Type::CSlice(_) => {
+                                return Err("borrowed c_slice values are read-only".into())
                             }
                             t => return Err(format!("cannot index into {}", self.name(&t))),
                         }
@@ -726,7 +774,7 @@ impl<'a> Checker<'a> {
                     return Err("array index must be i64".into());
                 }
                 match self.check_expr(*a, scopes)? {
-                    Type::Arr(el) => Ok(*el),
+                    Type::Arr(el) | Type::CSlice(el) => Ok(*el),
                     Type::Str => Ok(Type::I64), // byte access
                     t => Err(format!("cannot index into {}", self.name(&t))),
                 }
@@ -949,7 +997,7 @@ impl<'a> Checker<'a> {
                     "len" => {
                         need(1)?;
                         match &ats[0] {
-                            Type::Arr(_) | Type::Str => Ok(Type::I64),
+                            Type::Arr(_) | Type::CSlice(_) | Type::Str => Ok(Type::I64),
                             t => Err(format!(
                                 "`len` expects an array or str, got {}",
                                 self.name(t)
