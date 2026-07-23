@@ -42,7 +42,8 @@ export fn saxpy(a: f64, x: [f64], y: [f64], n: i64): f64 { ... }
 | `[f64]`/`[i64]` | `T* data, int64_t n` | Ptr | yes (data ptr = handle+8) | no | yes (copy-in/out wrapper) | no |
 | `c_slice[f64]`/`c_slice[i64]` | `const T* data, int64_t n` | Ptr+I64 | yes | no | yes (borrowed, no copy) | no |
 | `f32` | `float` | F32 | yes | yes | yes | yes |
-| records, nested arrays | — | — | no | no | no | no |
+| portable `@c_layout` record | C struct value | 1–2 homogeneous I64/Ptr or F64 | yes | no | yes | no |
+| other records, nested arrays | — | — | no | no | no | no |
 
 - Direct `f32` is a post-M8 compatible extension. The dependency-free
   interpreter trampoline carries raw F32 bits in the low half of each FP
@@ -51,6 +52,11 @@ export fn saxpy(a: f64, x: [f64], y: [f64], n: i64): f64 { ... }
 - `c_slice[T]` is a post-M8 borrowed-view extension for 64-bit scalar
   elements. It is read-only, cannot be returned, and preserves the caller's
   `(const T*, length)` without constructing an ordinary lulang array.
+- Direct `@c_layout` parameters are a post-M8 compatible extension limited to
+  flat records with one or two 64-bit fields in one register class. This is
+  the subset whose register placement is identical on SysV x86-64 and
+  AArch64; mixed, `f32`, nested, wider, and returned aggregates retain
+  adapters or explicit diagnostics.
 - **Register-class cap (language rule):** ≤6 integer-class + ≤8 float-class
   components per FFI signature. This keeps every argument in registers on
   SysV x86-64 (6 GPR/8 XMM) and AArch64 (8/8), which is what makes the

@@ -341,11 +341,60 @@ impl<'a> Checker<'a> {
                 Ok((2, 0))
             }
             Type::Arr(element) if matches!(element.as_ref(), Type::I64 | Type::F64) => Ok((2, 0)),
+            Type::Rec(record) => self.ffi_record_classes(*record),
             _ => Err(
-                "allowed boundary types are i64, f32, f64, bool, enums, c_ptr[T], c_slice[i64|f64], str, [i64], and [f64]; @c_layout by-value calls are not enabled yet"
+                "allowed boundary types are i64, f32, f64, bool, enums, c_ptr[T], c_slice[i64|f64], str, [i64], [f64], and supported @c_layout records"
                     .into(),
             ),
         }
+    }
+
+    fn ffi_record_classes(&self, record_index: usize) -> Result<(usize, usize), String> {
+        let record = &self.p.types[record_index];
+        if !record.c_layout {
+            return Err(format!(
+                "record `{}` is compiler-layout; add @c_layout for boundary use",
+                record.name
+            ));
+        }
+        fn collect(
+            checker: &Checker<'_>,
+            record_index: usize,
+            classes: &mut Vec<bool>,
+        ) -> Result<(), String> {
+            for (_, source) in &checker.p.types[record_index].fields {
+                match checker.resolve(source)? {
+                    Type::I64 | Type::Bool | Type::CPtr(_) => classes.push(false),
+                    Type::F64 => classes.push(true),
+                    _ => {
+                        return Err(
+                            "direct @c_layout parameters require flat records containing only 64-bit integer/pointer fields or only f64 fields"
+                                .into(),
+                        )
+                    }
+                }
+            }
+            Ok(())
+        }
+        let mut classes = Vec::new();
+        collect(self, record_index, &mut classes)?;
+        if classes.is_empty() || classes.len() > 2 {
+            return Err(format!(
+                "direct @c_layout parameter `{}` must flatten to one or two 64-bit fields",
+                record.name
+            ));
+        }
+        if classes.iter().any(|class| *class != classes[0]) {
+            return Err(format!(
+                "direct @c_layout parameter `{}` cannot mix integer/pointer and f64 fields",
+                record.name
+            ));
+        }
+        Ok(if classes[0] {
+            (0, classes.len())
+        } else {
+            (classes.len(), 0)
+        })
     }
 
     fn validate_c_layout_record(

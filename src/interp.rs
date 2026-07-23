@@ -819,6 +819,50 @@ impl<'a> Interp<'a> {
             I64(Vec<i64>),
             F64(Vec<f64>),
         }
+        fn marshal_record(
+            ir: &ir::LoweredProgram,
+            record_index: usize,
+            fields: &[Value],
+            ints: &mut [i64; 6],
+            int_index: &mut usize,
+            floats: &mut [f64; 8],
+            float_index: &mut usize,
+        ) -> Result<(), String> {
+            use crate::check::Type;
+            for ((_, ty), value) in ir.records[record_index].fields.iter().zip(fields) {
+                match (ty, value) {
+                    (Type::I64, Value::Int(value)) => {
+                        ints[*int_index] = *value;
+                        *int_index += 1;
+                    }
+                    (Type::Bool, Value::Bool(value)) => {
+                        ints[*int_index] = i64::from(*value);
+                        *int_index += 1;
+                    }
+                    (Type::CPtr(_), Value::CPtr(pointer)) => {
+                        ints[*int_index] = *pointer as i64;
+                        *int_index += 1;
+                    }
+                    (Type::F64, value) => {
+                        floats[*float_index] = as_f64(value)?;
+                        *float_index += 1;
+                    }
+                    (Type::Rec(nested), Value::Rec(actual, nested_fields)) if nested == actual => {
+                        marshal_record(
+                            ir,
+                            *nested,
+                            nested_fields,
+                            ints,
+                            int_index,
+                            floats,
+                            float_index,
+                        )?;
+                    }
+                    _ => return Err("cannot marshal @c_layout record field".into()),
+                }
+            }
+            Ok(())
+        }
         let declaration = &self.ir.externs[id as usize];
         let pointer = crate::ffi::resolve(declaration.lib.as_deref(), &declaration.name)?;
         let mut ints = [0i64; 6];
@@ -906,6 +950,17 @@ impl<'a> Interp<'a> {
                         }
                     }
                     int_index += 2;
+                }
+                (Type::Rec(expected), Value::Rec(actual, fields)) if expected == actual => {
+                    marshal_record(
+                        self.ir,
+                        *expected,
+                        fields,
+                        &mut ints,
+                        &mut int_index,
+                        &mut floats,
+                        &mut float_index,
+                    )?;
                 }
                 _ => {
                     return Err(format!(

@@ -188,7 +188,7 @@ pub fn generate(
     let mut shimmed = 0;
     let mut shim_definitions = Vec::new();
     for function in &parsed.functions {
-        match render_function(function, &parsed.aliases, library) {
+        match render_function(function, &parsed, library) {
             Ok(declaration) => {
                 source.push_str(&declaration);
                 source.push('\n');
@@ -265,11 +265,7 @@ fn map_shim_record_field(ty: &CType, aliases: &BTreeMap<String, CType>) -> Resul
     }
 }
 
-fn render_function(
-    function: &CFunction,
-    aliases: &BTreeMap<String, CType>,
-    library: &str,
-) -> Result<String, String> {
+fn render_function(function: &CFunction, header: &Header, library: &str) -> Result<String, String> {
     if function.variadic {
         return Err("variadic functions are not supported".into());
     }
@@ -279,17 +275,24 @@ fn render_function(
     if is_lulang_builtin(&function.name) {
         return Err("name collides with a lulang builtin".into());
     }
-    let ret = map_type(&function.ret, aliases, true)?;
+    let ret = map_type(&function.ret, &header.aliases, true)?;
     let mut params = Vec::new();
     let mut int_classes = 0usize;
     let mut float_classes = 0usize;
     for (index, parameter) in function.params.iter().enumerate() {
-        let ty = map_type(&parameter.ty, aliases, false)?;
-        match ty.as_str() {
-            "f64" => float_classes += 1,
-            "str" => int_classes += 2,
-            _ => int_classes += 1,
-        }
+        let (ty, ints, floats) = match map_type(&parameter.ty, &header.aliases, false) {
+            Ok(ty) => {
+                let (ints, floats) = match ty.as_str() {
+                    "f64" | "f32" => (0, 1),
+                    "str" => (2, 0),
+                    _ => (1, 0),
+                };
+                (ty, ints, floats)
+            }
+            Err(reason) => direct_record_param(&parameter.ty, header).map_err(|_| reason)?,
+        };
+        int_classes += ints;
+        float_classes += floats;
         params.push(format!(
             "{}: {}",
             sanitize_identifier(&parameter.name, index),
@@ -311,6 +314,52 @@ fn render_function(
         format!("{declaration}\n")
     } else {
         format!("{declaration}: {ret}\n")
+    })
+}
+
+fn direct_record_param(ty: &CType, header: &Header) -> Result<(String, usize, usize), String> {
+    let resolved = resolve_alias(ty, &header.aliases)?;
+    if resolved.function_pointer || resolved.pointers != 0 {
+        return Err("not a by-value record".into());
+    }
+    let base = canonical_base(&resolved.base);
+    let name = base
+        .strip_prefix("struct ")
+        .filter(|name| valid_identifier(name))
+        .ok_or("not a named struct")?;
+    let fields = header
+        .structs
+        .get(name)
+        .and_then(Option::as_ref)
+        .ok_or("record layout is incomplete")?;
+    if fields.is_empty() || fields.len() > 2 {
+        return Err("direct records need one or two fields".into());
+    }
+    let mut class = None;
+    for field in fields {
+        let field = resolve_alias(&field.ty, &header.aliases)?;
+        if field.function_pointer {
+            return Err("record contains a callback".into());
+        }
+        let field_class = if field.pointers != 0 {
+            false
+        } else {
+            match canonical_base(&field.base).as_str() {
+                "double" => true,
+                "int64_t" | "signed long" | "signed long int" | "long" | "long int"
+                | "intptr_t" | "ptrdiff_t" => false,
+                _ => return Err("record field is not a portable 64-bit boundary scalar".into()),
+            }
+        };
+        if class.is_some_and(|class| class != field_class) {
+            return Err("record mixes integer and floating register classes".into());
+        }
+        class = Some(field_class);
+    }
+    Ok(if class == Some(true) {
+        (name.into(), 0, fields.len())
+    } else {
+        (name.into(), fields.len(), 0)
     })
 }
 

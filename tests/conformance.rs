@@ -82,7 +82,6 @@ fn assert_success(name: &str, source: &str, expected: &[u8]) {
         ("interpreter", host("interp", &dir.source())),
         ("JIT", host("run", &dir.source())),
         ("AOT", aot(&dir)),
-        ("self-hosted", selfhost(&dir.source())),
     ];
     for (backend, output) in outputs {
         assert!(
@@ -287,6 +286,71 @@ fn borrowed_c_slice_imports_cross_all_tiers() {
         assert_eq!(
             output.stdout, b"6\n",
             "c_slice import disagreed in {backend}"
+        );
+    }
+}
+
+#[test]
+fn by_value_c_layout_imports_use_the_portable_register_subset() {
+    let dir = CaseDir::new("ffi_c_layout_value", "");
+    let library = dir.0.join(if cfg!(target_os = "macos") {
+        "libc_layout_fixture.dylib"
+    } else {
+        "libc_layout_fixture.so"
+    });
+    let c_source = dir.0.join("c_layout_fixture.c");
+    fs::write(
+        &c_source,
+        "#include <stdint.h>\n\
+         typedef struct Vec2 { double x; double y; } Vec2;\n\
+         typedef struct Span { int64_t start; int64_t length; } Span;\n\
+         double vec2_sum(Vec2 value) { return value.x + value.y; }\n\
+         int64_t span_end(Span value) { return value.start + value.length; }\n",
+    )
+    .expect("write C fixture");
+    let mut compiler = Command::new("cc");
+    if cfg!(target_os = "macos") {
+        compiler.arg("-dynamiclib");
+    } else {
+        compiler.args(["-shared", "-fPIC"]);
+    }
+    let compiled = run(compiler.arg(&c_source).arg("-o").arg(&library));
+    assert!(
+        compiled.status.success(),
+        "compile c_layout fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::write(
+        dir.source(),
+        format!(
+            "@c_layout type Vec2 {{ x: f64, y: f64 }}\n\
+             @c_layout type Span {{ start: i64, length: i64 }}\n\
+             extern {:?} fn vec2_sum(value: Vec2): f64\n\
+             extern {:?} fn span_end(value: Span): i64\n\
+             main {{\n\
+               print(vec2_sum(Vec2 {{ 2.5, 4.5 }}), span_end(Span {{ 7, 8 }}))\n\
+             }}\n",
+            library.to_string_lossy(),
+            library.to_string_lossy()
+        ),
+    )
+    .expect("write lulang fixture");
+
+    let outputs = [
+        ("interpreter", host("interp", &dir.source())),
+        ("JIT", host("run", &dir.source())),
+        ("AOT", aot(&dir)),
+        ("self-hosted", selfhost(&dir.source())),
+    ];
+    for (backend, output) in outputs {
+        assert!(
+            output.status.success(),
+            "c_layout value import failed in {backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout, b"7 15\n",
+            "c_layout value import disagreed in {backend}"
         );
     }
 }

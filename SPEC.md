@@ -203,8 +203,13 @@ layout metadata. Its fields are restricted to exact-width boundary scalars,
 strings, and arrays are rejected. The annotation does not change ordinary
 lulang records, which retain compiler-owned layout. C headers and ABI
 manifests describe annotated records. By-value aggregate calls remain rejected
-until the backend implements the target C ABI's aggregate classification;
-using an annotated record behind `c_ptr[Name]` is already supported.
+except for a deliberately portable register subset: a flat annotated record
+with one or two fields, either all `f64` or all 64-bit integer/pointer-class
+fields, may be a parameter. It is passed as a real C value aggregate in LLVM
+imports and export wrappers and as the equivalent registers in the
+interpreter and JIT. Mixed-class, `f32`, nested, wider, and returned aggregates
+still require an adapter. Using any annotated record behind `c_ptr[Name]`
+remains supported.
 
 Generated bindgen adapters may expose a record-valued lulang parameter without
 passing that record through the boundary. The generated lulang wrapper

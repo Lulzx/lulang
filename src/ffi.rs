@@ -229,6 +229,27 @@ unsafe fn unpack_call(
                 ints[integer_index + 1] = length as i64;
                 integer_index += 2;
             }
+            6 => {
+                let offset = usize::try_from(value).map_err(|_| "invalid record data offset")?;
+                let length = usize::try_from(length).map_err(|_| "invalid record field count")?;
+                if integer_index + length > ints.len() || offset + length > control.len() {
+                    return Err("packed integer record is out of bounds".into());
+                }
+                ints[integer_index..integer_index + length]
+                    .copy_from_slice(&control[offset..offset + length]);
+                integer_index += length;
+            }
+            7 => {
+                let offset =
+                    usize::try_from(value).map_err(|_| "invalid float record data offset")?;
+                let length = usize::try_from(length).map_err(|_| "invalid record field count")?;
+                if float_index + length > float_registers.len() || offset + length > floats.len() {
+                    return Err("packed float record is out of bounds".into());
+                }
+                float_registers[float_index..float_index + length]
+                    .copy_from_slice(&floats[offset..offset + length]);
+                float_index += length;
+            }
             _ => return Err(format!("unknown packed FFI argument kind {}", kind)),
         }
     }

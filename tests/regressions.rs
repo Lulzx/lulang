@@ -200,6 +200,18 @@ fn ffi_boundary_subset_and_register_caps_are_checked() {
             "extern fn bad(a: c_slice[f64], b: c_slice[f64], c: c_slice[f64], d: c_slice[f64])\nmain {}\n",
             "maximum is 6 and 8",
         ),
+        (
+            "@c_layout type Mixed { count: i64, scale: f64 }\nextern fn bad(value: Mixed)\nmain {}\n",
+            "cannot mix integer/pointer and f64 fields",
+        ),
+        (
+            "@c_layout type Narrow { x: f32, y: f32 }\nextern fn bad(value: Narrow)\nmain {}\n",
+            "only 64-bit",
+        ),
+        (
+            "@c_layout type Wide { x: i64, y: i64, z: i64 }\nextern fn bad(value: Wide)\nmain {}\n",
+            "one or two 64-bit fields",
+        ),
     ];
     for (source, message) in cases {
         let output = run("interp", source);

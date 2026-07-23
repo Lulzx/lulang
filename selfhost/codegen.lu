@@ -214,7 +214,7 @@ type P {
   pname: [str], ptype: [i64], pmut: [i64], np: i64,
   opglyph: [str], opfname: [str], opprec: [i64], nops: i64,
   copen: [str], cclose: [str], cfname: [str], ncirc: i64,
-  tyname: [str], tfo: [i64], tnf: [i64], nty: i64,
+  tyname: [str], tfo: [i64], tnf: [i64], tyclayout: [i64], nty: i64,
   flname: [str], flty: [i64], nfl: i64,
   ename: [str], evo: [i64], evn: [i64], nen: i64,
   vrname: [str], nvr: i64,
@@ -910,6 +910,27 @@ fn parse_property(inout p: P) {
   add_fn(p, name, ret, po, np2, body, 1)
 }
 
+// Portable direct aggregate subset: a flat @c_layout record with one or two
+// 64-bit fields, all integer/pointer class (10 + width) or all f64 (20 + width).
+fn ffi_record_shape(p: P, t: i64): i64 {
+  if not is_rect(t) { return 0 }
+  let ti = t - 64
+  if p.tyclayout[ti] == 0 { return 0 }
+  let width = p.tnf[ti]
+  if width < 1 or width > 2 { return 0 }
+  var class = 0
+  for i in 0..width {
+    let ft = p.flty[p.tfo[ti] + i]
+    var field_class = 0
+    if ft == 0 or ft == 2 or is_ptrt(ft) { field_class = 1 }
+    if ft == 1 { field_class = 2 }
+    if field_class == 0 { return 0 }
+    if class != 0 and class != field_class { return 0 }
+    class = field_class
+  }
+  return class * 10 + width
+}
+
 fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
   var ni = 0
   var nflo = 0
@@ -928,8 +949,17 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
         if t == 0 or t == 2 or is_enumt(t) or is_ptrt(t) {
           ni = ni + 1
         } else {
-          print("type error: unsupported FFI parameter in", name)
-          p.err = 1
+          let shape = ffi_record_shape(p, t)
+          if shape >= 20 {
+            nflo = nflo + shape - 20
+          } else {
+            if shape >= 10 {
+              ni = ni + shape - 10
+            } else {
+              print("type error: unsupported FFI parameter in", name)
+              p.err = 1
+            }
+          }
         }
       }
     }
@@ -999,10 +1029,12 @@ fn parse_top(inout p: P) {
   var going = true
   while going and p.err == 0 {
     skipnl(p)
+    var c_layout = 0
     if cur_is_sym(p, "@") {
       p.pos = p.pos + 1
       if cur_is_kw(p, "c_layout") {
         p.pos = p.pos + 1
+        c_layout = 1
       } else {
         fail(p, "c_layout")
       }
@@ -1030,6 +1062,7 @@ fn parse_top(inout p: P) {
         if cur_is_kw(p, "type") {
           p.pos = p.pos + 1
           parse_type_decl(p)
+          p.tyclayout[p.nty - 1] = c_layout
         } else {
           if cur_is_kw(p, "enum") {
             p.pos = p.pos + 1
@@ -2735,8 +2768,19 @@ fn emit_user_call(p: P, inout g: G, fi: i64, at: [i64], ao: [i64], argv: [i64]):
       parts = join2(parts, c2str("ptr ", data))
       parts = join2(parts, c2str("i64 ", logical))
     } else {
-      for k in 0..wcount(p, want) {
-        parts = join2(parts, c3(compty(p, want, k), " ", g.rs[v.o + k]))
+      if p.fextern[fi] == 1 and ffi_record_shape(p, want) != 0 {
+        let aggregate = agg_ty(wcount(p, want), comps_join(p, want))
+        var packed = "poison"
+        for k in 0..wcount(p, want) {
+          let next = newt(g)
+          eline(c9(next, " = insertvalue ", aggregate, " ", packed, ", ", compty(p, want, k), " ", c2str(g.rs[v.o + k], c2str(", ", i2s(k)))))
+          packed = next
+        }
+        parts = join2(parts, c3(aggregate, " ", packed))
+      } else {
+        for k in 0..wcount(p, want) {
+          parts = join2(parts, c3(compty(p, want, k), " ", g.rs[v.o + k]))
+        }
       }
     }
   }
@@ -3264,6 +3308,10 @@ fn emit_export_wrapper(p: P, f: i64) {
   var ahandle = arr(16, "")
   var acomp = arr(16, "")
   var na = 0
+  var rsource = arr(16, "")
+  var rtype = arr(16, "")
+  var rwidth = arr(16, 0)
+  var nr = 0
   var ci = 0
   for j in 0..p.fnp[f] {
     let t = p.ptype[p.fpo[f] + j]
@@ -3282,11 +3330,26 @@ fn emit_export_wrapper(p: P, f: i64) {
       acomp[na] = compty(p, elem_of(t), 0)
       na = na + 1
     } else {
-      for k in 0..wcount(p, t) {
-        let reg = c2str("%c", i2s(ci))
-        params = join2(params, c3(compty(p, t, k), " ", reg))
-        args = join2(args, c3(compty(p, t, k), " ", reg))
+      if ffi_record_shape(p, t) != 0 {
+        let source = c2str("%c", i2s(ci))
+        let aggregate = agg_ty(wcount(p, t), comps_join(p, t))
+        params = join2(params, c3(aggregate, " ", source))
+        for k in 0..wcount(p, t) {
+          let reg = c3("%wr", i2s(nr), c2str("_", i2s(k)))
+          args = join2(args, c3(compty(p, t, k), " ", reg))
+        }
+        rsource[nr] = source
+        rtype[nr] = aggregate
+        rwidth[nr] = wcount(p, t)
+        nr = nr + 1
         ci = ci + 1
+      } else {
+        for k in 0..wcount(p, t) {
+          let reg = c2str("%c", i2s(ci))
+          params = join2(params, c3(compty(p, t, k), " ", reg))
+          args = join2(args, c3(compty(p, t, k), " ", reg))
+          ci = ci + 1
+        }
       }
     }
   }
@@ -3296,6 +3359,12 @@ fn emit_export_wrapper(p: P, f: i64) {
   putnl()
   puts("entry:")
   putnl()
+  for i in 0..nr {
+    for k in 0..rwidth[i] {
+      let reg = c3("%wr", i2s(i), c2str("_", i2s(k)))
+      eline(c7(reg, " = extractvalue ", rtype[i], " ", rsource[i], ", ", i2s(k)))
+    }
+  }
   for i in 0..na {
     let lq = c2str("wa", i2s(i))
     let q = c2str("%", lq)
@@ -3368,8 +3437,12 @@ fn emit_extern_decl(p: P, f: i64) {
       parts = join2(parts, "ptr")
       parts = join2(parts, "i64")
     } else {
-      for k in 0..wcount(p, t) {
-        parts = join2(parts, compty(p, t, k))
+      if ffi_record_shape(p, t) != 0 {
+        parts = join2(parts, agg_ty(wcount(p, t), comps_join(p, t)))
+      } else {
+        for k in 0..wcount(p, t) {
+          parts = join2(parts, compty(p, t, k))
+        }
       }
     }
   }
@@ -3542,7 +3615,7 @@ main {
     pname: arr(2048, ""), ptype: arr(2048, 5), pmut: arr(2048, 0), np: 0,
     opglyph: arr(32, ""), opfname: arr(32, ""), opprec: arr(32, 0), nops: 0,
     copen: arr(32, ""), cclose: arr(32, ""), cfname: arr(32, ""), ncirc: 0,
-    tyname: arr(64, ""), tfo: arr(64, 0), tnf: arr(64, 0), nty: 0,
+    tyname: arr(64, ""), tfo: arr(64, 0), tnf: arr(64, 0), tyclayout: arr(64, 0), nty: 0,
     flname: arr(512, ""), flty: arr(512, 5), nfl: 0,
     ename: arr(32, ""), evo: arr(32, 0), evn: arr(32, 0), nen: 0,
     vrname: arr(256, ""), nvr: 0,

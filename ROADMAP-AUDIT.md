@@ -12,8 +12,9 @@ The stable C ABI is a boundary representation, not the compiler ABI.
 `src/check.rs` admits only the scalar, string, array, enum, and opaque-pointer
 subset and enforces the 6 integer / 8 float register cap. Ordinary records
 remain compiler-owned. `@c_layout` records provide explicit C metadata;
-bindgen uses generated adapters for by-value C records rather than passing
-ordinary lulang records across the boundary. The invariant is exercised by
+bindgen passes only the portable homogeneous `@c_layout` subset directly and
+uses generated adapters for other by-value C records; ordinary lulang records
+never cross the boundary. The invariant is exercised by
 `tests/regressions.rs`, `tests/ffi_export.rs`, and `tests/bindgen.rs`.
 
 ## Ordered roadmap evidence
@@ -22,11 +23,11 @@ ordinary lulang records across the boundary. The invariant is exercised by
 |---:|---|---|
 | 1 | Stable C import/export ABI | Parser/checker/IR in `src/{ast,parser,check,ir}.rs`; interpreter, JIT, LLVM, and selfhost execution; four-tier scalar/array/string/pointer and unresolved-symbol cases in `tests/conformance.rs`. |
 | 2 | C headers and ABI manifests | `src/cheader.rs`; static/shared C and ctypes callers in `tests/ffi_export.rs`; generated Embedded `.h`/`.json` drift check in `tests/luphysics.rs`. |
-| 3 | `pylulang` v0.1 | Installable package under `python/pylulang`; mutable arrays retain copy-out semantics while borrowed `c_slice` accepts read-only contiguous NumPy storage without an internal array copy; list, scalar, mutation, boolean, f32, and NumPy coverage in `tests/pylulang.rs`. |
+| 3 | `pylulang` v0.1 | Installable package under `python/pylulang`; mutable arrays retain copy-out semantics, borrowed `c_slice` accepts read-only contiguous NumPy storage without an internal array copy, and portable `@c_layout` values map to generated ctypes structures; list, scalar, mutation, boolean, f32, record, and NumPy coverage in `tests/pylulang.rs`. |
 | 4 | LSP and VS Code v0.1 | Tree-sitter grammar, VS Code grammar/snippets/extension, `lu lsp`, typed hover/completion, function/operator definitions, format-on-save, property lenses and inline counterexamples; `tests/lsp.rs` plus `tools/tests/test_lulang_lsp.py`. |
 | 5 | `lu-numerics` v0.1 | 26 kernels, 11 law groups, per-function benchmark registry, C++/NumPy/Julia twins, generated docs and all-tier/generated-Python execution; enforced by `tests/numerics.rs` and `lib/lu-numerics/test_numerics.py`. |
 | 6 | Public playground v0.1 | Local browser interpreter with editable examples and no server execution in `playground/app/playground.tsx`; rendered-route tests in `playground/tests`; production site at `lulang.lulzx.space`. |
-| 7 | `lu bindgen` foundation | Dependency-free C parser, typedefs/macros/enums/functions, opaque pointers, exact-layout metadata and generated narrow/by-value adapters in `src/bindgen.rs`; checker-valid and real-library integration in `tests/bindgen.rs`. Unsupported unions, bitfields, variadics, callbacks, and aggregate returns are explicit diagnostics. |
+| 7 | `lu bindgen` foundation | Dependency-free C parser, typedefs/macros/enums/functions, opaque pointers, direct portable homogeneous records, exact-layout metadata and generated narrow/non-portable aggregate adapters in `src/bindgen.rs`; checker-valid and real-library integration in `tests/bindgen.rs`. Unsupported unions, bitfields, variadics, callbacks, and aggregate returns are explicit diagnostics. |
 | 8 | WASI and web targets | `lu build --target wasm32-wasi|wasm32-web`, web loader, executable parity and native-extern rejection in `tests/wasm.rs`. |
 | 9 | Git package foundation | `lu init/add/fetch`, immutable commit/tree lockfile, content-addressed cache, dependency graph composition and package-default commands in `src/package.rs`; moving-revision and whole-program verification in `tests/package.rs`. A registry is an explicit non-goal before a real package corpus exists. |
 | 10 | `luphysics` showcase | Value vectors/bodies, N-body gravity, integration, impulses, conservation laws, C SoA export, WASI and raylib adapter under `lib/luphysics`; all-tier, property, C, WASM and notebook checks in `tests/luphysics.rs`. |
@@ -47,6 +48,10 @@ ordinary lulang records across the boundary. The invariant is exercised by
   index and import the read-only view, export wrappers pass `(const T*, len)`
   without `lu_arr_new_raw`, C callers use generated const-pointer headers,
   and `pylulang` accepts read-only contiguous NumPy buffers.
+- Portable by-value `@c_layout` parameters are a shipped compatible extension:
+  homogeneous two-`f64` and two-`i64` records execute in all four tiers,
+  generated exports are called from C without adapters, bindgen removes the
+  safe record shim, and `pylulang` builds the matching ctypes structure.
 - `tests/selfhost_sync.rs` byte-compares the shared frontend region and the
   host/selfhost LLVM for an import and a scalar export.
 - `selfhost/build.sh --bootstrap` proves stage 1 = stage 2 and stage 2 =

@@ -77,9 +77,11 @@ records have C layout. Direct `f32` parameters and returns now work in all
 four tiers and bindgen emits C `float` directly. Borrowed
 `c_slice[i64|f64]` parameters are read-only `(const T*, length)` views in all
 four tiers; exported kernels and `pylulang` consume C-contiguous buffers
-without an array copy. Remaining follow-ups: by-value `@c_layout` calls
-without adapters, `str` returns, callbacks, and owning zero-copy array export
-handles.
+without an array copy. Portable by-value `@c_layout` parameters—flat, one or
+two homogeneous 64-bit fields—now work without adapters in every tier,
+generated C libraries, bindgen, and `pylulang`. Remaining follow-ups: broader
+aggregate classification, `str` returns, callbacks, and owning zero-copy array
+export handles.
 
 ### 3. `pylulang`
 
@@ -166,9 +168,10 @@ and checker-valid `extern` generation. The second adds boundary-only
 `c_ptr[T]`, opaque C structs, and end-to-end pointer calls in the interpreter,
 JIT, AOT, and self-hosted compiler. Unsupported pointees degrade to the
 explicit untyped handle `c_ptr[()]`; no C layout is inferred. Narrower
-integers, C `bool`, and by-value struct parameters use generated C adapter
-shims; C `float` maps directly to the stable `f32` boundary type. Public
-wrappers retain their logical types, while private
+integers, C `bool`, and non-portable by-value struct parameters use generated
+C adapter shims; C `float` maps directly to the stable `f32` boundary type.
+Portable one- or two-field homogeneous 64-bit structs import directly as
+`@c_layout` values. Public wrappers retain their logical types, while private
 externs use only the proven scalar boundary ABI. Exact records carry
 `@c_layout`; records containing narrow fields become logical adapter records,
 never false layout claims. The adapters run through all four tiers and avoid

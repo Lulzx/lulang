@@ -44,11 +44,10 @@ fn bindgen_generates_checker_valid_imports_and_reports_deferred_types() {
     assert!(source.contains("extern \"m\" fn clamp_index(value: i64, low: i64, high: i64): i64"));
     assert!(source.contains("extern \"m\" fn narrow_float(value: f32): f32"));
     assert!(source.contains("extern \"m\" fn allocate_bytes(size: i64): c_ptr[()]"));
-    assert!(!source.contains("extern \"m\" fn consume_vector"));
+    assert!(source.contains("extern \"m\" fn consume_vector(value: mini_vector): i64"));
 
     let diagnostics = String::from_utf8_lossy(&generated.stderr);
-    assert!(diagnostics.contains("@c_layout"));
-    assert!(diagnostics.contains("generated 4 C import(s)"));
+    assert!(diagnostics.contains("generated 5 C import(s)"));
 
     let checked = Command::new(lu())
         .args(["check"])
@@ -108,7 +107,7 @@ fn generated_imports_call_a_compiled_c_library() {
         String::from_utf8_lossy(&generated.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&generated.stderr).contains("built 4 C adapter shim(s)"),
+        String::from_utf8_lossy(&generated.stderr).contains("built 3 C adapter shim(s)"),
         "missing shim build report:\n{}",
         String::from_utf8_lossy(&generated.stderr)
     );
@@ -116,13 +115,14 @@ fn generated_imports_call_a_compiled_c_library() {
     assert!(generated_source.contains("fn bindgen_half(value: f32): f32"));
     assert!(generated_source.contains("fn bindgen_increment_i32(value: i64): i64"));
     assert!(generated_source.contains("fn bindgen_is_positive(value: i64): bool"));
+    assert!(generated_source.contains("extern"));
     assert!(generated_source.contains("fn bindgen_pair_sum(value: bindgen_pair): f64"));
     assert!(generated_source.contains("type bindgen_mixed"));
     assert!(generated_source.contains("count: i64"));
     assert!(generated_source.contains("scale: f32"));
     let shim_source = std::fs::read_to_string(bindings.with_extension("bindgen.c"))
         .expect("read generated C adapter");
-    assert!(shim_source.contains("(struct bindgen_pair){ .x = arg0_x, .y = arg0_y }"));
+    assert!(!shim_source.contains("struct bindgen_pair"));
     let mut bindings_file = OpenOptions::new()
         .append(true)
         .open(&bindings)
