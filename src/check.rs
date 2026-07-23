@@ -81,6 +81,41 @@ pub struct Checker<'a> {
 
 type Scope = HashMap<String, (Type, bool)>; // type, is-mutable
 
+fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "print"
+            | "puti"
+            | "putf"
+            | "putb"
+            | "puts"
+            | "putsp"
+            | "putnl"
+            | "nargs"
+            | "arg"
+            | "chr"
+            | "concat"
+            | "read_file"
+            | "write_file"
+            | "sqrt"
+            | "sin"
+            | "cos"
+            | "acos"
+            | "abs"
+            | "floor"
+            | "min"
+            | "max"
+            | "pow"
+            | "atan2"
+            | "float"
+            | "f32"
+            | "int"
+            | "len"
+            | "substr"
+            | "arr"
+    )
+}
+
 impl<'a> Checker<'a> {
     pub fn check_types(p: &'a Program) -> Result<Vec<Option<Type>>, String> {
         let mut type_ids = HashMap::new();
@@ -93,11 +128,49 @@ impl<'a> Checker<'a> {
             sigs: HashMap::new(),
             expr_types: RefCell::new(vec![None; p.exprs.len()]),
         };
+        for e in &p.externs {
+            if e.name.starts_with("lu_") {
+                return Err(format!("extern name `{}` uses reserved `lu_` prefix", e.name));
+            }
+            if is_builtin(&e.name) || p.fns.iter().any(|f| f.name == e.name) {
+                return Err(format!("extern name `{}` collides with an existing function", e.name));
+            }
+            if e.inouts.iter().any(|&inout| inout) {
+                return Err(format!("extern `{}` cannot have `inout` parameters", e.name));
+            }
+            let params = e
+                .params
+                .iter()
+                .map(|(_, t)| c.resolve(t))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ret = c.resolve(&e.ret)?;
+            c.validate_ffi_signature(&e.name, &params, &ret)?;
+            if c
+                .sigs
+                .insert(e.name.clone(), (params, e.inouts.clone(), ret))
+                .is_some()
+            {
+                return Err(format!("duplicate extern `{}`", e.name));
+            }
+        }
         for f in &p.fns {
             let params: Result<Vec<Type>, String> =
                 f.params.iter().map(|(_, t)| c.resolve(t)).collect();
-            c.sigs
-                .insert(f.name.clone(), (params?, f.inouts.clone(), c.resolve(&f.ret)?));
+            let params = params?;
+            let ret = c.resolve(&f.ret)?;
+            if f.exported {
+                if f.has_inout() {
+                    return Err(format!("export `{}` cannot have `inout` parameters", f.name));
+                }
+                c.validate_ffi_signature(&f.name, &params, &ret)?;
+            }
+            if c
+                .sigs
+                .insert(f.name.clone(), (params, f.inouts.clone(), ret))
+                .is_some()
+            {
+                return Err(format!("duplicate function `{}`", f.name));
+            }
         }
         for prop in &p.props {
             if prop.has_inout() {
@@ -141,6 +214,52 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
+
+    fn validate_ffi_signature(
+        &self,
+        name: &str,
+        params: &[Type],
+        ret: &Type,
+    ) -> Result<(), String> {
+        fn param_classes(ty: &Type) -> Result<(usize, usize), String> {
+            match ty {
+                Type::I64 | Type::Bool | Type::Enum(_) => Ok((1, 0)),
+                Type::F64 => Ok((0, 1)),
+                Type::Str => Ok((2, 0)),
+                Type::Arr(element)
+                    if matches!(element.as_ref(), Type::I64 | Type::F64) =>
+                {
+                    Ok((2, 0))
+                }
+                _ => Err("allowed boundary types are i64, f64, bool, enums, str, [i64], and [f64]".into()),
+            }
+        }
+        for param in params {
+            param_classes(param).map_err(|why| {
+                format!("FFI signature `{}` has unsupported parameter: {}", name, why)
+            })?;
+        }
+        if !matches!(
+            ret,
+            Type::Unit | Type::I64 | Type::F64 | Type::Bool | Type::Enum(_)
+        ) {
+            return Err(format!(
+                "FFI signature `{}` has unsupported return type; returns are limited to (), i64, f64, bool, and enums",
+                name
+            ));
+        }
+        let (ints, floats) = params.iter().try_fold((0usize, 0usize), |acc, ty| {
+            let classes = param_classes(ty)?;
+            Ok::<_, String>((acc.0 + classes.0, acc.1 + classes.1))
+        })?;
+        if ints > 6 || floats > 8 {
+            return Err(format!(
+                "FFI signature `{}` needs {} integer-class and {} float-class argument registers; maximum is 6 and 8",
+                name, ints, floats
+            ));
+        }
+        Ok(())
     }
 
     fn name(&self, t: &Type) -> String {
@@ -713,6 +832,9 @@ impl<'a> Checker<'a> {
                     _ => {
                         let (params, inouts, ret) =
                             self.sigs.get(name).ok_or(format!("unknown function `{}`", name))?;
+                        let extern_decl = self.p.externs.iter().find(|declaration| {
+                            declaration.name == *name
+                        });
                         if params.len() != ats.len() {
                             return Err(format!(
                                 "`{}` expects {} args, got {}",
@@ -763,6 +885,37 @@ impl<'a> Checker<'a> {
                                         return Err(format!(
                                             "inout arg {} of `{}` must be a variable",
                                             i + 1, name
+                                        ))
+                                    }
+                                }
+                            } else if extern_decl.is_some() && matches!(p, Type::Arr(_)) {
+                                match self.p.expr(args[i]) {
+                                    Expr::Ident(variable) => {
+                                        let (actual, mutable) = self
+                                            .lookup(scopes, variable)
+                                            .ok_or(format!("unknown variable `{}`", variable))?;
+                                        if !mutable {
+                                            return Err(format!(
+                                                "array arg {} of extern `{}` needs a `var` for copy-out",
+                                                i + 1,
+                                                name
+                                            ));
+                                        }
+                                        if actual != *p {
+                                            return Err(format!(
+                                                "array arg {} of extern `{}` must be exactly {}, got {}",
+                                                i + 1,
+                                                name,
+                                                self.name(p),
+                                                self.name(&actual)
+                                            ));
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(format!(
+                                            "array arg {} of extern `{}` must be a variable",
+                                            i + 1,
+                                            name
                                         ))
                                     }
                                 }

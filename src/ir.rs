@@ -6,6 +6,7 @@ pub type ValueId = u32;
 pub type LocalId = u32;
 pub type BlockId = u32;
 pub type FunctionId = u32;
+pub type ExternId = u32;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constant {
@@ -42,6 +43,7 @@ pub enum BinaryOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Callee {
     Function(FunctionId),
+    Extern(ExternId),
     Builtin(String),
 }
 
@@ -114,6 +116,7 @@ pub struct Local {
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
+    pub exported: bool,
     pub params: Vec<LocalId>,
     pub inouts: Vec<bool>,
     pub ret: Type,
@@ -121,6 +124,14 @@ pub struct Function {
     pub values: Vec<Type>,
     pub blocks: Vec<Block>,
     pub entry: BlockId,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExternDef {
+    pub name: String,
+    pub lib: Option<String>,
+    pub params: Vec<(String, Type)>,
+    pub ret: Type,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +160,7 @@ pub struct LoweredProgram {
     source: ast::Program,
     pub records: Vec<RecordDef>,
     pub enums: Vec<EnumDef>,
+    pub externs: Vec<ExternDef>,
     pub functions: Vec<Function>,
     pub properties: Vec<Property>,
     pub main: Option<Function>,
@@ -163,14 +175,44 @@ impl LoweredProgram {
             .enumerate()
             .map(|(i, f)| (f.name.clone(), i as FunctionId))
             .collect();
+        let extern_names: HashMap<_, _> = source
+            .externs
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.name.clone(), i as ExternId))
+            .collect();
+        let externs = source
+            .externs
+            .iter()
+            .map(|e| {
+                Ok(ExternDef {
+                    name: e.name.clone(),
+                    lib: e.lib.clone(),
+                    params: e
+                        .params
+                        .iter()
+                        .map(|(name, ty)| {
+                            Ok((name.clone(), crate::check::resolve_type(&source, ty)?))
+                        })
+                        .collect::<Result<_, String>>()?,
+                    ret: crate::check::resolve_type(&source, &e.ret)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let mut functions = Vec::with_capacity(source.fns.len() + source.props.len());
         for f in &source.fns {
-            functions.push(Builder::new(&source, &expr_types, &function_names, f)?.finish(&f.body)?);
+            functions.push(
+                Builder::new(&source, &expr_types, &function_names, &extern_names, f)?
+                    .finish(&f.body)?,
+            );
         }
         let mut properties = Vec::with_capacity(source.props.len());
         for f in &source.props {
             let id = functions.len() as FunctionId;
-            functions.push(Builder::new(&source, &expr_types, &function_names, f)?.finish(&f.body)?);
+            functions.push(
+                Builder::new(&source, &expr_types, &function_names, &extern_names, f)?
+                    .finish(&f.body)?,
+            );
             properties.push(Property {
                 function: id,
                 name: f.name.clone(),
@@ -184,15 +226,31 @@ impl LoweredProgram {
                 inouts: Vec::new(),
                 ret: "()".into(),
                 body: body.clone(),
+                exported: false,
             };
-            Builder::new(&source, &expr_types, &function_names, &decl)?.finish(body)
+            Builder::new(
+                &source,
+                &expr_types,
+                &function_names,
+                &extern_names,
+                &decl,
+            )?
+            .finish(body)
         }).transpose()?;
         let records = source.types.iter().map(|record| Ok(RecordDef {
             name: record.name.clone(),
             fields: record.fields.iter().map(|(name, ty)| Ok((name.clone(), crate::check::resolve_type(&source, ty)?))).collect::<Result<_, String>>()?,
         })).collect::<Result<_, String>>()?;
         let enums = source.enums.iter().map(|e| EnumDef { name: e.name.clone(), variants: e.variants.clone() }).collect();
-        let ir = Self { source, records, enums, functions, properties, main };
+        let ir = Self {
+            source,
+            records,
+            enums,
+            externs,
+            functions,
+            properties,
+            main,
+        };
         ir.validate()?;
         Ok(ir)
     }
@@ -250,6 +308,34 @@ impl LoweredProgram {
                                 let want = &callee.locals[callee.params[i] as usize].ty;
                                 if !compatible(want, &f.values[arg as usize]) { return Err(format!("IR `{}` call argument type mismatch", f.name)); }
                                 if target.is_some() != callee.inouts[i] { return Err(format!("IR `{}` call inout mismatch", f.name)); }
+                            }
+                        }
+                        InstKind::Call {
+                            callee: Callee::Extern(id),
+                            args,
+                            inout,
+                        } => {
+                            let callee = self.externs.get(*id as usize).ok_or_else(|| {
+                                format!("IR `{}` calls invalid extern", f.name)
+                            })?;
+                            if args.len() != callee.params.len() || inout.len() != args.len() {
+                                return Err(format!("IR `{}` extern call arity mismatch", f.name));
+                            }
+                            for ((arg, target), (_, want)) in
+                                args.iter().zip(inout).zip(&callee.params)
+                            {
+                                if !compatible(want, &f.values[*arg as usize]) {
+                                    return Err(format!(
+                                        "IR `{}` extern call argument type mismatch",
+                                        f.name
+                                    ));
+                                }
+                                if target.is_some() != matches!(want, Type::Arr(_)) {
+                                    return Err(format!(
+                                        "IR `{}` extern array copy-out mismatch",
+                                        f.name
+                                    ));
+                                }
                             }
                         }
                         _ => {}
@@ -344,7 +430,9 @@ struct Builder<'a> {
     p: &'a ast::Program,
     types: &'a [Option<Type>],
     functions: &'a HashMap<String, FunctionId>,
+    externs: &'a HashMap<String, ExternId>,
     name: String,
+    exported: bool,
     params: Vec<LocalId>,
     inouts: Vec<bool>,
     ret: Type,
@@ -356,9 +444,16 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(p: &'a ast::Program, types: &'a [Option<Type>], functions: &'a HashMap<String, FunctionId>, f: &FnDecl) -> Result<Self, String> {
+    fn new(
+        p: &'a ast::Program,
+        types: &'a [Option<Type>],
+        functions: &'a HashMap<String, FunctionId>,
+        externs: &'a HashMap<String, ExternId>,
+        f: &FnDecl,
+    ) -> Result<Self, String> {
         let mut b = Self {
-            p, types, functions, name: f.name.clone(), params: Vec::new(), inouts: f.inouts.clone(),
+            p, types, functions, externs, name: f.name.clone(), exported: f.exported,
+            params: Vec::new(), inouts: f.inouts.clone(),
             ret: crate::check::resolve_type(p, &f.ret)?, locals: Vec::new(), scopes: vec![HashMap::new()],
             values: Vec::new(), blocks: vec![Block { instructions: Vec::new(), terminator: Terminator::Unreachable }], current: 0,
         };
@@ -379,7 +474,7 @@ impl<'a> Builder<'a> {
             };
             self.terminate(Terminator::Return(value));
         }
-        Ok(Function { name: self.name, params: self.params, inouts: self.inouts, ret: self.ret, locals: self.locals, values: self.values, blocks: self.blocks, entry: 0 })
+        Ok(Function { name: self.name, exported: self.exported, params: self.params, inouts: self.inouts, ret: self.ret, locals: self.locals, values: self.values, blocks: self.blocks, entry: 0 })
     }
 
     fn add_local(&mut self, name: &str, ty: Type, mutable: bool) -> LocalId {
@@ -590,8 +685,31 @@ impl<'a> Builder<'a> {
             ast::Expr::Sum { var,lo,hi,body } => self.sum(var,*lo,*hi,*body,ty),
             ast::Expr::Call(name,args) => {
                 let mut values=Vec::with_capacity(args.len()); let mut inout=vec![None;args.len()];
-                for (i,e) in args.iter().enumerate(){ values.push(self.expr(*e)?); if let Some(fid)=self.functions.get(name) { if self.p.fns[*fid as usize].inouts.get(i)==Some(&true) { let ast::Expr::Ident(n)=self.p.expr(*e) else{return Err("lowering: inout argument is not a local".into())}; inout[i]=Some(self.lookup(n)?); } } }
-                let callee=self.functions.get(name).copied().map(Callee::Function).unwrap_or_else(||Callee::Builtin(name.clone()));
+                for (i,e) in args.iter().enumerate(){
+                    values.push(self.expr(*e)?);
+                    let copy_out = self
+                        .functions
+                        .get(name)
+                        .is_some_and(|fid| self.p.fns[*fid as usize].inouts.get(i) == Some(&true))
+                        || self.externs.get(name).is_some_and(|id| {
+                            self.p.externs[*id as usize]
+                                .params
+                                .get(i)
+                                .and_then(|(_, ty)| crate::check::resolve_type(self.p, ty).ok())
+                                .is_some_and(|ty| matches!(ty, Type::Arr(_)))
+                        });
+                    if copy_out {
+                        let ast::Expr::Ident(n)=self.p.expr(*e) else{return Err("lowering: copy-out argument is not a local".into())};
+                        inout[i]=Some(self.lookup(n)?);
+                    }
+                }
+                let callee = self
+                    .functions
+                    .get(name)
+                    .copied()
+                    .map(Callee::Function)
+                    .or_else(|| self.externs.get(name).copied().map(Callee::Extern))
+                    .unwrap_or_else(|| Callee::Builtin(name.clone()));
                 Ok(self.emit(InstKind::Call { callee,args:values,inout },ty))
             }
         }

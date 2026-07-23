@@ -85,6 +85,7 @@ pub struct Jit<'a> {
     do_licm: bool,
     inline_math: bool,
     fns: HashMap<String, FnInfo>,
+    externs: Vec<FnInfo>,
     imports: HashMap<&'static str, FuncId>,
     pure_imports: std::collections::HashSet<u32>,
     // String constants are addressed directly by generated code. Optimized
@@ -149,6 +150,10 @@ impl<'a> Jit<'a> {
         for (n, ptr) in syms {
             jb.symbol(*n, *ptr);
         }
+        for e in &p.externs {
+            let pointer = crate::ffi::resolve(e.lib.as_deref(), &e.name)?;
+            jb.symbol(&e.name, pointer as *const u8);
+        }
         let module = JITModule::new(jb);
         let soa = std::env::var("LU_LAYOUT")
             .map(|v| v != "aos")
@@ -171,11 +176,13 @@ impl<'a> Jit<'a> {
             do_licm,
             inline_math,
             fns: HashMap::new(),
+            externs: Vec::new(),
             imports: HashMap::new(),
             pure_imports: std::collections::HashSet::new(),
             strings: Vec::new(),
         };
         jit.declare_imports()?;
+        jit.declare_externs()?;
         jit.declare_fns()?;
         for (index, f) in p.fns.iter().enumerate() {
             let mut function = inline_calls(&ir.functions[index], &ir.functions, 3000);
@@ -305,6 +312,40 @@ impl<'a> Jit<'a> {
         Ok(())
     }
 
+    fn declare_externs(&mut self) -> Result<(), String> {
+        for e in &self.p.externs {
+            let params = e
+                .params
+                .iter()
+                .map(|(_, ty)| resolve_type(self.p, ty))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ret = resolve_type(self.p, &e.ret)?;
+            let mut sig = self.module.make_signature();
+            for ty in &params {
+                match ty {
+                    CType::Arr(_) => {
+                        sig.params.push(AbiParam::new(types::I64));
+                        sig.params.push(AbiParam::new(types::I64));
+                    }
+                    _ => {
+                        for component in comps(self.p, ty)? {
+                            sig.params.push(AbiParam::new(component));
+                        }
+                    }
+                }
+            }
+            for component in comps(self.p, &ret)? {
+                sig.returns.push(AbiParam::new(component));
+            }
+            let id = self
+                .module
+                .declare_function(&e.name, Linkage::Import, &sig)
+                .map_err(|error| error.to_string())?;
+            self.externs.push(FnInfo { id, params, ret });
+        }
+        Ok(())
+    }
+
     fn compile_ir_fn(&mut self, function: &ir::Function, decl: &FnDecl) -> Result<(), String> {
         let analysis = analyze_cfg(function);
         let info_id = self.fns[&decl.name].id;
@@ -340,6 +381,7 @@ impl<'a> Jit<'a> {
                 b,
                 module: &mut self.module,
                 fns: &self.fns,
+                externs: &self.externs,
                 imports: &self.imports,
                 env: vec![HashMap::new()],
                 refs: HashMap::new(),
@@ -406,6 +448,7 @@ impl<'a> Jit<'a> {
                 b,
                 module: &mut self.module,
                 fns: &self.fns,
+                externs: &self.externs,
                 imports: &self.imports,
                 env: vec![HashMap::new()],
                 refs: HashMap::new(),
@@ -445,6 +488,7 @@ struct Gen<'a, 'b> {
     b: FunctionBuilder<'b>,
     module: &'a mut JITModule,
     fns: &'a HashMap<String, FnInfo>,
+    externs: &'a [FnInfo],
     imports: &'a HashMap<&'static str, FuncId>,
     env: Vec<HashMap<String, (CType, Vec<Variable>)>>,
     refs: HashMap<String, cranelift_codegen::ir::FuncRef>,
@@ -1103,6 +1147,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                         self.gen_call(name, types, vals)?
                     }
                     Callee::Function(id) => self.gen_ir_user_call(*id, args, inout)?,
+                    Callee::Extern(id) => self.gen_ir_extern_call(*id, args)?,
                 })
             }
             InstKind::Field {
@@ -1526,6 +1571,41 @@ impl<'a, 'b> Gen<'a, 'b> {
             self.define_ir_local(target, &loaded)?;
         }
         Ok((ret, result))
+    }
+
+    fn gen_ir_extern_call(
+        &mut self,
+        id: ir::ExternId,
+        args: Vec<(CType, Vec<Value>)>,
+    ) -> Result<(CType, Vec<Value>), String> {
+        let info = &self.externs[id as usize];
+        let params = info.params.clone();
+        let ret = info.ret.clone();
+        let mut flat = Vec::new();
+        for ((got, values), want) in args.into_iter().zip(&params) {
+            let values = self.coerce(want, &got, values)?;
+            match want {
+                CType::Arr(element) => {
+                    let handle = values[0];
+                    let slots =
+                        self.b
+                            .ins()
+                            .load(types::I64, MemFlags::trusted(), handle, 0);
+                    let stride = comps(self.p, element)?.len() as i64;
+                    let length = if stride == 1 {
+                        slots
+                    } else {
+                        self.b.ins().sdiv_imm(slots, stride)
+                    };
+                    flat.push(self.b.ins().iadd_imm(handle, 8));
+                    flat.push(length);
+                }
+                _ => flat.extend(values),
+            }
+        }
+        let callee = self.module.declare_func_in_func(info.id, self.b.func);
+        let call = self.b.ins().call(callee, &flat);
+        Ok((ret, self.b.inst_results(call).to_vec()))
     }
 
     fn checked_int_div(&mut self, lhs: Value, rhs: Value, remainder: bool) -> Value {

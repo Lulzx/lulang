@@ -9,5 +9,7 @@ pub mod ir {
 
 #[path = "../../../src/runtime.rs"]
 pub mod runtime;
+#[path = "../../../src/ffi.rs"]
+pub mod ffi;
 #[path = "../../../src/interp.rs"]
 pub mod interp;

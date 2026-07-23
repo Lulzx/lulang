@@ -13,5 +13,7 @@ pub mod ir {
 pub mod backend;
 #[path = "../../../src/runtime.rs"]
 pub mod runtime;
+#[path = "../../../src/ffi.rs"]
+pub mod ffi;
 #[path = "../../../src/jit.rs"]
 pub mod jit;

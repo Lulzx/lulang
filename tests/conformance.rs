@@ -233,3 +233,70 @@ fn inlined_inout_record_mutation_preserves_array_snapshots() {
         b"7 0\n",
     );
 }
+
+#[test]
+fn scalar_ffi_imports_match_across_host_tiers() {
+    assert_host_success(
+        "scalar_ffi_imports",
+        "extern fn llabs(x: i64): i64\n\
+         extern \"m\" fn cbrt(x: f64): f64\n\
+         main { print(llabs(-42), cbrt(27.0)) }\n",
+        b"42 3\n",
+    );
+}
+
+#[test]
+fn ffi_array_copyout_matches_across_host_tiers() {
+    let dir = CaseDir::new("ffi_array_copyout", "");
+    let extension = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let library = dir.0.join(format!("libfixture.{}", extension));
+    let fixture = dir.0.join("fixture.c");
+    fs::write(
+        &fixture,
+        "#include <stdint.h>\n\
+         void bump(int64_t *data, int64_t n) {\n\
+           for (int64_t i = 0; i < n; ++i) data[i] += 10;\n\
+         }\n",
+    )
+    .expect("write FFI fixture");
+    let compiled = run(
+        Command::new("clang")
+            .args(["-shared", "-o"])
+            .arg(&library)
+            .arg(&fixture),
+    );
+    assert!(
+        compiled.status.success(),
+        "compile FFI fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::write(
+        dir.source(),
+        format!(
+            "extern \"{}\" fn bump(data: [i64])\n\
+             main {{\n\
+               var data = [1, 2, 3]\n\
+               bump(data)\n\
+               print(data[0], data[2])\n\
+             }}\n",
+            library.display()
+        ),
+    )
+    .expect("write FFI case");
+    for (backend, output) in [
+        ("interpreter", host("interp", &dir.source())),
+        ("JIT", host("run", &dir.source())),
+        ("AOT", aot(&dir)),
+    ] {
+        assert!(
+            output.status.success(),
+            "FFI array case failed in {backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"11 13\n", "FFI array mismatch in {backend}");
+    }
+}

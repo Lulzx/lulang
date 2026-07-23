@@ -104,3 +104,44 @@ fn property_run_count_is_configurable() {
     assert!(output.status.success());
     assert_eq!(output.stdout, b"property reflexive ... ok (7 runs)\n");
 }
+
+#[test]
+fn ffi_declarations_parse_and_exports_remain_callable_in_host_tiers() {
+    assert_modes(
+        "extern \"m\" fn cbrt(x: f64): f64\n\
+         export fn twice(x: i64): i64 { x * 2 }\n\
+         main { print(twice(21)) }\n",
+        b"42\n",
+    );
+}
+
+#[test]
+fn ffi_boundary_subset_and_register_caps_are_checked() {
+    let cases = [
+        (
+            "extern fn bad(x: f32): f32\nmain {}\n",
+            "unsupported parameter",
+        ),
+        (
+            "extern fn bad(inout x: i64)\nmain {}\n",
+            "cannot have `inout`",
+        ),
+        (
+            "extern fn bad(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64)\nmain {}\n",
+            "maximum is 6 and 8",
+        ),
+        (
+            "type P { x: i64 }\nexport fn bad(p: P): i64 { p.x }\nmain {}\n",
+            "unsupported parameter",
+        ),
+    ];
+    for (source, message) in cases {
+        let output = run("interp", source);
+        assert!(!output.status.success(), "accepted invalid FFI signature");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "unexpected error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

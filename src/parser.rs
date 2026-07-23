@@ -102,14 +102,23 @@ impl Parser {
             match self.peek().clone() {
                 Tok::Eof => return Ok(()),
                 Tok::Ident(k) if k == "fn" => {
-                    let f = self.parse_fn(true)?;
+                    let f = self.parse_fn(true, false)?;
                     self.prog.fns.push(f);
                 }
+                Tok::Ident(k) if k == "export" => {
+                    self.eat_kw("export")?;
+                    if !matches!(self.peek(), Tok::Ident(k) if k == "fn") {
+                        return Err("`export` must be followed by `fn`".into());
+                    }
+                    let f = self.parse_fn(true, true)?;
+                    self.prog.fns.push(f);
+                }
+                Tok::Ident(k) if k == "extern" => self.parse_extern()?,
                 Tok::Ident(k) if k == "type" => self.parse_type()?,
                 Tok::Ident(k) if k == "enum" => self.parse_enum()?,
                 Tok::Ident(k) if k == "operator" => self.parse_operator()?,
                 Tok::Ident(k) if k == "property" => {
-                    let f = self.parse_fn(false)?;
+                    let f = self.parse_fn(false, false)?;
                     self.prog.props.push(f);
                 }
                 Tok::Ident(k) if k == "main" => {
@@ -207,7 +216,7 @@ impl Parser {
         Ok((ps, inouts))
     }
 
-    fn parse_fn(&mut self, has_kw_fn: bool) -> Result<FnDecl, String> {
+    fn parse_fn(&mut self, has_kw_fn: bool, exported: bool) -> Result<FnDecl, String> {
         self.eat_kw(if has_kw_fn { "fn" } else { "property" })?;
         let name = self.ident()?;
         let (params, inouts) = self.parse_params()?;
@@ -220,7 +229,42 @@ impl Parser {
             "bool".into() // property bodies are predicates
         };
         let body = self.parse_block()?;
-        Ok(FnDecl { name, params, inouts, ret, body })
+        Ok(FnDecl {
+            name,
+            params,
+            inouts,
+            ret,
+            body,
+            exported,
+        })
+    }
+
+    fn parse_extern(&mut self) -> Result<(), String> {
+        self.eat_kw("extern")?;
+        let lib = match self.peek().clone() {
+            Tok::Str(lib) => {
+                self.next();
+                Some(lib)
+            }
+            _ => None,
+        };
+        self.eat_kw("fn")?;
+        let name = self.ident()?;
+        let (params, inouts) = self.parse_params()?;
+        let ret = if self.is_sym(":") {
+            self.next();
+            self.parse_type_str()?
+        } else {
+            "()".into()
+        };
+        self.prog.externs.push(ExternDecl {
+            name,
+            lib,
+            params,
+            inouts,
+            ret,
+        });
+        Ok(())
     }
 
     fn parse_operator(&mut self) -> Result<(), String> {
@@ -260,6 +304,7 @@ impl Parser {
                 inouts: vec![false, false],
                 ret,
                 body,
+                exported: false,
             });
             Ok(())
         } else {
@@ -282,6 +327,7 @@ impl Parser {
                 inouts: vec![false],
                 ret,
                 body,
+                exported: false,
             });
             Ok(())
         }

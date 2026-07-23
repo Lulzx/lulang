@@ -293,6 +293,16 @@ impl<'a> Interp<'a> {
                                 }
                                 result
                             }
+                            Callee::Extern(id) => {
+                                let (result, copyouts) =
+                                    self.call_extern(*id, call_args)?;
+                                for (target, copyout) in inout.iter().zip(copyouts) {
+                                    if let (Some(target), Some(copyout)) = (target, copyout) {
+                                        locals[*target as usize] = copyout;
+                                    }
+                                }
+                                result
+                            }
                             Callee::Builtin(name) => self.call(name, call_args)?,
                         };
                         Some(result)
@@ -541,5 +551,112 @@ impl<'a> Interp<'a> {
                 format!("{}.{}", decl.name, decl.variants[*tag as usize])
             }
         }
+    }
+
+    fn call_extern(
+        &self,
+        id: ir::ExternId,
+        args: Vec<Value>,
+    ) -> Result<(Value, Vec<Option<Value>>), String> {
+        use crate::check::Type;
+        enum NativeArray {
+            I64(Vec<i64>),
+            F64(Vec<f64>),
+        }
+        let declaration = &self.ir.externs[id as usize];
+        let pointer = crate::ffi::resolve(declaration.lib.as_deref(), &declaration.name)?;
+        let mut ints = [0i64; 6];
+        let mut floats = [0f64; 8];
+        let mut int_index = 0;
+        let mut float_index = 0;
+        let mut arrays = Vec::new();
+        for (argument_index, (argument, (_, ty))) in
+            args.iter().zip(&declaration.params).enumerate()
+        {
+            match (ty, argument) {
+                (Type::I64, Value::Int(value)) => {
+                    ints[int_index] = *value;
+                    int_index += 1;
+                }
+                (Type::Bool, Value::Bool(value)) => {
+                    ints[int_index] = i64::from(*value);
+                    int_index += 1;
+                }
+                (Type::Enum(expected), Value::Enum(actual, tag)) if expected == actual => {
+                    ints[int_index] = *tag;
+                    int_index += 1;
+                }
+                (Type::F64, value) => {
+                    floats[float_index] = as_f64(value)?;
+                    float_index += 1;
+                }
+                (Type::Str, Value::Str(bytes)) => {
+                    ints[int_index] = bytes.as_ptr() as i64;
+                    ints[int_index + 1] = bytes.len() as i64;
+                    int_index += 2;
+                }
+                (Type::Arr(element), Value::Arr(cells)) => {
+                    let native = match element.as_ref() {
+                        Type::I64 => NativeArray::I64(
+                            cells
+                                .iter()
+                                .map(as_i64)
+                                .collect::<Result<Vec<_>, _>>()?,
+                        ),
+                        Type::F64 => NativeArray::F64(
+                            cells
+                                .iter()
+                                .map(as_f64)
+                                .collect::<Result<Vec<_>, _>>()?,
+                        ),
+                        _ => return Err("unsupported FFI array element type".into()),
+                    };
+                    arrays.push((argument_index, native));
+                    let array = &arrays.last().unwrap().1;
+                    match array {
+                        NativeArray::I64(values) => {
+                            ints[int_index] = values.as_ptr() as i64;
+                            ints[int_index + 1] = values.len() as i64;
+                        }
+                        NativeArray::F64(values) => {
+                            ints[int_index] = values.as_ptr() as i64;
+                            ints[int_index + 1] = values.len() as i64;
+                        }
+                    }
+                    int_index += 2;
+                }
+                _ => {
+                    return Err(format!(
+                        "cannot marshal {:?} as FFI type {:?}",
+                        argument, ty
+                    ))
+                }
+            }
+        }
+        let result = unsafe {
+            match &declaration.ret {
+                Type::F64 => Value::Float(crate::ffi::call_f64(pointer, ints, floats)),
+                Type::Unit => {
+                    crate::ffi::call_i64(pointer, ints, floats);
+                    Value::Unit
+                }
+                Type::I64 => Value::Int(crate::ffi::call_i64(pointer, ints, floats)),
+                Type::Bool => Value::Bool(crate::ffi::call_i64(pointer, ints, floats) != 0),
+                Type::Enum(enumeration) => Value::Enum(
+                    *enumeration,
+                    crate::ffi::call_i64(pointer, ints, floats),
+                ),
+                ty => return Err(format!("cannot return FFI type {:?}", ty)),
+            }
+        };
+        let mut copyouts = vec![None; args.len()];
+        for (index, array) in arrays {
+            let cells = match array {
+                NativeArray::I64(values) => values.into_iter().map(Value::Int).collect(),
+                NativeArray::F64(values) => values.into_iter().map(Value::Float).collect(),
+            };
+            copyouts[index] = Some(Value::Arr(Rc::new(cells)));
+        }
+        Ok((result, copyouts))
     }
 }
