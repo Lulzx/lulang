@@ -22,7 +22,9 @@ evidence.*
 
 ## 2. Files & entry
 
-- Extension: `.lu`. One file = one module. `use math` imports (stdlib only in v0.1).
+- Extension: `.lu`. A standalone file is one compilation unit. In a
+  `lu.toml` package, `use name` names a declared Git dependency whose
+  `src/lib.lu` is composed into the same whole-program compilation.
 - Entry point: a bare `main { … }` block.
 
 ## 3. Types
@@ -164,7 +166,7 @@ single arena per module, spans everywhere, target <10ms frontend for 1k-line fil
 ## 10. Explicitly deferred (v0.2+)
 
 Strings beyond literals in `print`, enums/matching, generics beyond array sizes,
-modules beyond stdlib, closures, heap collections (growable arrays), FFI, `exact`
+namespaced/separately compiled modules, closures, heap collections (growable arrays), FFI, `exact`
 FP mode, property-driven optimizer assumptions, AI/LLM-call runtime, self-hosting.
 
 **Committed for v0.2** (per DESIGN.md Revision 3): `inout` parameters (mutable value

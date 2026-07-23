@@ -35,7 +35,7 @@ than exposing internals.
 | 6 | Web playground (interpreter → wasm32) — **v0.1 shipped** | High | Medium |
 | 7 | `lu bindgen` C-header importer — **foundation shipped** | Very high | Medium–high |
 | 8 | `wasm32-wasi` / `wasm32-web` target — **shipped** | High | Medium |
-| 9 | Git-based package manager (`lu.toml`) | High once libraries exist | Medium |
+| 9 | Git-based package manager (`lu.toml`) — **foundation shipped** | High once libraries exist | Medium |
 | 10 | Flagship demo (`luphysics`) | High visibility | Medium |
 | 11 | `lu doc` + benchmark observatory | High credibility | Medium |
 | 12 | Autodiff (`ludiff`, forward-mode duals first) | High technical value | High |
@@ -179,10 +179,15 @@ version = "0.1.0"
 numerics = { git = "https://github.com/lulang/lu-numerics", rev = "..." }
 ```
 
-Commands: `lu init | add | build | test | bench | doc`. Content-addressed
-lockfiles, immutable commit pins, reproducible builds, whole-program
-compilation after resolution. (Prerequisite: a module/import story beyond the
-stdlib — currently deferred in SPEC §deferred.)
+The foundation now provides `lu init`, `lu add --git --rev`, `lu fetch`, and
+package-default `run`, `check`, `build`, and `test`. `lu.lock` records the
+resolved commit and Git tree; checkouts are content-addressed by commit, and a
+moving branch does not change a locked build. Dependency `src/lib.lu` files
+are composed in graph order before the root and enter one whole-program
+frontend/optimizer. `use name` is checked against declared dependencies.
+
+`bench` and `doc` become package-aware with the observatory item below. There
+is intentionally no registry until roughly 20–30 meaningful packages exist.
 
 ### 10. Flagship showcase: `luphysics`
 

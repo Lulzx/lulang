@@ -138,6 +138,27 @@ Both targets consume the same validated CFG and runtime as native AOT.
 Native dynamic `extern` declarations are rejected for wasm builds rather than
 becoming unresolved imports.
 
+### Git packages
+
+Packages are deliberately registry-free and source-based:
+
+```bash
+mkdir orbit && cd orbit
+lu init orbit
+lu add numerics --git https://github.com/example/lu-numerics --rev v0.1.0
+lu run
+lu test --runs 1000
+lu build
+```
+
+`lu add` resolves the requested Git revision to an immutable commit and tree,
+writes `lu.lock`, and stores the checkout by commit ID in the content-addressed
+cache. Later builds use the lock even if a branch or tag moves. Dependencies
+provide `src/lib.lu`; the root provides `src/main.lu`, and `use name` must
+refer to a declared dependency. Resolution composes the dependency graph
+before one whole-program typecheck and optimization pipeline. Set
+`LULANG_CACHE` to override the cache location.
+
 ## Architecture
 
 One front end, four back ends, packaged as the `lu_syntax`, `lu_check`, `lu_ir`,

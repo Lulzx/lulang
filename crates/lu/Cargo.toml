@@ -43,6 +43,10 @@ path = "../../tests/bindgen.rs"
 name = "wasm"
 path = "../../tests/wasm.rs"
 
+[[test]]
+name = "package"
+path = "../../tests/package.rs"
+
 [dependencies]
 lu_syntax.workspace = true
 lu_ir.workspace = true

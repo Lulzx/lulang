@@ -5,12 +5,16 @@ use lu_syntax::{fmt, lexer, parser};
 use lu_test::{interp, runtime as test_runtime};
 
 mod bindgen;
+mod package;
 
 use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
         "usage: lu <run|build|check|interp> <file.lu> [program args...]\n\
+         \x20      lu init [package-name]\n\
+         \x20      lu add <name> --git <url> --rev <revision>\n\
+         \x20      lu fetch\n\
          \x20      lu build --lib [--shared] [-o name] <file.lu>\n\
          \x20      lu build --target <wasm32-wasi|wasm32-web> [-o file.wasm] <file.lu>\n\
          \x20      lu bindgen [--lib name] [--no-shims] [-o file.lu] <header.h>\n\
@@ -22,11 +26,38 @@ fn usage() -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    let explicit_mode = args.get(1).is_some_and(|argument| {
+        matches!(
+            argument.as_str(),
+            "run"
+                | "build"
+                | "check"
+                | "interp"
+                | "test"
+                | "fmt"
+                | "bindgen"
+                | "init"
+                | "add"
+                | "fetch"
+        )
+    });
     let mode = match args.get(1) {
         None => return usage(),
-        Some(arg) if args.len() == 2 => "run",
+        Some(_) if !explicit_mode => "run",
         Some(arg) => arg.as_str(),
     };
+    if mode == "init" {
+        return package_result(package::init(&args[2..]));
+    }
+    if mode == "add" {
+        return package_result(package::add(&args[2..]));
+    }
+    if mode == "fetch" {
+        if args.len() != 2 {
+            return usage();
+        }
+        return package_result(package::fetch());
+    }
     let mut runs = 100u32;
     let mut check_format = false;
     let mut build_library = false;
@@ -36,7 +67,7 @@ fn main() -> ExitCode {
     let mut bindgen_library = None;
     let mut bindgen_shims = true;
     let mut positionals = Vec::new();
-    let mut i = if args.len() == 2 { 1 } else { 2 };
+    let mut i = if explicit_mode { 2 } else { 1 };
     while i < args.len() {
         match args[i].as_str() {
             "--runs" if mode == "test" => {
@@ -102,10 +133,10 @@ fn main() -> ExitCode {
             }
         }
     }
-    let Some(path) = positionals.first() else {
-        return usage();
-    };
     if mode == "bindgen" {
+        let Some(path) = positionals.first() else {
+            return usage();
+        };
         if positionals.len() != 1 {
             return usage();
         }
@@ -116,17 +147,41 @@ fn main() -> ExitCode {
             bindgen_shims,
         );
     }
-    if !matches!(mode, "test" | "fmt") && positionals.len() > 1 {
+    let package_input = if positionals.is_empty()
+        && matches!(mode, "run" | "build" | "check" | "interp" | "test")
+    {
+        match package::load_workspace(mode) {
+            Ok(program) => Some(program),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let path_owned = package_input
+        .as_ref()
+        .map(|program| program.label.clone())
+        .or_else(|| positionals.first().cloned());
+    let Some(path_owned) = path_owned else {
+        return usage();
+    };
+    let path = path_owned.as_str();
+    if package_input.is_none() && !matches!(mode, "test" | "fmt") && positionals.len() > 1 {
         let program_args = positionals[1..].to_vec();
         jit_runtime::set_args(program_args.clone());
         test_runtime::set_args(program_args);
     }
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read {}: {}", path, e);
-            return ExitCode::FAILURE;
-        }
+    let src = match package_input {
+        Some(program) => program.source,
+        None => match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read {}: {}", path, e);
+                return ExitCode::FAILURE;
+            }
+        },
     };
     if mode == "fmt" {
         let formatted = fmt::format_source(&src);
@@ -186,6 +241,19 @@ fn main() -> ExitCode {
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("error: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn package_result(result: Result<String, String>) -> ExitCode {
+    match result {
+        Ok(message) => {
+            eprintln!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
             ExitCode::FAILURE
         }
     }
