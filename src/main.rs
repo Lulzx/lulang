@@ -59,7 +59,7 @@ fn run_pipeline(mode: &str, path: &str, src: &str) -> Result<bool, String> {
         let toks = lexer::lex(&src)?;
         let mut p = parser::Parser::new(toks);
         p.parse()?;
-        let ir = ir::TypedProgram::lower(p.prog)?;
+        let ir = ir::LoweredProgram::lower(p.prog)?;
         match mode {
             "run" => {
                 jit::Jit::run(&ir)?;

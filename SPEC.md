@@ -136,6 +136,16 @@ Performance gate (from experiments/RESULTS.md): on the alcubierre-style corpus,
 
 ## 9. Implementation layout (Rust workspace)
 
+The checked middle end lowers source into a control-flow graph before any
+execution tier runs. Each function owns numeric local and value tables plus
+basic blocks of typed instructions. Calls contain resolved function IDs,
+record/enum operations contain declaration and field/tag IDs, and every block
+ends in `jump`, `branch`, `return`, or `unreachable`. Short-circuit operators,
+`for`, `while`, and `sum` are therefore control flow rather than backend
+special cases. Mutable bindings are explicit slots; expression evaluation is
+the instruction order within a block. The IR validator checks references,
+types, call signatures, inout destinations, branch targets, and returns.
+
 ```
 crates/
   lu_syntax   lexer + Pratt parser w/ extensible operator table → flat arena AST

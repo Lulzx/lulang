@@ -8,7 +8,7 @@ use crate::ast::*;
 use crate::backend::layout::{components as layout_components, field_offset, Component};
 use crate::backend::optimization::{licm, scan_trusted, scan_trusted_expr};
 use crate::check::{resolve_type, Type as CType};
-use crate::ir::TypedProgram;
+use crate::ir::LoweredProgram;
 use crate::runtime;
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Value};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -52,8 +52,8 @@ pub struct Jit<'a> {
 }
 
 impl<'a> Jit<'a> {
-    pub fn run(ir: &'a TypedProgram) -> Result<(), String> {
-        let p = ir.program();
+    pub fn run(ir: &'a LoweredProgram) -> Result<(), String> {
+        let p = ir.source();
         use cranelift_codegen::settings::Configurable as _;
         // The module ISA stays at opt_level=none: we run the egraph optimizer
         // manually per-function and then our own LICM pass on its output —

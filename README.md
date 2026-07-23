@@ -64,7 +64,8 @@ flat arena AST, then dispatches:
               │  lexer.rs  → tokens        │
               │  parser.rs → flat AST      │   (arena tables, ExprId indices;
               │  check.rs  → validation    │    match desugared at parse)
-              │  ir.rs     → typed program │   (type for every reachable expr)
+              │  ir.rs     → lowered CFG   │   (typed values/locals, resolved
+              │                           │    calls/fields, explicit branches)
               └─────────────┬──────────────┘
                             │
       ┌──────────────┬──────┴───────┬──────────────┐
@@ -72,8 +73,8 @@ flat arena AST, then dispatches:
  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌──────────┐
  │lu interp │  │  lu run   │  │ lu build  │  │ lu test  │
  │          │  │           │  │           │  │          │
- │ tree-    │  │ Cranelift │  │ textual   │  │ property │
- │ walking  │  │ JIT       │  │ LLVM IR   │  │ engine + │
+ │ CFG      │  │ Cranelift │  │ textual   │  │ property │
+ │ executor │  │ JIT       │  │ LLVM IR   │  │ engine + │
  │ eval     │  │           │  │   │       │  │ shrinker │
  │          │  │ inlining  │  │   ▼       │  └──────────┘
  │reference │  │ SIMD sum  │  │ clang -O3 │
@@ -84,8 +85,12 @@ flat arena AST, then dispatches:
                └───────────┘  └───────────┘
 ```
 
-Execution APIs accept only `TypedProgram`; unchecked parser output cannot reach
-an interpreter or code generator. Lowering/validation lives in `ir.rs`; shared
+Execution APIs accept only `LoweredProgram`; unchecked parser output cannot
+reach an interpreter or code generator. The reference interpreter and property
+engine execute its CFG directly. Cranelift and LLVM currently retain a
+source-pattern view for their specialized loop optimizations while their
+emitters are migrated instruction-by-instruction. Lowering/validation lives in
+`ir.rs`; shared
 component layout, flattened ABI, and optimization analysis live under
 `src/backend/`, separate from the Cranelift and LLVM emission modules.
 `tests/conformance.rs` generates small programs and diffs reference

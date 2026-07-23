@@ -12,7 +12,7 @@ use crate::backend::abi::return_components;
 use crate::backend::layout::{components as layout_components, field_offset, Component};
 use crate::backend::optimization::{scan_trusted, scan_trusted_expr};
 use crate::check::{resolve_type, Type as CType};
-use crate::ir::TypedProgram;
+use crate::ir::LoweredProgram;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -72,8 +72,8 @@ struct Emit<'a> {
     in_main: bool,
 }
 
-pub fn build(ir: &TypedProgram, src_path: &str, out_path: Option<&str>) -> Result<String, String> {
-    let p = ir.program();
+pub fn build(ir: &LoweredProgram, src_path: &str, out_path: Option<&str>) -> Result<String, String> {
+    let p = ir.source();
     let mut e = Emit {
         p,
         expr_types: ir.expression_types(),
