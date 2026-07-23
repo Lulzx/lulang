@@ -258,8 +258,13 @@ lu build
 writes `lu.lock`, and stores the checkout by commit ID in the content-addressed
 cache. Later builds use the lock even if a branch or tag moves. Dependencies
 provide `src/lib.lu`; the root provides `src/main.lu`, and `use name` must
-refer to a declared dependency. Resolution composes the dependency graph
-before one whole-program typecheck and optimization pipeline. Set
+refer to a declared dependency. Each source file is parsed once into an
+independent module arena. Imported functions, records, and enums can be
+qualified (`numerics.dot`, `geometry.Vec3`); qualification prevents dependency
+names from colliding with root declarations. Imports may be locally renamed
+with `use numerics as numbers`. The module linker remaps arena and symbol IDs
+and uses collision-proof internal names before one whole-program typecheck and
+optimization pipeline. Set
 `LULANG_CACHE` to override the cache location.
 
 ### Flagship: luphysics
@@ -357,8 +362,8 @@ runs lex → parse → typecheck over a flat arena AST, then dispatches:
  │ executor │  │ JIT       │  │ LLVM IR   │  │ engine + │
  │ eval     │  │           │  │   │       │  │ shrinker │
  │          │  │ inlining  │  │   ▼       │  └──────────┘
- │reference │  │ SIMD sum  │  │ clang -O3 │
- │semantics │  │ LICM      │  │   │       │
+ │reference │  │ shared    │  │ explicit  │
+ │semantics │  │ SIMD plan │  │ SIMD IR   │
  └──────────┘  │ if-conv   │  │   ▼       │
                │ SoA arrays│  │ native +  │
                │ math krnls│  │lu_runtime.c
@@ -460,17 +465,22 @@ oracle that catches a bug codegen.lu would faithfully preserve in itself):
 | M6 — self-hosting: full v0.1+v0.2 surface + lulang lexer, parser, typechecker, and interpreter in lulang, able to run **its own source** | **done — [selfhost/interp.lu](selfhost/interp.lu) handles records, enums, `match`, `sum`, user `operator`/`property` declarations, Unicode glyphs, string escapes, and file input; interpreter towers reach depth 3 (`--heap` scaling, 2.9 s AOT); the whole ladder *and* the slerp teaser corpus run on it byte-identically (`lu run selfhost/interp.lu corpus/slerp.lu`). All tiers print floats identically (shortest round-trip, plain notation)** |
 | M7 — bootstrapping compiler: LLVM AOT backend in lulang ([selfhost/codegen.lu](selfhost/codegen.lu)) | **done — the front end shared with interp.lu plus an IR emitter mirroring `src/llvm.rs` (flattened multi-component values, fast-flagged FP, SoA record arrays, hoisted bounds checks, same C runtime ABI). Compiles the whole ladder and the teaser corpus byte-identically to `lu build`, compiles interp.lu into a native interpreter that reruns the ladder, and **compiles itself to a fixpoint**: stage-1 (interpreted), stage-2, and stage-3 binaries emit byte-identical IR (`selfhost/build.sh --bootstrap`; self-compilation drops from 6.5 s interpreted to 60 ms compiled)** |
 
-The M5 middle-end lives in the JIT tier (the AOT tier gets the equivalent from
-LLVM, plus the same SoA layout): branch-free inline sin/cos/acos kernels (musl
-polynomials as pure Cranelift IR), if-conversion of speculation-safe `if`s into
-selects, a CLIF-level LICM pass, f64x2 vectorization of `sum`, and SoA field
-planes for record arrays. Each is ablatable (`LU_MATH=call`, `LU_IFCONV=off`,
-`LU_LICM=off`, `LU_SIMD=off`, `LU_LAYOUT=aos`) — measurements in
+The M5 middle-end supplies a target-independent legality proof and expression
+plan for order-free f64 `sum` reductions. Cranelift JIT and LLVM AOT consume
+that plan as explicit f64x2 vector loops with four accumulators and a scalar
+tail; the self-host mirrors the same expression subset, and wasm builds enable
+SIMD128. It also provides branch-free inline sin/cos/acos kernels (musl
+polynomials as pure Cranelift IR), if-conversion of speculation-safe `if`s,
+LICM, and SoA field planes for record arrays. Each is ablatable
+(`LU_MATH=call`, `LU_IFCONV=off`, `LU_LICM=off`, `LU_SIMD=off`,
+`LU_LAYOUT=aos`) — measurements in
 [experiments/RESULTS.md](experiments/RESULTS.md).
 
 The v0.1 surface is fully represented in the checked CFG. Arrays use value
-semantics in every host tier (copy-on-write in the reference interpreter and
-explicit compiler-owned copies in compiled tiers), including arrays nested in
+semantics in every tier: persistent stores retain independent values, while
+immutable parameters borrow and `inout` parameters have exclusive access.
+The runtime uses copy-on-write where applicable and compiled tiers clone
+owning components at persistent value boundaries, including arrays nested in
 records. Functions may return the final expression of their body. `f32` is a
 distinct IEEE-754 binary32 type throughout the host interpreter, JIT, and AOT
 pipelines.

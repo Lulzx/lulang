@@ -8,6 +8,7 @@ mod abi;
 mod benchmark;
 mod bindgen;
 mod docgen;
+mod module_system;
 mod package;
 mod sdk;
 
@@ -232,10 +233,26 @@ fn main() -> ExitCode {
         jit_runtime::set_args(program_args.clone());
         test_runtime::set_args(program_args);
     }
-    let src = match package_input {
-        Some(program) => program.source,
+    let (src, sources) = match package_input {
+        Some(program) => {
+            let source = program
+                .sources
+                .iter()
+                .map(|file| file.source.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (source, program.sources)
+        }
         None => match std::fs::read_to_string(path) {
-            Ok(s) => s,
+            Ok(s) => {
+                let source_file = module_system::SourceFile {
+                    module: "main".into(),
+                    path: path.to_string(),
+                    source: s.clone(),
+                    root: true,
+                };
+                (s, vec![source_file])
+            }
             Err(e) => {
                 eprintln!("error: cannot read {}: {}", path, e);
                 return ExitCode::FAILURE;
@@ -274,6 +291,7 @@ fn main() -> ExitCode {
     // deep recursion (e.g. self-hosted interpreter towers) needs more than the
     // default 8 MiB main-thread stack; run the pipeline on a 512 MiB thread
     let src_owned = src.clone();
+    let sources_owned = sources;
     let mode_owned = mode.to_string();
     let path_owned = path.to_string();
     let output_name_owned = output_name.clone();
@@ -286,6 +304,7 @@ fn main() -> ExitCode {
                 &mode_owned,
                 &path_owned,
                 &src_owned,
+                &sources_owned,
                 runs,
                 build_library,
                 build_shared,
@@ -496,6 +515,7 @@ fn run_pipeline(
     mode: &str,
     path: &str,
     src: &str,
+    sources: &[module_system::SourceFile],
     property_runs: u32,
     build_library: bool,
     build_shared: bool,
@@ -505,10 +525,8 @@ fn run_pipeline(
     property_name: Option<&str>,
 ) -> Result<bool, String> {
     (|| -> Result<bool, String> {
-        let toks = lexer::lex(src)?;
-        let mut p = parser::Parser::new(toks);
-        p.parse()?;
-        let ir = ir::LoweredProgram::lower(p.prog)?;
+        let program = module_system::parse_and_link(sources)?;
+        let ir = ir::LoweredProgram::lower(program)?;
         match mode {
             "run" => {
                 jit::Jit::run(&ir)?;

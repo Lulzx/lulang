@@ -20,7 +20,59 @@ pub struct Parser {
     type_names: HashSet<String>,
     enum_names: HashSet<String>,
     circum_close: HashSet<String>,
+    available_circum: HashMap<String, (String, String)>,
+    namespaces: HashSet<String>,
     match_ct: u32,
+}
+
+/// Reads top-level imports without parsing declaration bodies. The module
+/// loader uses this pre-pass to seed qualified type/operator syntax before the
+/// file's independent arena is parsed.
+pub fn scan_imports(toks: &[Tok]) -> Result<Vec<UseDecl>, String> {
+    let mut imports = Vec::new();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < toks.len() {
+        match &toks[index] {
+            Tok::Sym(symbol) if symbol == "{" => depth += 1,
+            Tok::Sym(symbol) if symbol == "}" => depth = depth.saturating_sub(1),
+            Tok::Ident(keyword) if keyword == "use" && depth == 0 => {
+                let module = match toks.get(index + 1) {
+                    Some(Tok::Ident(module)) => module.clone(),
+                    token => {
+                        return Err(format!("expected module name after `use`, found {token:?}"))
+                    }
+                };
+                index += 2;
+                let alias = if matches!(toks.get(index), Some(Tok::Ident(word)) if word == "as") {
+                    match toks.get(index + 1) {
+                        Some(Tok::Ident(alias)) => {
+                            index += 2;
+                            alias.clone()
+                        }
+                        token => {
+                            return Err(format!(
+                                "expected namespace alias after `as`, found {token:?}"
+                            ))
+                        }
+                    }
+                } else {
+                    module.clone()
+                };
+                if !matches!(toks.get(index), Some(Tok::Newline | Tok::Eof)) {
+                    return Err(format!(
+                        "unexpected token after import alias: {:?}",
+                        toks.get(index)
+                    ));
+                }
+                imports.push(UseDecl { module, alias });
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok(imports)
 }
 
 impl Parser {
@@ -42,8 +94,36 @@ impl Parser {
             type_names: HashSet::new(),
             enum_names: HashSet::new(),
             circum_close: HashSet::new(),
+            available_circum: HashMap::new(),
+            namespaces: HashSet::new(),
             match_ct: 0,
         }
+    }
+
+    /// Seeds declarations supplied by already parsed modules. Modules are
+    /// still parsed into independent arenas; this prelude only gives the
+    /// syntax layer enough information to recognize imported record literals,
+    /// enum values, and operators.
+    pub fn with_prelude(
+        mut self,
+        namespaces: impl IntoIterator<Item = String>,
+        type_names: impl IntoIterator<Item = String>,
+        enum_names: impl IntoIterator<Item = String>,
+        infix_precedence: &HashMap<String, u8>,
+        circum_ops: &HashMap<String, (String, String)>,
+    ) -> Self {
+        self.namespaces.extend(namespaces);
+        self.type_names.extend(type_names);
+        self.enum_names.extend(enum_names);
+        for (glyph, precedence) in infix_precedence {
+            self.prec.insert(glyph.clone(), *precedence);
+        }
+        for (open, (close, function)) in circum_ops {
+            self.circum_close.insert(close.clone());
+            self.available_circum
+                .insert(open.clone(), (close.clone(), function.clone()));
+        }
+        self
     }
 
     fn peek(&self) -> &Tok {
@@ -138,9 +218,22 @@ impl Parser {
                     self.prog.main = Some(body);
                 }
                 Tok::Ident(k) if k == "use" => {
-                    while !matches!(self.peek(), Tok::Newline | Tok::Eof) {
+                    self.eat_kw("use")?;
+                    let module = self.ident()?;
+                    let alias = if matches!(self.peek(), Tok::Ident(word) if word == "as") {
                         self.next();
+                        self.ident()?
+                    } else {
+                        module.clone()
+                    };
+                    if !matches!(self.peek(), Tok::Newline | Tok::Eof) {
+                        return Err(format!(
+                            "unexpected token after import alias: {:?}",
+                            self.peek()
+                        ));
                     }
+                    self.namespaces.insert(alias.clone());
+                    self.prog.uses.push(UseDecl { module, alias });
                 }
                 t => return Err(format!("unexpected top-level token {:?}", t)),
             }
@@ -206,7 +299,12 @@ impl Parser {
             self.eat_sym("]")?;
             Ok(format!("[{}]", inner))
         } else {
-            let name = self.ident()?;
+            let mut name = self.ident()?;
+            while self.is_sym(".") {
+                self.next();
+                name.push('.');
+                name.push_str(&self.ident()?);
+            }
             if name == "c_fn" && self.is_sym("[") {
                 self.next();
                 self.eat_sym("(")?;
@@ -355,7 +453,10 @@ impl Parser {
             // Example: `⊕` is the ordinary function `operator_u2295`.
             let fname = operator_ascii_name(&[&glyph]);
             self.prec.insert(glyph.clone(), anchor_prec);
-            self.prog.infix_ops.insert(glyph, fname.clone());
+            self.prog.infix_ops.insert(glyph.clone(), fname.clone());
+            self.prog
+                .infix_precedence
+                .insert(glyph.clone(), anchor_prec);
             let body = self.parse_block()?;
             self.prog.fns.push(FnDecl {
                 name: fname,
@@ -378,6 +479,8 @@ impl Parser {
             let ret = self.parse_type_str()?;
             let fname = operator_ascii_name(&[&open, &close]);
             self.circum_close.insert(close.clone());
+            self.available_circum
+                .insert(open.clone(), (close.clone(), fname.clone()));
             self.prog.circum_ops.insert(open, (close, fname.clone()));
             let body = self.parse_block()?;
             self.prog.fns.push(FnDecl {
@@ -605,9 +708,9 @@ impl Parser {
                 let e = self.parse_prefix()?;
                 Ok(self.alloc(Expr::Un("not".into(), e)))
             }
-            Tok::Sym(s) if self.prog.circum_ops.contains_key(&s) => {
+            Tok::Sym(s) if self.available_circum.contains_key(&s) => {
                 self.next();
-                let close = self.prog.circum_ops[&s].0.clone();
+                let close = self.available_circum[&s].0.clone();
                 let e = self.parse_expr(0)?;
                 self.eat_sym(&close)?;
                 Ok(self.alloc(Expr::Circum(s, e)))
@@ -648,41 +751,51 @@ impl Parser {
             Tok::Int(v) => Ok(self.alloc(Expr::Int(v))),
             Tok::Float(v) => Ok(self.alloc(Expr::Float(v))),
             Tok::Str(s) => Ok(self.alloc(Expr::Str(s))),
-            Tok::Ident(name) => match name.as_str() {
-                "true" => Ok(self.alloc(Expr::Bool(true))),
-                "false" => Ok(self.alloc(Expr::Bool(false))),
-                "sum" => {
-                    self.eat_sym("(")?;
-                    let var = self.ident()?;
-                    self.eat_kw("in")?;
-                    let lo = self.parse_expr(4)?;
-                    self.eat_sym("..")?;
-                    let hi = self.parse_expr(4)?;
-                    self.eat_sym(")")?;
-                    let body = self.parse_expr(4)?;
-                    Ok(self.alloc(Expr::Sum { var, lo, hi, body }))
+            Tok::Ident(mut name) => {
+                if self.namespaces.contains(&name) && self.is_sym(".") {
+                    self.next();
+                    name.push('.');
+                    name.push_str(&self.ident()?);
+                    // Qualified types and enums have two components after the
+                    // package name: `package.Type` and `package.Enum.Variant`.
+                    // The final enum variant remains a postfix operation.
                 }
-                _ => {
-                    if self.is_sym("(") {
-                        self.next();
-                        self.skip_nl();
-                        let mut args = Vec::new();
-                        while !self.is_sym(")") {
-                            args.push(self.parse_expr(0)?);
-                            if self.is_sym(",") {
-                                self.next();
-                                self.skip_nl();
+                match name.as_str() {
+                    "true" => Ok(self.alloc(Expr::Bool(true))),
+                    "false" => Ok(self.alloc(Expr::Bool(false))),
+                    "sum" => {
+                        self.eat_sym("(")?;
+                        let var = self.ident()?;
+                        self.eat_kw("in")?;
+                        let lo = self.parse_expr(4)?;
+                        self.eat_sym("..")?;
+                        let hi = self.parse_expr(4)?;
+                        self.eat_sym(")")?;
+                        let body = self.parse_expr(4)?;
+                        Ok(self.alloc(Expr::Sum { var, lo, hi, body }))
+                    }
+                    _ => {
+                        if self.is_sym("(") {
+                            self.next();
+                            self.skip_nl();
+                            let mut args = Vec::new();
+                            while !self.is_sym(")") {
+                                args.push(self.parse_expr(0)?);
+                                if self.is_sym(",") {
+                                    self.next();
+                                    self.skip_nl();
+                                }
                             }
-                        }
-                        self.next();
-                        Ok(self.alloc(Expr::Call(name, args)))
-                    } else if self.is_sym("{") && self.type_names.contains(&name) {
-                        self.next();
-                        self.skip_nl();
-                        let mut inits = Vec::new();
-                        while !self.is_sym("}") {
-                            let field =
-                                if let (Tok::Ident(f), Tok::Sym(c)) = (self.peek(), self.peek2()) {
+                            self.next();
+                            Ok(self.alloc(Expr::Call(name, args)))
+                        } else if self.is_sym("{") && self.type_names.contains(&name) {
+                            self.next();
+                            self.skip_nl();
+                            let mut inits = Vec::new();
+                            while !self.is_sym("}") {
+                                let field = if let (Tok::Ident(f), Tok::Sym(c)) =
+                                    (self.peek(), self.peek2())
+                                {
                                     if c == ":" {
                                         let f = f.clone();
                                         self.next();
@@ -694,21 +807,22 @@ impl Parser {
                                 } else {
                                     None
                                 };
-                            let e = self.parse_expr(0)?;
-                            inits.push((field, e));
-                            if self.is_sym(",") {
-                                self.next();
+                                let e = self.parse_expr(0)?;
+                                inits.push((field, e));
+                                if self.is_sym(",") {
+                                    self.next();
+                                    self.skip_nl();
+                                }
                                 self.skip_nl();
                             }
-                            self.skip_nl();
+                            self.next();
+                            Ok(self.alloc(Expr::Record(name, inits)))
+                        } else {
+                            Ok(self.alloc(Expr::Ident(name)))
                         }
-                        self.next();
-                        Ok(self.alloc(Expr::Record(name, inits)))
-                    } else {
-                        Ok(self.alloc(Expr::Ident(name)))
                     }
                 }
-            },
+            }
             Tok::Sym(s) if s == "(" => {
                 self.skip_nl();
                 let e = self.parse_expr(0)?;

@@ -2081,6 +2081,45 @@ fn rpush2(inout g: G, t: i64, r0: str, r1: str): R {
   return R { t: t, o: o, n: 2 }
 }
 
+// True when flattened component k is an owning array pointer. Records may
+// contain arrays recursively, so value retention must walk their flattened
+// layout rather than checking only the outer type.
+fn array_component(p: P, t: i64, k: i64): bool {
+  if is_arrt(t) { return k == 0 }
+  if is_rect(t) {
+    let ti = t - 64
+    var off = 0
+    for i in 0..p.tnf[ti] {
+      let ft = p.flty[p.tfo[ti] + i]
+      let width = wcount(p, ft)
+      if k >= off and k < off + width {
+        return array_component(p, ft, k - off)
+      }
+      off = off + width
+    }
+  }
+  return false
+}
+
+// Creates the persistent value required by LuLang's value semantics. Scalar
+// components are reused; every owning array component gets independent
+// storage. LLVM may later elide a clone only when it can prove the copy
+// unobservable.
+fn retain_value(p: P, inout g: G, v: R): R {
+  let o = g.nrs
+  for k in 0..v.n {
+    var reg = g.rs[v.o + k]
+    if array_component(p, v.t, k) {
+      let copy = newt(g)
+      eline(c5(copy, " = call ptr @lu_arr_clone(ptr ", reg, ")", ""))
+      reg = copy
+    }
+    g.rs[g.nrs] = reg
+    g.nrs = g.nrs + 1
+  }
+  return R { t: v.t, o: o, n: v.n }
+}
+
 fn gdeclare(p: P, inout g: G, name: str, t: i64, ro: i64) {
   let po = g.npt
   for k in 0..wcount(p, t) {
@@ -2117,11 +2156,12 @@ fn gload(p: P, inout g: G, name: str): R {
 }
 
 fn gstore(p: P, inout g: G, name: str, v: R) {
+  let retained = retain_value(p, g, v)
   let i = glookup(g, name)
   let t = g.gty[i]
   let po = g.gpo[i]
   for k in 0..wcount(p, t) {
-    eline(c6("store ", compty(p, t, k), " ", g.rs[v.o + k], ", ptr ", g.ptrs[po + k]))
+    eline(c6("store ", compty(p, t, k), " ", g.rs[retained.o + k], ", ptr ", g.ptrs[po + k]))
   }
 }
 
@@ -2364,6 +2404,280 @@ fn trusted_len(p: P, g: G, a: i64, b: i64): str {
     }
   }
   return ""
+}
+
+fn simd_trusted_len(g: G, array: str, variable: str): str {
+  for i in 0..g.ntr {
+    if g.tarr[i] == array and g.tvar[i] == variable { return g.tlen[i] }
+  }
+  return ""
+}
+
+// Target-independent SIMD legality mirrored from backend/optimization.rs.
+// The self-host has the parsed tree rather than the host's CFG, but accepts
+// exactly the same pure f64 expression shapes after bounds checks are hoisted.
+fn simd_expr_ok(p: P, g: G, e: i64, variable: str): bool {
+  if e < 0 { return false }
+  let n = p.en[e]
+  if n.kind == EK.ENum { return true }
+  if n.kind == EK.EIdent {
+    if n.text == variable { return false }
+    let v = glookup(g, n.text)
+    return v >= 0 and g.gty[v] == 1
+  }
+  if n.kind == EK.EUn {
+    return n.text == "-" and simd_expr_ok(p, g, n.a, variable)
+  }
+  if n.kind == EK.EBin {
+    let arithmetic = n.text == "+" or n.text == "-" or n.text == "*" or n.text == "/"
+    return arithmetic and simd_expr_ok(p, g, n.a, variable) and simd_expr_ok(p, g, n.b, variable)
+  }
+  if n.kind == EK.EIndex {
+    let base = p.en[n.a]
+    let index = p.en[n.b]
+    if base.kind != EK.EIdent or index.kind != EK.EIdent or index.text != variable { return false }
+    let v = glookup(g, base.text)
+    if v < 0 or not is_arrt(g.gty[v]) or elem_of(g.gty[v]) != 1 { return false }
+    return simd_trusted_len(g, base.text, variable) != ""
+  }
+  if n.kind == EK.EField {
+    let indexed = p.en[n.a]
+    if indexed.kind != EK.EIndex { return false }
+    let base = p.en[indexed.a]
+    let index = p.en[indexed.b]
+    if base.kind != EK.EIdent or index.kind != EK.EIdent or index.text != variable { return false }
+    let v = glookup(g, base.text)
+    if v < 0 or not is_arrt(g.gty[v]) { return false }
+    let elem = elem_of(g.gty[v])
+    if not is_rect(elem) { return false }
+    let ti = elem - 64
+    let fi = field_index(p, ti, n.text)
+    if fi < 0 or p.flty[p.tfo[ti] + fi] != 1 { return false }
+    return simd_trusted_len(g, base.text, variable) != ""
+  }
+  if n.kind == EK.ECall {
+    if not (n.text == "sqrt" or n.text == "abs" or n.text == "min" or n.text == "max") {
+      return false
+    }
+    var a = n.a
+    var count = 0
+    while a >= 0 {
+      let arg = p.en[a]
+      if not simd_expr_ok(p, g, arg.a, variable) { return false }
+      count = count + 1
+      a = arg.b
+    }
+    if n.text == "sqrt" or n.text == "abs" { return count == 1 }
+    return count == 2
+  }
+  return false
+}
+
+fn simd_expr_f64(p: P, g: G, e: i64): bool {
+  let n = p.en[e]
+  if n.kind == EK.ENum { return n.b == 1 }
+  if n.kind == EK.EIdent {
+    let v = glookup(g, n.text)
+    return v >= 0 and g.gty[v] == 1
+  }
+  if n.kind == EK.EUn { return simd_expr_f64(p, g, n.a) }
+  if n.kind == EK.EBin {
+    return simd_expr_f64(p, g, n.a) or simd_expr_f64(p, g, n.b)
+  }
+  if n.kind == EK.EIndex {
+    let base = p.en[n.a]
+    let v = glookup(g, base.text)
+    return v >= 0 and elem_of(g.gty[v]) == 1
+  }
+  if n.kind == EK.EField { return true }
+  if n.kind == EK.ECall { return true }
+  return false
+}
+
+fn emit_simd_load(p: P, inout g: G, array: str, variable: str, index: str, component: i64, vector: bool): str {
+  let av = gload(p, g, array)
+  let data = newt(g)
+  eline(c6(data, " = getelementptr i8, ptr ", g.rs[av.o], ", i64 8", "", ""))
+  var at = index
+  if component > 0 {
+    let logical = simd_trusted_len(g, array, variable)
+    let plane = newt(g)
+    eline(c6(plane, " = mul i64 ", logical, ", ", i2s(component), ""))
+    at = newt(g)
+    eline(c6(at, " = add i64 ", plane, ", ", index, ""))
+  }
+  let address = newt(g)
+  eline(c6(address, " = getelementptr double, ptr ", data, ", i64 ", at, ""))
+  let value = newt(g)
+  if vector {
+    eline(c5(value, " = load <2 x double>, ptr ", address, ", align 8", ""))
+  } else {
+    eline(c5(value, " = load double, ptr ", address, ", align 8", ""))
+  }
+  return value
+}
+
+fn emit_simd_expr(p: P, inout g: G, e: i64, variable: str, index: str, vector: bool): str {
+  let n = p.en[e]
+  if n.kind == EK.ENum {
+    let value = f64hex(n.num)
+    if vector { return c5("<double ", value, ", double ", value, ">") }
+    return value
+  }
+  if n.kind == EK.EIdent {
+    let v = gload(p, g, n.text)
+    if not vector { return g.rs[v.o] }
+    let inserted = newt(g)
+    eline(c6(inserted, " = insertelement <2 x double> poison, double ", g.rs[v.o], ", i64 0", "", ""))
+    let splat = newt(g)
+    eline(c4(splat, " = shufflevector <2 x double> ", inserted, ", <2 x double> poison, <2 x i32> zeroinitializer"))
+    return splat
+  }
+  if n.kind == EK.EUn {
+    let value = emit_simd_expr(p, g, n.a, variable, index, vector)
+    let out = newt(g)
+    if vector {
+      eline(c4(out, " = fneg fast <2 x double> ", value, ""))
+    } else {
+      eline(c4(out, " = fneg fast double ", value, ""))
+    }
+    return out
+  }
+  if n.kind == EK.EBin {
+    let lhs = emit_simd_expr(p, g, n.a, variable, index, vector)
+    let rhs = emit_simd_expr(p, g, n.b, variable, index, vector)
+    var op = "fadd"
+    if n.text == "-" { op = "fsub" }
+    if n.text == "*" { op = "fmul" }
+    if n.text == "/" { op = "fdiv" }
+    let out = newt(g)
+    var ty = "double"
+    if vector { ty = "<2 x double>" }
+    eline(c8(out, " = ", op, " fast ", ty, " ", lhs, c2str(", ", rhs)))
+    return out
+  }
+  if n.kind == EK.EIndex {
+    return emit_simd_load(p, g, p.en[n.a].text, variable, index, 0, vector)
+  }
+  if n.kind == EK.EField {
+    let indexed = p.en[n.a]
+    let base = p.en[indexed.a]
+    let v = glookup(g, base.text)
+    let ti = elem_of(g.gty[v]) - 64
+    return emit_simd_load(p, g, base.text, variable, index, foff(p, ti, n.text), vector)
+  }
+  if n.kind == EK.ECall {
+    let first = p.en[n.a]
+    let a0 = emit_simd_expr(p, g, first.a, variable, index, vector)
+    var a1 = ""
+    if first.b >= 0 {
+      let second = p.en[first.b]
+      a1 = emit_simd_expr(p, g, second.a, variable, index, vector)
+    }
+    var suffix = ".f64"
+    var ty = "double"
+    if vector {
+      suffix = ".v2f64"
+      ty = "<2 x double>"
+    }
+    var intrinsic = n.text
+    if n.text == "abs" { intrinsic = "fabs" }
+    if n.text == "min" { intrinsic = "minnum" }
+    if n.text == "max" { intrinsic = "maxnum" }
+    let out = newt(g)
+    if a1 == "" {
+      eline(c8(out, " = call fast ", ty, " @llvm.", intrinsic, suffix, "(", c3(ty, " ", c2str(a0, ")"))))
+    } else {
+      eline(c8(out, " = call fast ", ty, " @llvm.", intrinsic, suffix, "(", c3(ty, " ", c5(a0, ", ", ty, " ", c2str(a1, ")")))))
+    }
+    return out
+  }
+  return ""
+}
+
+fn emit_simd_sum(p: P, inout g: G, body: i64, variable: str, lower: str, upper: str): str {
+  let indexp = newt(g)
+  eline(c2str(indexp, " = alloca i64"))
+  eline(c4("store i64 ", lower, ", ptr ", indexp))
+  var accs = arr(4, "")
+  for i in 0..4 {
+    accs[i] = newt(g)
+    eline(c2str(accs[i], " = alloca <2 x double>"))
+    eline(c4("store <2 x double> zeroinitializer, ptr ", accs[i], "", ""))
+  }
+  let scalarp = newt(g)
+  eline(c2str(scalarp, " = alloca double"))
+  eline(c2str("store double 0.0, ptr ", scalarp))
+  let vh = newl(g)
+  let vb = newl(g)
+  let sh = newl(g)
+  let sb = newl(g)
+  let done = newl(g)
+  eline(c2str("br label %", vh))
+  elabel(vh)
+  let index = newt(g)
+  eline(c4(index, " = load i64, ptr ", indexp, ""))
+  let after = newt(g)
+  eline(c4(after, " = add i64 ", index, ", 8"))
+  let fits = newt(g)
+  eline(c6(fits, " = icmp sle i64 ", after, ", ", upper, ""))
+  eline(c6("br i1 ", fits, ", label %", vb, ", label %", sh))
+  elabel(vb)
+  for lane in 0..4 {
+    var at = index
+    if lane > 0 {
+      at = newt(g)
+      eline(c6(at, " = add i64 ", index, ", ", i2s(lane * 2), ""))
+    }
+    let item = emit_simd_expr(p, g, body, variable, at, true)
+    let current = newt(g)
+    eline(c4(current, " = load <2 x double>, ptr ", accs[lane], ""))
+    let next = newt(g)
+    eline(c6(next, " = fadd fast <2 x double> ", current, ", ", item, ""))
+    eline(c4("store <2 x double> ", next, ", ptr ", accs[lane]))
+  }
+  eline(c4("store i64 ", after, ", ptr ", indexp))
+  eline(c2str("br label %", vh))
+  elabel(sh)
+  let si = newt(g)
+  eline(c4(si, " = load i64, ptr ", indexp, ""))
+  let more = newt(g)
+  eline(c6(more, " = icmp slt i64 ", si, ", ", upper, ""))
+  eline(c6("br i1 ", more, ", label %", sb, ", label %", done))
+  elabel(sb)
+  let item = emit_simd_expr(p, g, body, variable, si, false)
+  let current = newt(g)
+  eline(c4(current, " = load double, ptr ", scalarp, ""))
+  let next = newt(g)
+  eline(c6(next, " = fadd fast double ", current, ", ", item, ""))
+  eline(c4("store double ", next, ", ptr ", scalarp))
+  let ni = newt(g)
+  eline(c4(ni, " = add i64 ", si, ", 1"))
+  eline(c4("store i64 ", ni, ", ptr ", indexp))
+  eline(c2str("br label %", sh))
+  elabel(done)
+  var vectors = arr(4, "")
+  for i in 0..4 {
+    vectors[i] = newt(g)
+    eline(c4(vectors[i], " = load <2 x double>, ptr ", accs[i], ""))
+  }
+  let pair0 = newt(g)
+  eline(c6(pair0, " = fadd fast <2 x double> ", vectors[0], ", ", vectors[1], ""))
+  let pair1 = newt(g)
+  eline(c6(pair1, " = fadd fast <2 x double> ", vectors[2], ", ", vectors[3], ""))
+  let vt = newt(g)
+  eline(c6(vt, " = fadd fast <2 x double> ", pair0, ", ", pair1, ""))
+  let lane0 = newt(g)
+  eline(c4(lane0, " = extractelement <2 x double> ", vt, ", i64 0"))
+  let lane1 = newt(g)
+  eline(c4(lane1, " = extractelement <2 x double> ", vt, ", i64 1"))
+  let lanes = newt(g)
+  eline(c6(lanes, " = fadd fast double ", lane0, ", ", lane1, ""))
+  let scalar = newt(g)
+  eline(c4(scalar, " = load double, ptr ", scalarp, ""))
+  let total = newt(g)
+  eline(c6(total, " = fadd fast double ", lanes, ", ", scalar, ""))
+  return total
 }
 
 // ---------- element addressing (same layout contract as the host) ----------
@@ -2615,6 +2929,11 @@ fn emit_expr(p: P, inout g: G, e: i64): R {
     var pushed = 0
     if ts.ok == 1 and ts.cnt > 0 {
       pushed = hoist_checks(p, g, ts, nd.text, g.rs[lov.o], g.rs[hiv.o])
+    }
+    if pushed > 0 and simd_expr_ok(p, g, aux.b, nd.text) and simd_expr_f64(p, g, aux.b) {
+      let total = emit_simd_sum(p, g, aux.b, nd.text, g.rs[lov.o], g.rs[hiv.o])
+      g.ntr = g.ntr - pushed
+      return rpush1(g, 1, total)
     }
     let iptr = newt(g)
     eline(c2str(iptr, " = alloca i64"))
@@ -3161,7 +3480,10 @@ fn emit_stmt(p: P, inout g: G, s: i64): R {
   let n = p.sn[s]
   if n.kind == SK.SLet or n.kind == SK.SVar {
     let v = emit_expr(p, g, n.a)
-    if g.gerr == 0 { gdeclare(p, g, n.text, v.t, v.o) }
+    if g.gerr == 0 {
+      let retained = retain_value(p, g, v)
+      gdeclare(p, g, n.text, retained.t, retained.o)
+    }
     return runit()
   }
   if n.kind == SK.SAssign {
@@ -3391,6 +3713,10 @@ fn emit_fn(p: P, inout g: G, f: i64) {
       g.nrs = g.nrs + 1
       idx = idx + 1
     }
+    // Persistent bindings and assignments already establish unique owning
+    // arrays. Ordinary parameters are immutable, while `inout` parameters
+    // have exclusive access and return into that same unique caller slot, so
+    // both can borrow their incoming storage without another physical copy.
     gdeclare(p, g, p.pname[p.fpo[f] + j], t, o)
   }
   let last = emit_block(p, g, p.fbody[f])
@@ -3630,17 +3956,25 @@ fn emit_module(p: P, inout g: G, triple: str) {
   }
   puts("declare double @llvm.sqrt.f64(double)")
   putnl()
+  puts("declare <2 x double> @llvm.sqrt.v2f64(<2 x double>)")
+  putnl()
   puts("declare double @llvm.sin.f64(double)")
   putnl()
   puts("declare double @llvm.cos.f64(double)")
   putnl()
   puts("declare double @llvm.fabs.f64(double)")
   putnl()
+  puts("declare <2 x double> @llvm.fabs.v2f64(<2 x double>)")
+  putnl()
   puts("declare double @llvm.floor.f64(double)")
   putnl()
   puts("declare double @llvm.minnum.f64(double, double)")
   putnl()
+  puts("declare <2 x double> @llvm.minnum.v2f64(<2 x double>, <2 x double>)")
+  putnl()
   puts("declare double @llvm.maxnum.f64(double, double)")
+  putnl()
+  puts("declare <2 x double> @llvm.maxnum.v2f64(<2 x double>, <2 x double>)")
   putnl()
   puts("declare double @llvm.pow.f64(double, double)")
   putnl()

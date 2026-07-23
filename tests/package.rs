@@ -27,6 +27,19 @@ fn write_dependency(directory: &Path, body: &str) {
     std::fs::write(directory.join("src/lib.lu"), body).expect("write dependency source");
 }
 
+fn commit_dependency(directory: &Path) {
+    run(Command::new("git")
+        .args(["init", "--quiet", "-b", "main"])
+        .arg(directory));
+    git(
+        directory,
+        &["config", "user.email", "package-test@example.com"],
+    );
+    git(directory, &["config", "user.name", "Package Test"]);
+    git(directory, &["add", "."]);
+    git(directory, &["commit", "--quiet", "-m", "initial"]);
+}
+
 #[test]
 fn git_dependencies_are_locked_cached_and_composed_whole_program() {
     let directory = std::env::temp_dir().join(format!("lulang-package-{}", std::process::id()));
@@ -36,16 +49,7 @@ fn git_dependencies_are_locked_cached_and_composed_whole_program() {
     std::fs::create_dir_all(&dependency).expect("create dependency repository");
     std::fs::create_dir_all(&root).expect("create root package");
     write_dependency(&dependency, "fn triple(x: i64): i64 { return x * 3 }\n");
-    run(Command::new("git")
-        .args(["init", "--quiet", "-b", "main"])
-        .arg(&dependency));
-    git(
-        &dependency,
-        &["config", "user.email", "package-test@example.com"],
-    );
-    git(&dependency, &["config", "user.name", "Package Test"]);
-    git(&dependency, &["add", "."]);
-    git(&dependency, &["commit", "--quiet", "-m", "initial"]);
+    commit_dependency(&dependency);
     let first_commit = String::from_utf8_lossy(&git(&dependency, &["rev-parse", "HEAD"]).stdout)
         .trim()
         .to_string();
@@ -62,7 +66,7 @@ fn git_dependencies_are_locked_cached_and_composed_whole_program() {
         .env("LULANG_CACHE", &cache));
     std::fs::write(
         root.join("src/main.lu"),
-        "use numerics\nmain { print(triple(14)) }\n",
+        "use numerics\nmain { print(numerics.triple(14)) }\n",
     )
     .expect("write root source");
 
@@ -81,9 +85,25 @@ fn git_dependencies_are_locked_cached_and_composed_whole_program() {
         .env("LULANG_CACHE", &cache));
     assert_eq!(interpreted.stdout, b"42\n");
 
+    std::fs::write(
+        root.join("src/main.lu"),
+        "use numerics as numbers\nfn triple(x: i64): i64 { return x + 1 }\nmain { print(triple(14), numbers.triple(14)) }\n",
+    )
+    .expect("write collision-safe module source");
+    let namespaced = run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .arg("run")
+        .current_dir(&root)
+        .env("LULANG_CACHE", &cache));
+    assert_eq!(namespaced.stdout, b"15 42\n");
+
     write_dependency(&dependency, "fn triple(x: i64): i64 { return x * 4 }\n");
     git(&dependency, &["add", "."]);
     git(&dependency, &["commit", "--quiet", "-m", "move main"]);
+    std::fs::write(
+        root.join("src/main.lu"),
+        "use numerics\nmain { print(numerics.triple(14)) }\n",
+    )
+    .expect("restore namespaced package source");
     let still_locked = run(Command::new(env!("CARGO_BIN_EXE_lu"))
         .arg("run")
         .current_dir(&root)
@@ -128,6 +148,60 @@ fn git_dependencies_are_locked_cached_and_composed_whole_program() {
         .expect("check undeclared package");
     assert!(!undeclared.status.success());
     assert!(String::from_utf8_lossy(&undeclared.stderr).contains("imports undeclared package"));
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn imported_records_and_enums_link_with_qualified_names() {
+    let directory =
+        std::env::temp_dir().join(format!("lulang-module-types-{}", std::process::id()));
+    let dependency = directory.join("geometry");
+    let root = directory.join("viewer");
+    let cache = directory.join("cache");
+    std::fs::create_dir_all(&dependency).expect("create dependency");
+    std::fs::create_dir_all(&root).expect("create root");
+    write_dependency(
+        &dependency,
+        "type Point { x: i64, y: i64 }\nenum Axis { X, Y }\n\
+         fn point_sum(value: Point): i64 { return value.x + value.y }\n\
+         fn axis_tag(value: Axis): i64 {\n\
+           if value == Axis.X { return 10 }\n\
+           return 20\n\
+         }\n",
+    );
+    std::fs::write(
+        dependency.join("lu.toml"),
+        "[package]\nname = \"geometry\"\nversion = \"0.1.0\"\n\n[dependencies]\n",
+    )
+    .expect("write geometry manifest");
+    commit_dependency(&dependency);
+
+    run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .args(["init", "viewer"])
+        .current_dir(&root)
+        .env("LULANG_CACHE", &cache));
+    run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .args(["add", "geometry", "--git"])
+        .arg(&dependency)
+        .args(["--rev", "main"])
+        .current_dir(&root)
+        .env("LULANG_CACHE", &cache));
+    std::fs::write(
+        root.join("src/main.lu"),
+        "use geometry\n\
+         fn local_sum(value: geometry.Point): i64 { return value.x + value.y + 1 }\n\
+         main {\n\
+           let point = geometry.Point { x: 2, y: 3 }\n\
+           print(geometry.point_sum(point), local_sum(point), geometry.axis_tag(geometry.Axis.Y))\n\
+         }\n",
+    )
+    .expect("write qualified module program");
+    let output = run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .arg("run")
+        .current_dir(&root)
+        .env("LULANG_CACHE", &cache));
+    assert_eq!(output.stdout, b"5 6 20\n");
 
     let _ = std::fs::remove_dir_all(&directory);
 }

@@ -51,6 +51,85 @@ fn target_triple(module: &str) -> &str {
         .expect("target triple in host LLVM")
 }
 
+fn compile_ir(repository: &Path, ir: &Path, output: &Path) {
+    let compiled = run(Command::new("clang")
+        .args(["-O3", "-mcpu=native"])
+        .arg("-o")
+        .arg(output)
+        .arg(ir)
+        .arg(repository.join("src/lu_runtime.c")));
+    assert!(
+        compiled.status.success(),
+        "LLVM fixture compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+}
+
+#[test]
+fn host_and_selfhost_emit_correct_explicit_simd_with_scalar_tails() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let directory =
+        std::env::temp_dir().join(format!("lulang-selfhost-simd-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create SIMD sync directory");
+    let source = directory.join("odd-dot.lu");
+    std::fs::write(
+        &source,
+        "main {\n\
+           let n = 11\n\
+           var a = arr(n, 0.0)\n\
+           var b = arr(n, 0.0)\n\
+           for i in 0..n {\n\
+             a[i] = float(i)\n\
+             b[i] = float(i + 1)\n\
+           }\n\
+           print(sum(i in 0..n) a[i] * b[i])\n\
+         }\n",
+    )
+    .expect("write SIMD fixture");
+
+    let host_path = directory.join("host.ll");
+    let host = emit_host_ir(&source, &host_path);
+    let selfhost = emit_selfhost_ir(&repository, &source, target_triple(&host));
+    assert!(
+        host.contains("fmul fast <2 x double>"),
+        "host did not lower the shared SIMD plan"
+    );
+    assert!(
+        selfhost.contains("fmul fast <2 x double>"),
+        "selfhost did not mirror the shared SIMD plan"
+    );
+    assert!(
+        host.contains("icmp slt i64") && selfhost.contains("icmp slt i64"),
+        "both backends need a scalar tail"
+    );
+    let scalar_path = directory.join("host-scalar.ll");
+    let scalar_build = run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .env("LU_SIMD", "off")
+        .args(["build", "--emit-llvm", "-o"])
+        .arg(&scalar_path)
+        .arg(&source));
+    assert!(
+        scalar_build.status.success(),
+        "scalar fallback emission failed: {}",
+        String::from_utf8_lossy(&scalar_build.stderr)
+    );
+    let scalar = std::fs::read_to_string(&scalar_path).expect("read scalar fallback IR");
+    assert!(
+        !scalar.contains("fmul fast <2 x double>"),
+        "LU_SIMD=off must preserve the scalar fallback"
+    );
+
+    let selfhost_path = directory.join("selfhost.ll");
+    std::fs::write(&selfhost_path, selfhost).expect("write selfhost SIMD IR");
+    for (name, ir) in [("host", &host_path), ("selfhost", &selfhost_path)] {
+        let binary = directory.join(name);
+        compile_ir(&repository, ir, &binary);
+        let output = run(&mut Command::new(binary));
+        assert!(output.status.success(), "{name} SIMD fixture failed");
+        assert_eq!(output.stdout, b"440\n", "{name} scalar tail disagreed");
+    }
+}
+
 #[test]
 fn selfhost_frontends_are_byte_identical() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -263,6 +342,59 @@ fn ffi_import_and_export_ir_match_the_host_byte_for_byte() {
     assert_eq!(
         host_string_wrapper, selfhost_string_wrapper,
         "string-return export wrappers drifted between host and selfhost"
+    );
+
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn selfhost_preserves_array_value_semantics() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let directory =
+        std::env::temp_dir().join(format!("lulang-selfhost-values-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create selfhost value directory");
+    let source = directory.join("array-values.lu");
+    std::fs::write(
+        &source,
+        "type Holder { values: [i64] }\n\
+         main {\n\
+           var original = arr(1, 1)\n\
+           var direct = original\n\
+           direct[0] = 2\n\
+           var left = Holder { values: original }\n\
+           var right = left\n\
+           right.values[0] = 3\n\
+           var assigned = arr(1, 0)\n\
+           assigned = original\n\
+           assigned[0] = 4\n\
+           print(original[0], direct[0], left.values[0], right.values[0], assigned[0])\n\
+         }\n",
+    )
+    .expect("write array value fixture");
+
+    let host_ir_path = directory.join("host.ll");
+    let host_ir = emit_host_ir(&source, &host_ir_path);
+    let triple = target_triple(&host_ir);
+    let selfhost_ir = emit_selfhost_ir(&repository, &source, triple);
+    assert!(
+        selfhost_ir.matches("call ptr @lu_arr_clone").count() >= 5,
+        "selfhost did not retain persistent array values"
+    );
+    let selfhost_ir_path = directory.join("selfhost.ll");
+    std::fs::write(&selfhost_ir_path, selfhost_ir).expect("write selfhost LLVM");
+    let selfhost_binary = directory.join("selfhost");
+    compile_ir(&repository, &selfhost_ir_path, &selfhost_binary);
+
+    let host_binary = directory.join("host");
+    compile_ir(&repository, &host_ir_path, &host_binary);
+    let host = run(&mut Command::new(&host_binary));
+    let selfhost = run(&mut Command::new(&selfhost_binary));
+    assert!(host.status.success());
+    assert!(selfhost.status.success());
+    assert_eq!(host.stdout, b"1 2 1 3 4\n");
+    assert_eq!(
+        selfhost.stdout, host.stdout,
+        "selfhost violated array value semantics"
     );
 
     let _ = std::fs::remove_dir_all(directory);

@@ -25,9 +25,11 @@ struct LockedPackage {
     tree: String,
 }
 
+use crate::module_system::SourceFile;
+
 pub struct LoadedProgram {
     pub label: String,
-    pub source: String,
+    pub sources: Vec<SourceFile>,
 }
 
 pub fn init(arguments: &[String]) -> Result<String, String> {
@@ -121,18 +123,18 @@ pub fn load_workspace(mode: &str) -> Result<LoadedProgram, String> {
     let root = workspace_root(&std::env::current_dir().map_err(|error| error.to_string())?)?;
     let manifest = read_manifest(&root.join("lu.toml"))?;
     let (resolved, _) = resolve_workspace(&root)?;
-    let mut source = String::new();
+    let mut sources = Vec::new();
     let mut emitted = BTreeSet::new();
     for package in &resolved {
-        append_package_source(&mut source, &package.path, false, mode, &mut emitted)?;
+        append_package_source(&mut sources, &package.path, false, mode, &mut emitted)?;
     }
-    append_package_source(&mut source, &root, true, mode, &mut emitted)?;
+    append_package_source(&mut sources, &root, true, mode, &mut emitted)?;
     Ok(LoadedProgram {
         label: root
             .join(format!("{}.lu", manifest.name))
             .to_string_lossy()
             .into_owned(),
-        source,
+        sources,
     })
 }
 
@@ -335,7 +337,7 @@ fn clone_package(
 }
 
 fn append_package_source(
-    output: &mut String,
+    output: &mut Vec<SourceFile>,
     directory: &Path,
     root: bool,
     mode: &str,
@@ -402,27 +404,25 @@ fn append_package_source(
         }
         let source = std::fs::read_to_string(&file)
             .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
-        for line in source.lines() {
-            let line = line.trim();
-            let Some(import) = line.strip_prefix("use ") else {
-                continue;
-            };
-            let import = import
-                .split_whitespace()
-                .next()
-                .ok_or_else(|| format!("empty `use` in {}", file.display()))?;
-            if import != "math" && !manifest.dependencies.contains_key(import) {
+        let tokens = lu_syntax::lexer::lex(&source)
+            .map_err(|error| format!("{}: {error}", file.display()))?;
+        let imports = lu_syntax::parser::scan_imports(&tokens)
+            .map_err(|error| format!("{}: {error}", file.display()))?;
+        for import in imports {
+            if import.module != "math" && !manifest.dependencies.contains_key(&import.module) {
                 return Err(format!(
-                    "{} imports undeclared package `{import}`",
-                    file.display()
+                    "{} imports undeclared package `{}`",
+                    file.display(),
+                    import.module
                 ));
             }
         }
-        let _ = writeln!(output, "// package {}: {}", manifest.name, file.display());
-        output.push_str(&source);
-        if !source.ends_with('\n') {
-            output.push('\n');
-        }
+        output.push(SourceFile {
+            module: manifest.name.clone(),
+            path: file.to_string_lossy().into_owned(),
+            source,
+            root,
+        });
     }
     Ok(())
 }

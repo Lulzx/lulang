@@ -15,16 +15,20 @@ evidence.*
   blessed comparison. Bit-exact reproducibility is out of scope for v0.1.
 - **No layout guarantees.** The compiler may re-layout records and arrays (AoS→SoA,
   padding, scalarization). There is no `sizeof`, no FFI in v0.1.
-- **Whole-program compilation.** One compilation unit per invocation; everything
-  monomorphized and inlinable.
+- **Whole-program optimization.** Source files are parsed as modules and linked
+  before lowering; the resulting program remains fully inlinable.
 - Statically typed, with local type inference (`let` needs no annotation; function
   signatures are fully annotated).
 
 ## 2. Files & entry
 
-- Extension: `.lu`. A standalone file is one compilation unit. In a
-  `lu.toml` package, `use name` names a declared Git dependency whose
-  `src/lib.lu` is composed into the same whole-program compilation.
+- Extension: `.lu`. A standalone file is the root module. In a `lu.toml`
+  package, `use name` imports a declared Git dependency as a namespace.
+  `use name as local` gives that namespace a local alias.
+  Dependency declarations are addressed as `name.member`; each source file is
+  parsed once into its own arena and modules are linked before checking and
+  whole-program lowering. Unqualified imported names remain accepted when
+  exactly one imported module defines them, for source compatibility.
 - Entry point: a bare `main { … }` block.
 
 ## 3. Types

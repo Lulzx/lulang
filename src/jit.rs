@@ -8,7 +8,10 @@ use crate::ast::{FnDecl, Program};
 use crate::backend::layout::{
     array_component_offsets, components as layout_components, field_offset, Component,
 };
-use crate::backend::optimization::{analyze_cfg, if_convert, inline_calls, licm, CfgAnalysis};
+use crate::backend::optimization::{
+    analyze_cfg, array_local_for_value, if_convert, inline_calls, licm, simd_reduction_plan,
+    CfgAnalysis, SimdExpr,
+};
 use crate::check::{resolve_type, Type as CType};
 use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
 use crate::runtime;
@@ -31,43 +34,6 @@ fn comps(p: &Program, t: &CType) -> Result<Vec<cranelift_codegen::ir::Type>, Str
             Component::I64 | Component::Ptr => types::I64,
         })
         .collect())
-}
-
-fn array_local_for_value(function: &ir::Function, value: ir::ValueId) -> Option<ir::LocalId> {
-    function
-        .blocks
-        .iter()
-        .flat_map(|block| &block.instructions)
-        .find_map(|inst| {
-            (inst.result == Some(value)).then(|| match inst.kind {
-                InstKind::Load(local) => Some(local),
-                _ => None,
-            })?
-        })
-        .filter(|local| matches!(function.locals[*local as usize].ty, CType::Arr(_)))
-}
-
-fn cfg_value_definition(
-    function: &ir::Function,
-    value: ir::ValueId,
-) -> Option<(ir::BlockId, usize, &ir::Inst)> {
-    function
-        .blocks
-        .iter()
-        .enumerate()
-        .find_map(|(block, contents)| {
-            contents
-                .instructions
-                .iter()
-                .enumerate()
-                .find(|(_, inst)| inst.result == Some(value))
-                .map(|(instruction, inst)| (block as ir::BlockId, instruction, inst))
-        })
-}
-
-fn cfg_value_is_load(function: &ir::Function, value: ir::ValueId, local: ir::LocalId) -> bool {
-    cfg_value_definition(function, value)
-        .is_some_and(|(_, _, inst)| matches!(inst.kind, InstKind::Load(id) if id == local))
 }
 
 struct FnInfo {
@@ -720,14 +686,9 @@ impl<'a, 'b> Gen<'a, 'b> {
         loop_index: usize,
     ) -> Result<bool, String> {
         let loop_info = &self.cfg.loops[loop_index];
-        let Some(reduction) = &loop_info.reduction else {
+        let Some(plan) = simd_reduction_plan(function, self.cfg, loop_index, self.soa) else {
             return Ok(false);
         };
-        if function.locals[reduction.accumulator as usize].ty != CType::F64
-            || !self.cfg_vector_value(function, loop_index, reduction.value)
-        {
-            return Ok(false);
-        }
         let (_, lower) = Self::ir_value(values, loop_info.lower)?;
         let (_, upper) = Self::ir_value(values, loop_info.upper)?;
         let index_var = self.b.declare_var(types::I64);
@@ -761,7 +722,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let batch = self.b.use_var(index_var);
         for (lane, accumulator) in vector_accs.iter().enumerate() {
             let at = self.b.ins().iadd_imm(batch, (lane * 2) as i64);
-            let item = self.gen_cfg_vector_value(function, loop_index, reduction.value, at)?;
+            let item = self.gen_simd_vector_expr(loop_index, &plan.value, at)?;
             let current = self.b.use_var(*accumulator);
             let next = self.b.ins().fadd(current, item);
             self.b.def_var(*accumulator, next);
@@ -777,7 +738,7 @@ impl<'a, 'b> Gen<'a, 'b> {
 
         self.b.switch_to_block(scalar_body);
         let at = self.b.use_var(index_var);
-        let item = self.gen_cfg_scalar_value(function, loop_index, reduction.value, at)?;
+        let item = self.gen_simd_scalar_expr(loop_index, &plan.value, at)?;
         let current = self.b.use_var(scalar_acc);
         let next = self.b.ins().fadd(current, item);
         self.b.def_var(scalar_acc, next);
@@ -798,129 +759,42 @@ impl<'a, 'b> Gen<'a, 'b> {
         let lanes = self.b.ins().fadd(lane0, lane1);
         let scalar = self.b.use_var(scalar_acc);
         let total = self.b.ins().fadd(lanes, scalar);
-        self.define_ir_local(reduction.accumulator, &[total])?;
+        self.define_ir_local(plan.accumulator, &[total])?;
         self.b.ins().jump(blocks[loop_info.exit as usize], &[]);
         self.skipped_cfg_blocks
             .extend(loop_info.blocks.iter().copied());
         Ok(true)
     }
 
-    fn cfg_vector_value(
-        &self,
-        function: &ir::Function,
-        loop_index: usize,
-        value: ir::ValueId,
-    ) -> bool {
-        let Some((block, instruction, inst)) = cfg_value_definition(function, value) else {
-            return false;
-        };
-        match &inst.kind {
-            InstKind::Constant(Constant::F64(_) | Constant::I64(_)) => true,
-            InstKind::Load(local) => {
-                *local != self.cfg.loops[loop_index].induction
-                    && function.locals[*local as usize].ty == CType::F64
-                    && self.cfg_loop_invariant_local(function, loop_index, *local)
-            }
-            InstKind::Unary {
-                op: UnaryOp::Neg,
-                value,
-            } => self.cfg_vector_value(function, loop_index, *value),
-            InstKind::Binary { op, lhs, rhs }
-                if matches!(
-                    op,
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
-                ) =>
-            {
-                self.cfg_vector_value(function, loop_index, *lhs)
-                    && self.cfg_vector_value(function, loop_index, *rhs)
-            }
-            InstKind::Index { base, index } => {
-                function.values[value as usize] == CType::F64
-                    && self.cfg.trusted_accesses.get(&(block, instruction)) == Some(&loop_index)
-                    && array_local_for_value(function, *base).is_some()
-                    && cfg_value_is_load(function, *index, self.cfg.loops[loop_index].induction)
-            }
-            InstKind::Field { base, .. } if self.soa => {
-                let Some((base_block, base_instruction, base_inst)) =
-                    cfg_value_definition(function, *base)
-                else {
-                    return false;
-                };
-                let InstKind::Index { base: array, index } = base_inst.kind else {
-                    return false;
-                };
-                function.values[value as usize] == CType::F64
-                    && self
-                        .cfg
-                        .trusted_accesses
-                        .get(&(base_block, base_instruction))
-                        == Some(&loop_index)
-                    && array_local_for_value(function, array).is_some()
-                    && cfg_value_is_load(function, index, self.cfg.loops[loop_index].induction)
-            }
-            InstKind::Call {
-                callee: Callee::Builtin(name),
-                args,
-                ..
-            } if matches!(name.as_str(), "sqrt" | "abs" | "min" | "max") => args
-                .iter()
-                .all(|value| self.cfg_vector_value(function, loop_index, *value)),
-            _ => false,
-        }
-    }
-
-    fn cfg_loop_invariant_local(
-        &self,
-        function: &ir::Function,
-        loop_index: usize,
-        local: ir::LocalId,
-    ) -> bool {
-        self.cfg.loops[loop_index].blocks.iter().all(|block| {
-            function.blocks[*block as usize]
-                .instructions
-                .iter()
-                .all(|instruction| match &instruction.kind {
-                    InstKind::Store { local: target, .. } => *target != local,
-                    InstKind::Call { inout, .. } => {
-                        !inout.iter().flatten().any(|target| *target == local)
-                    }
-                    _ => true,
-                })
-        })
-    }
-
-    fn gen_cfg_vector_value(
+    fn gen_simd_vector_expr(
         &mut self,
-        function: &ir::Function,
         loop_index: usize,
-        value: ir::ValueId,
+        expr: &SimdExpr,
         index: Value,
     ) -> Result<Value, String> {
-        let (_, _, inst) =
-            cfg_value_definition(function, value).ok_or("missing vector value definition")?;
-        Ok(match &inst.kind {
-            InstKind::Constant(Constant::F64(value)) => {
+        Ok(match expr {
+            SimdExpr::F64(value) => {
                 let scalar = self.b.ins().f64const(*value);
                 self.b.ins().splat(types::F64X2, scalar)
             }
-            InstKind::Constant(Constant::I64(value)) => {
+            SimdExpr::I64(value) => {
                 let scalar = self.b.ins().f64const(*value as f64);
                 self.b.ins().splat(types::F64X2, scalar)
             }
-            InstKind::Load(local) => {
+            SimdExpr::Invariant(local) => {
                 let (_, vars) = self
                     .lookup(&Self::ir_local(*local))
                     .ok_or("missing vector invariant")?;
                 let scalar = self.b.use_var(vars[0]);
                 self.b.ins().splat(types::F64X2, scalar)
             }
-            InstKind::Unary { value, .. } => {
-                let inner = self.gen_cfg_vector_value(function, loop_index, *value, index)?;
+            SimdExpr::Neg(value) => {
+                let inner = self.gen_simd_vector_expr(loop_index, value, index)?;
                 self.b.ins().fneg(inner)
             }
-            InstKind::Binary { op, lhs, rhs } => {
-                let lhs = self.gen_cfg_vector_value(function, loop_index, *lhs, index)?;
-                let rhs = self.gen_cfg_vector_value(function, loop_index, *rhs, index)?;
+            SimdExpr::Binary { op, lhs, rhs } => {
+                let lhs = self.gen_simd_vector_expr(loop_index, lhs, index)?;
+                let rhs = self.gen_simd_vector_expr(loop_index, rhs, index)?;
                 match op {
                     BinaryOp::Add => self.b.ins().fadd(lhs, rhs),
                     BinaryOp::Sub => self.b.ins().fsub(lhs, rhs),
@@ -929,11 +803,9 @@ impl<'a, 'b> Gen<'a, 'b> {
                     _ => return Err("unsupported vector binary".into()),
                 }
             }
-            InstKind::Index { base, .. } => {
-                let local =
-                    array_local_for_value(function, *base).ok_or("missing vector array local")?;
+            SimdExpr::Array { local } => {
                 let (_, vars) = self
-                    .lookup(&Self::ir_local(local))
+                    .lookup(&Self::ir_local(*local))
                     .ok_or("missing vector array")?;
                 let base = self.b.use_var(vars[0]);
                 let bytes = self.b.ins().imul_imm(index, 8);
@@ -943,25 +815,18 @@ impl<'a, 'b> Gen<'a, 'b> {
                     .ins()
                     .load(types::F64X2, MemFlags::trusted(), address, 0)
             }
-            InstKind::Field {
-                base,
+            SimdExpr::Field {
+                local,
                 record,
                 field,
             } => {
-                let (_, _, indexed) =
-                    cfg_value_definition(function, *base).ok_or("missing field base")?;
-                let InstKind::Index { base: array, .. } = indexed.kind else {
-                    return Err("vector field base is not an index".into());
-                };
-                let local =
-                    array_local_for_value(function, array).ok_or("missing field array local")?;
                 let (_, vars) = self
-                    .lookup(&Self::ir_local(local))
+                    .lookup(&Self::ir_local(*local))
                     .ok_or("missing field array")?;
                 let base = self.b.use_var(vars[0]);
                 let field_name = &self.p.types[*record].fields[*field].0;
                 let (component, _) = field_offset(self.p, *record, field_name)?;
-                let logical = self.cfg_trusted[&(loop_index, local)];
+                let logical = self.cfg_trusted[&(loop_index, *local)];
                 let data = self.b.ins().iadd_imm(base, 8);
                 let plane = self.b.ins().imul_imm(logical, (component * 8) as i64);
                 let lane = self.b.ins().imul_imm(index, 8);
@@ -971,14 +836,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                     .ins()
                     .load(types::F64X2, MemFlags::trusted(), address, 0)
             }
-            InstKind::Call {
-                callee: Callee::Builtin(name),
-                args,
-                ..
-            } => {
+            SimdExpr::Builtin { name, args } => {
                 let args = args
                     .iter()
-                    .map(|value| self.gen_cfg_vector_value(function, loop_index, *value, index))
+                    .map(|value| self.gen_simd_vector_expr(loop_index, value, index))
                     .collect::<Result<Vec<_>, _>>()?;
                 match name.as_str() {
                     "sqrt" => self.b.ins().sqrt(args[0]),
@@ -988,36 +849,31 @@ impl<'a, 'b> Gen<'a, 'b> {
                     _ => return Err("unsupported vector builtin".into()),
                 }
             }
-            _ => return Err("unsupported vector value".into()),
         })
     }
 
-    fn gen_cfg_scalar_value(
+    fn gen_simd_scalar_expr(
         &mut self,
-        function: &ir::Function,
         loop_index: usize,
-        value: ir::ValueId,
+        expr: &SimdExpr,
         index: Value,
     ) -> Result<Value, String> {
-        let (_, _, inst) =
-            cfg_value_definition(function, value).ok_or("missing scalar value definition")?;
-        Ok(match &inst.kind {
-            InstKind::Constant(Constant::F64(value)) => self.b.ins().f64const(*value),
-            InstKind::Constant(Constant::I64(value)) => self.b.ins().f64const(*value as f64),
-            InstKind::Load(local) if *local == self.cfg.loops[loop_index].induction => index,
-            InstKind::Load(local) => {
+        Ok(match expr {
+            SimdExpr::F64(value) => self.b.ins().f64const(*value),
+            SimdExpr::I64(value) => self.b.ins().f64const(*value as f64),
+            SimdExpr::Invariant(local) => {
                 let (_, vars) = self
                     .lookup(&Self::ir_local(*local))
                     .ok_or("missing scalar invariant")?;
                 self.b.use_var(vars[0])
             }
-            InstKind::Unary { value, .. } => {
-                let inner = self.gen_cfg_scalar_value(function, loop_index, *value, index)?;
+            SimdExpr::Neg(value) => {
+                let inner = self.gen_simd_scalar_expr(loop_index, value, index)?;
                 self.b.ins().fneg(inner)
             }
-            InstKind::Binary { op, lhs, rhs } => {
-                let lhs = self.gen_cfg_scalar_value(function, loop_index, *lhs, index)?;
-                let rhs = self.gen_cfg_scalar_value(function, loop_index, *rhs, index)?;
+            SimdExpr::Binary { op, lhs, rhs } => {
+                let lhs = self.gen_simd_scalar_expr(loop_index, lhs, index)?;
+                let rhs = self.gen_simd_scalar_expr(loop_index, rhs, index)?;
                 match op {
                     BinaryOp::Add => self.b.ins().fadd(lhs, rhs),
                     BinaryOp::Sub => self.b.ins().fsub(lhs, rhs),
@@ -1026,11 +882,9 @@ impl<'a, 'b> Gen<'a, 'b> {
                     _ => return Err("unsupported scalar binary".into()),
                 }
             }
-            InstKind::Index { base, .. } => {
-                let local =
-                    array_local_for_value(function, *base).ok_or("missing scalar array local")?;
+            SimdExpr::Array { local } => {
                 let (_, vars) = self
-                    .lookup(&Self::ir_local(local))
+                    .lookup(&Self::ir_local(*local))
                     .ok_or("missing scalar array")?;
                 let base = self.b.use_var(vars[0]);
                 let address = self.b.ins().imul_imm(index, 8);
@@ -1040,25 +894,18 @@ impl<'a, 'b> Gen<'a, 'b> {
                     .ins()
                     .load(types::F64, MemFlags::trusted(), address, 0)
             }
-            InstKind::Field {
-                base,
+            SimdExpr::Field {
+                local,
                 record,
                 field,
             } => {
-                let (_, _, indexed) =
-                    cfg_value_definition(function, *base).ok_or("missing scalar field base")?;
-                let InstKind::Index { base: array, .. } = indexed.kind else {
-                    return Err("scalar field base is not an index".into());
-                };
-                let local =
-                    array_local_for_value(function, array).ok_or("missing scalar field local")?;
                 let (_, vars) = self
-                    .lookup(&Self::ir_local(local))
+                    .lookup(&Self::ir_local(*local))
                     .ok_or("missing scalar field array")?;
                 let base = self.b.use_var(vars[0]);
                 let field_name = &self.p.types[*record].fields[*field].0;
                 let (component, _) = field_offset(self.p, *record, field_name)?;
-                let logical = self.cfg_trusted[&(loop_index, local)];
+                let logical = self.cfg_trusted[&(loop_index, *local)];
                 let data = self.b.ins().iadd_imm(base, 8);
                 let plane = self.b.ins().imul_imm(logical, (component * 8) as i64);
                 let lane = self.b.ins().imul_imm(index, 8);
@@ -1068,14 +915,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                     .ins()
                     .load(types::F64, MemFlags::trusted(), address, 0)
             }
-            InstKind::Call {
-                callee: Callee::Builtin(name),
-                args,
-                ..
-            } => {
+            SimdExpr::Builtin { name, args } => {
                 let args = args
                     .iter()
-                    .map(|value| self.gen_cfg_scalar_value(function, loop_index, *value, index))
+                    .map(|value| self.gen_simd_scalar_expr(loop_index, value, index))
                     .collect::<Result<Vec<_>, _>>()?;
                 match name.as_str() {
                     "sqrt" => self.b.ins().sqrt(args[0]),
@@ -1085,7 +928,6 @@ impl<'a, 'b> Gen<'a, 'b> {
                     _ => return Err("unsupported scalar builtin".into()),
                 }
             }
-            _ => return Err("unsupported scalar reduction value".into()),
         })
     }
 

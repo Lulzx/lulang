@@ -12,10 +12,10 @@ use crate::backend::abi::return_components;
 use crate::backend::layout::{
     array_component_offsets, components as layout_components, field_offset, Component,
 };
-use crate::backend::optimization::{analyze_cfg, CfgAnalysis};
+use crate::backend::optimization::{analyze_cfg, simd_reduction_plan, CfgAnalysis, SimdExpr};
 use crate::check::{resolve_type, Type as CType};
 use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 const RTOL: f64 = 9.094947017729282e-13; // 2^-40
@@ -269,6 +269,8 @@ struct Emit<'a> {
     in_main: bool,
     cfg: CfgAnalysis,
     cfg_trusted: HashMap<(usize, ir::LocalId), String>,
+    skipped_cfg_blocks: HashSet<ir::BlockId>,
+    simd: bool,
     location: (ir::BlockId, usize),
     externs: &'a [ir::ExternDef],
 }
@@ -465,6 +467,10 @@ fn build_output(
         in_main: false,
         cfg: CfgAnalysis::default(),
         cfg_trusted: HashMap::new(),
+        skipped_cfg_blocks: HashSet::new(),
+        simd: std::env::var("LU_SIMD")
+            .map(|value| value != "off" && value != "0")
+            .unwrap_or(true),
         location: (0, 0),
         externs: &ir.externs,
     };
@@ -498,10 +504,15 @@ fn build_output(
     };
     let _ = writeln!(module, "target triple = \"{}\"", triple);
     module.push_str(
-        "declare double @llvm.sqrt.f64(double)\ndeclare double @llvm.sin.f64(double)\n\
+        "declare double @llvm.sqrt.f64(double)\ndeclare <2 x double> @llvm.sqrt.v2f64(<2 x double>)\n\
+         declare double @llvm.sin.f64(double)\n\
          declare double @llvm.cos.f64(double)\ndeclare double @llvm.fabs.f64(double)\n\
+         declare <2 x double> @llvm.fabs.v2f64(<2 x double>)\n\
          declare double @llvm.floor.f64(double)\ndeclare double @llvm.minnum.f64(double, double)\n\
-         declare double @llvm.maxnum.f64(double, double)\ndeclare double @llvm.pow.f64(double, double)\n\
+         declare <2 x double> @llvm.minnum.v2f64(<2 x double>, <2 x double>)\n\
+         declare double @llvm.maxnum.f64(double, double)\n\
+         declare <2 x double> @llvm.maxnum.v2f64(<2 x double>, <2 x double>)\n\
+         declare double @llvm.pow.f64(double, double)\n\
          declare double @acos(double) #0\ndeclare double @atan2(double, double) #0\n\
          declare void @lu_print_f64(double)\ndeclare void @lu_print_i64(i64)\n\
          declare void @lu_print_bool(i64)\ndeclare void @lu_print_str(ptr, i64)\n\
@@ -631,7 +642,7 @@ fn build_output(
         let runtime_c = std::env::temp_dir().join(format!("lu_runtime_wasm_{}.c", pid));
         std::fs::write(&runtime_c, include_str!("lu_runtime.c")).map_err(|e| e.to_string())?;
         let mut zig = std::process::Command::new("zig");
-        zig.args(["cc", "-target", "wasm32-wasi", "-O3"]);
+        zig.args(["cc", "-target", "wasm32-wasi", "-O3", "-msimd128"]);
         if wasm_target == WasmTarget::Web {
             zig.args([
                 "-DLU_WEB",
@@ -860,20 +871,14 @@ impl<'a> Emit<'a> {
             self.declare_uninit(&Self::ir_local(id as u32), &local.ty)?;
         }
         for (local, regs) in incoming {
-            let mut value = EV {
+            let value = EV {
                 ty: function.locals[local as usize].ty.clone(),
                 regs,
             };
-            if !(decl.exported && matches!(&value.ty, CType::Arr(_))) {
-                for offset in array_component_offsets(self.p, &value.ty)? {
-                    let copy = self.t();
-                    self.line(format!(
-                        "{} = call ptr @lu_arr_clone(ptr {})",
-                        copy, value.regs[offset]
-                    ));
-                    value.regs[offset] = copy;
-                }
-            }
+            // Parameters borrow their incoming value. Ordinary parameters are
+            // immutable, and `inout` is exclusive; persistent stores already
+            // clone owning array components. This matches the JIT and avoids
+            // copying read-only arrays on every call.
             self.store_var(&Self::ir_local(local), &value)?;
         }
         self.emit_ir_body(function)?;
@@ -900,11 +905,19 @@ impl<'a> Emit<'a> {
     fn emit_ir_body(&mut self, function: &ir::Function) -> Result<(), String> {
         self.cfg = analyze_cfg(function);
         self.cfg_trusted.clear();
+        self.skipped_cfg_blocks.clear();
         let mut values: Vec<Option<EV>> = vec![None; function.values.len()];
         for (block_index, block) in function.blocks.iter().enumerate() {
             self.location.0 = block_index as ir::BlockId;
             if block_index != 0 {
                 self.label(&format!("B{}", block_index));
+            }
+            if self
+                .skipped_cfg_blocks
+                .contains(&(block_index as ir::BlockId))
+            {
+                self.line("unreachable".into());
+                continue;
             }
             self.terminated = false;
             for (instruction, inst) in block.instructions.iter().enumerate() {
@@ -914,10 +927,18 @@ impl<'a> Emit<'a> {
                     values[id as usize] = Some(value.ok_or("value instruction produced no value")?);
                 }
             }
+            let mut emitted_simd = false;
             for loop_index in 0..self.cfg.loops.len() {
                 if self.cfg.loops[loop_index].preheader == block_index as ir::BlockId {
                     self.hoist_cfg_checks(function, &values, loop_index)?;
+                    if self.simd && self.emit_cfg_simd(function, &values, loop_index)? {
+                        emitted_simd = true;
+                        break;
+                    }
                 }
+            }
+            if emitted_simd {
+                continue;
             }
             match block.terminator {
                 Terminator::Jump(target) => self.line(format!("br label %B{}", target)),
@@ -943,6 +964,402 @@ impl<'a> Emit<'a> {
             }
         }
         Ok(())
+    }
+
+    fn emit_cfg_simd(
+        &mut self,
+        function: &ir::Function,
+        values: &[Option<EV>],
+        loop_index: usize,
+    ) -> Result<bool, String> {
+        let Some(plan) = simd_reduction_plan(function, &self.cfg, loop_index, self.soa) else {
+            return Ok(false);
+        };
+        let loop_info = self.cfg.loops[loop_index].clone();
+        let lower = Self::ir_value(values, loop_info.lower)?.regs[0].clone();
+        let upper = Self::ir_value(values, loop_info.upper)?.regs[0].clone();
+
+        let index_ptr = self.t();
+        self.line(format!("{} = alloca i64", index_ptr));
+        self.line(format!("store i64 {}, ptr {}", lower, index_ptr));
+        let mut vector_ptrs = Vec::new();
+        for _ in 0..4 {
+            let ptr = self.t();
+            self.line(format!("{} = alloca <2 x double>", ptr));
+            self.line(format!("store <2 x double> zeroinitializer, ptr {}", ptr));
+            vector_ptrs.push(ptr);
+        }
+        let scalar_ptr = self.t();
+        self.line(format!("{} = alloca double", scalar_ptr));
+        self.line(format!("store double 0.0, ptr {}", scalar_ptr));
+
+        let vector_head = self.l();
+        let vector_body = self.l();
+        let scalar_head = self.l();
+        let scalar_body = self.l();
+        let finish = self.l();
+        self.line(format!("br label %{}", vector_head));
+
+        self.label(&vector_head);
+        let index = self.t();
+        self.line(format!("{} = load i64, ptr {}", index, index_ptr));
+        let after_batch = self.t();
+        self.line(format!("{} = add i64 {}, 8", after_batch, index));
+        let fits = self.t();
+        self.line(format!(
+            "{} = icmp sle i64 {}, {}",
+            fits, after_batch, upper
+        ));
+        self.line(format!(
+            "br i1 {}, label %{}, label %{}",
+            fits, vector_body, scalar_head
+        ));
+
+        self.label(&vector_body);
+        for (lane, accumulator) in vector_ptrs.iter().enumerate() {
+            let at = if lane == 0 {
+                index.clone()
+            } else {
+                let at = self.t();
+                self.line(format!("{} = add i64 {}, {}", at, index, lane * 2));
+                at
+            };
+            let item = self.emit_simd_vector_expr(loop_index, &plan.value, &at)?;
+            let current = self.t();
+            self.line(format!(
+                "{} = load <2 x double>, ptr {}",
+                current, accumulator
+            ));
+            let next = self.t();
+            self.line(format!(
+                "{} = fadd fast <2 x double> {}, {}",
+                next, current, item
+            ));
+            self.line(format!("store <2 x double> {}, ptr {}", next, accumulator));
+        }
+        self.line(format!("store i64 {}, ptr {}", after_batch, index_ptr));
+        self.line(format!("br label %{}", vector_head));
+
+        self.label(&scalar_head);
+        let scalar_index = self.t();
+        self.line(format!("{} = load i64, ptr {}", scalar_index, index_ptr));
+        let more = self.t();
+        self.line(format!(
+            "{} = icmp slt i64 {}, {}",
+            more, scalar_index, upper
+        ));
+        self.line(format!(
+            "br i1 {}, label %{}, label %{}",
+            more, scalar_body, finish
+        ));
+
+        self.label(&scalar_body);
+        let item = self.emit_simd_scalar_expr(loop_index, &plan.value, &scalar_index)?;
+        let current = self.t();
+        self.line(format!("{} = load double, ptr {}", current, scalar_ptr));
+        let next = self.t();
+        self.line(format!("{} = fadd fast double {}, {}", next, current, item));
+        self.line(format!("store double {}, ptr {}", next, scalar_ptr));
+        let next_index = self.t();
+        self.line(format!("{} = add i64 {}, 1", next_index, scalar_index));
+        self.line(format!("store i64 {}, ptr {}", next_index, index_ptr));
+        self.line(format!("br label %{}", scalar_head));
+
+        self.label(&finish);
+        let mut vectors = Vec::new();
+        for accumulator in &vector_ptrs {
+            let value = self.t();
+            self.line(format!(
+                "{} = load <2 x double>, ptr {}",
+                value, accumulator
+            ));
+            vectors.push(value);
+        }
+        let pair0 = self.t();
+        self.line(format!(
+            "{} = fadd fast <2 x double> {}, {}",
+            pair0, vectors[0], vectors[1]
+        ));
+        let pair1 = self.t();
+        self.line(format!(
+            "{} = fadd fast <2 x double> {}, {}",
+            pair1, vectors[2], vectors[3]
+        ));
+        let vector_total = self.t();
+        self.line(format!(
+            "{} = fadd fast <2 x double> {}, {}",
+            vector_total, pair0, pair1
+        ));
+        let lane0 = self.t();
+        self.line(format!(
+            "{} = extractelement <2 x double> {}, i64 0",
+            lane0, vector_total
+        ));
+        let lane1 = self.t();
+        self.line(format!(
+            "{} = extractelement <2 x double> {}, i64 1",
+            lane1, vector_total
+        ));
+        let lanes = self.t();
+        self.line(format!("{} = fadd fast double {}, {}", lanes, lane0, lane1));
+        let scalar = self.t();
+        self.line(format!("{} = load double, ptr {}", scalar, scalar_ptr));
+        let total = self.t();
+        self.line(format!(
+            "{} = fadd fast double {}, {}",
+            total, lanes, scalar
+        ));
+        self.store_var(
+            &Self::ir_local(plan.accumulator),
+            &EV {
+                ty: CType::F64,
+                regs: vec![total],
+            },
+        )?;
+        self.line(format!("br label %B{}", loop_info.exit));
+        self.skipped_cfg_blocks
+            .extend(loop_info.blocks.iter().copied());
+        Ok(true)
+    }
+
+    fn emit_simd_vector_expr(
+        &mut self,
+        loop_index: usize,
+        expr: &SimdExpr,
+        index: &str,
+    ) -> Result<String, String> {
+        Ok(match expr {
+            SimdExpr::F64(value) => {
+                let bits = format!("0x{:016X}", value.to_bits());
+                format!("<double {bits}, double {bits}>")
+            }
+            SimdExpr::I64(value) => {
+                let bits = format!("0x{:016X}", (*value as f64).to_bits());
+                format!("<double {bits}, double {bits}>")
+            }
+            SimdExpr::Invariant(local) => {
+                let scalar = self.load_var(&Self::ir_local(*local))?.regs[0].clone();
+                let inserted = self.t();
+                self.line(format!(
+                    "{} = insertelement <2 x double> poison, double {}, i64 0",
+                    inserted, scalar
+                ));
+                let splat = self.t();
+                self.line(format!(
+                    "{} = shufflevector <2 x double> {}, <2 x double> poison, <2 x i32> zeroinitializer",
+                    splat, inserted
+                ));
+                splat
+            }
+            SimdExpr::Neg(value) => {
+                let value = self.emit_simd_vector_expr(loop_index, value, index)?;
+                let out = self.t();
+                self.line(format!("{} = fneg fast <2 x double> {}", out, value));
+                out
+            }
+            SimdExpr::Binary { op, lhs, rhs } => {
+                let lhs = self.emit_simd_vector_expr(loop_index, lhs, index)?;
+                let rhs = self.emit_simd_vector_expr(loop_index, rhs, index)?;
+                let instruction = match op {
+                    BinaryOp::Add => "fadd",
+                    BinaryOp::Sub => "fsub",
+                    BinaryOp::Mul => "fmul",
+                    BinaryOp::Div => "fdiv",
+                    _ => return Err("unsupported SIMD binary operation".into()),
+                };
+                let out = self.t();
+                self.line(format!(
+                    "{} = {} fast <2 x double> {}, {}",
+                    out, instruction, lhs, rhs
+                ));
+                out
+            }
+            SimdExpr::Array { local } => {
+                let base = self.load_var(&Self::ir_local(*local))?.regs[0].clone();
+                self.emit_simd_vector_load(&base, index, None)?
+            }
+            SimdExpr::Field {
+                local,
+                record,
+                field,
+            } => {
+                let base = self.load_var(&Self::ir_local(*local))?.regs[0].clone();
+                let field_name = &self.p.types[*record].fields[*field].0;
+                let (component, _) = field_offset(self.p, *record, field_name)?;
+                let logical = self
+                    .cfg_trusted
+                    .get(&(loop_index, *local))
+                    .cloned()
+                    .ok_or("missing trusted SIMD field length")?;
+                self.emit_simd_vector_load(&base, index, Some((component, logical)))?
+            }
+            SimdExpr::Builtin { name, args } => {
+                let args = args
+                    .iter()
+                    .map(|arg| self.emit_simd_vector_expr(loop_index, arg, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let out = self.t();
+                match name.as_str() {
+                    "sqrt" => self.line(format!(
+                        "{} = call fast <2 x double> @llvm.sqrt.v2f64(<2 x double> {})",
+                        out, args[0]
+                    )),
+                    "abs" => self.line(format!(
+                        "{} = call fast <2 x double> @llvm.fabs.v2f64(<2 x double> {})",
+                        out, args[0]
+                    )),
+                    "min" => self.line(format!(
+                        "{} = call fast <2 x double> @llvm.minnum.v2f64(<2 x double> {}, <2 x double> {})",
+                        out, args[0], args[1]
+                    )),
+                    "max" => self.line(format!(
+                        "{} = call fast <2 x double> @llvm.maxnum.v2f64(<2 x double> {}, <2 x double> {})",
+                        out, args[0], args[1]
+                    )),
+                    _ => return Err("unsupported SIMD builtin".into()),
+                }
+                out
+            }
+        })
+    }
+
+    fn emit_simd_vector_load(
+        &mut self,
+        base: &str,
+        index: &str,
+        plane: Option<(usize, String)>,
+    ) -> Result<String, String> {
+        let data = self.t();
+        self.line(format!("{} = getelementptr i8, ptr {}, i64 8", data, base));
+        let at = if let Some((component, logical)) = plane {
+            let offset = self.t();
+            self.line(format!("{} = mul i64 {}, {}", offset, logical, component));
+            let at = self.t();
+            self.line(format!("{} = add i64 {}, {}", at, offset, index));
+            at
+        } else {
+            index.to_string()
+        };
+        let address = self.t();
+        self.line(format!(
+            "{} = getelementptr double, ptr {}, i64 {}",
+            address, data, at
+        ));
+        let value = self.t();
+        self.line(format!(
+            "{} = load <2 x double>, ptr {}, align 8",
+            value, address
+        ));
+        Ok(value)
+    }
+
+    fn emit_simd_scalar_expr(
+        &mut self,
+        loop_index: usize,
+        expr: &SimdExpr,
+        index: &str,
+    ) -> Result<String, String> {
+        Ok(match expr {
+            SimdExpr::F64(value) => format!("0x{:016X}", value.to_bits()),
+            SimdExpr::I64(value) => format!("0x{:016X}", (*value as f64).to_bits()),
+            SimdExpr::Invariant(local) => self.load_var(&Self::ir_local(*local))?.regs[0].clone(),
+            SimdExpr::Neg(value) => {
+                let value = self.emit_simd_scalar_expr(loop_index, value, index)?;
+                let out = self.t();
+                self.line(format!("{} = fneg fast double {}", out, value));
+                out
+            }
+            SimdExpr::Binary { op, lhs, rhs } => {
+                let lhs = self.emit_simd_scalar_expr(loop_index, lhs, index)?;
+                let rhs = self.emit_simd_scalar_expr(loop_index, rhs, index)?;
+                let instruction = match op {
+                    BinaryOp::Add => "fadd",
+                    BinaryOp::Sub => "fsub",
+                    BinaryOp::Mul => "fmul",
+                    BinaryOp::Div => "fdiv",
+                    _ => return Err("unsupported scalar SIMD binary operation".into()),
+                };
+                let out = self.t();
+                self.line(format!(
+                    "{} = {} fast double {}, {}",
+                    out, instruction, lhs, rhs
+                ));
+                out
+            }
+            SimdExpr::Array { local } => {
+                let base = self.load_var(&Self::ir_local(*local))?.regs[0].clone();
+                self.emit_simd_scalar_load(&base, index, None)?
+            }
+            SimdExpr::Field {
+                local,
+                record,
+                field,
+            } => {
+                let base = self.load_var(&Self::ir_local(*local))?.regs[0].clone();
+                let field_name = &self.p.types[*record].fields[*field].0;
+                let (component, _) = field_offset(self.p, *record, field_name)?;
+                let logical = self
+                    .cfg_trusted
+                    .get(&(loop_index, *local))
+                    .cloned()
+                    .ok_or("missing trusted scalar-tail field length")?;
+                self.emit_simd_scalar_load(&base, index, Some((component, logical)))?
+            }
+            SimdExpr::Builtin { name, args } => {
+                let args = args
+                    .iter()
+                    .map(|arg| self.emit_simd_scalar_expr(loop_index, arg, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let out = self.t();
+                match name.as_str() {
+                    "sqrt" => self.line(format!(
+                        "{} = call fast double @llvm.sqrt.f64(double {})",
+                        out, args[0]
+                    )),
+                    "abs" => self.line(format!(
+                        "{} = call fast double @llvm.fabs.f64(double {})",
+                        out, args[0]
+                    )),
+                    "min" => self.line(format!(
+                        "{} = call fast double @llvm.minnum.f64(double {}, double {})",
+                        out, args[0], args[1]
+                    )),
+                    "max" => self.line(format!(
+                        "{} = call fast double @llvm.maxnum.f64(double {}, double {})",
+                        out, args[0], args[1]
+                    )),
+                    _ => return Err("unsupported scalar-tail builtin".into()),
+                }
+                out
+            }
+        })
+    }
+
+    fn emit_simd_scalar_load(
+        &mut self,
+        base: &str,
+        index: &str,
+        plane: Option<(usize, String)>,
+    ) -> Result<String, String> {
+        let data = self.t();
+        self.line(format!("{} = getelementptr i8, ptr {}, i64 8", data, base));
+        let at = if let Some((component, logical)) = plane {
+            let offset = self.t();
+            self.line(format!("{} = mul i64 {}, {}", offset, logical, component));
+            let at = self.t();
+            self.line(format!("{} = add i64 {}, {}", at, offset, index));
+            at
+        } else {
+            index.to_string()
+        };
+        let address = self.t();
+        self.line(format!(
+            "{} = getelementptr double, ptr {}, i64 {}",
+            address, data, at
+        ));
+        let value = self.t();
+        self.line(format!("{} = load double, ptr {}, align 8", value, address));
+        Ok(value)
     }
 
     fn ir_value(values: &[Option<EV>], id: ir::ValueId) -> Result<&EV, String> {

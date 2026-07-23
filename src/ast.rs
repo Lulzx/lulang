@@ -80,6 +80,12 @@ pub struct EnumDecl {
     pub variants: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UseDecl {
+    pub module: String,
+    pub alias: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Program {
     pub exprs: Vec<Expr>,
@@ -88,10 +94,14 @@ pub struct Program {
     pub externs: Vec<ExternDecl>,
     pub types: Vec<TypeDecl>,
     pub enums: Vec<EnumDecl>,
+    pub uses: Vec<UseDecl>,
     pub props: Vec<FnDecl>,
     pub main: Option<Vec<StmtId>>,
     // glyph -> function name (operators are ordinary functions after parsing)
     pub infix_ops: HashMap<String, String>,
+    // glyph -> parser precedence, retained so imported modules seed parsing
+    // without copying their declarations into another module's AST.
+    pub infix_precedence: HashMap<String, u8>,
     // open glyph -> (close glyph, function name)
     pub circum_ops: HashMap<String, (String, String)>,
 }

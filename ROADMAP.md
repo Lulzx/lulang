@@ -209,13 +209,13 @@ conversion shims, and wider variadic patterns.
 The second backend target after the C ABI — not GPU — now ships as `lu build
 --target wasm32-wasi` and `--target wasm32-web`. WASI produces a command
 module; the web target produces a reactor plus a dependency-free loader with a
-minimal byte-output host. Both are executable integration-tested. Native
-dynamic externs fail early because they have no portable wasm meaning.
+minimal byte-output host. Both are executable integration-tested, including
+SIMD128 f64 reductions with odd-length scalar tails. Native dynamic externs
+fail early because they have no portable wasm meaning.
 
 This enables browser kernels, serverless, JS embedding, portable benchmark
 artifacts, and sandboxed plugins. The next playground increment is to package
-its editable evaluator with this target; native SIMD parity remains an
-explicit non-promise.
+its editable evaluator with this target.
 
 ### 9. Package manager — deliberately minimal
 
@@ -234,9 +234,12 @@ numerics = { git = "https://github.com/lulang/lu-numerics", rev = "..." }
 The foundation now provides `lu init`, `lu add --git --rev`, `lu fetch`, and
 package-default `run`, `check`, `build`, and `test`. `lu.lock` records the
 resolved commit and Git tree; checkouts are content-addressed by commit, and a
-moving branch does not change a locked build. Dependency `src/lib.lu` files
-are composed in graph order before the root and enter one whole-program
-frontend/optimizer. `use name` is checked against declared dependencies.
+moving branch does not change a locked build. Dependency source files are
+parsed once into independent arenas; `use name` imports a checked namespace,
+`use name as local` provides collision-free local aliases, and the module
+linker remaps qualified functions, records, enums, operators, expressions, and
+statements with length-delimited internal names before the existing
+whole-program frontend/optimizer.
 
 `bench` and `doc` are package-aware. There is intentionally no registry until
 roughly 20–30 meaningful packages exist.

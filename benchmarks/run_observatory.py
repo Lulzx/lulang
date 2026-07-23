@@ -205,7 +205,7 @@ def main() -> None:
         (
             "dot",
             "dot 2M×20",
-            "order-free sum; approximate FP; contiguous f64 vectors; whole process",
+            "order-free sum; approximate FP; immutable array parameters borrowed; contiguous f64 vectors; whole process",
         ),
         (
             "slerp",

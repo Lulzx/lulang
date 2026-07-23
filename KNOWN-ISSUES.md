@@ -91,12 +91,44 @@ loop invariant. After `rho` was inlined inside `sum`, the callee return slot
 was an ordinary local but was stored on every iteration. SIMD splatted its
 pre-loop zero value and skipped the scalar loop body.
 
-**Fix:** `cfg_vector_value` now proves that a loaded local has no stores or
-`inout` writes in the natural loop before treating it as invariant.
+**Fix:** the shared middle-end SIMD plan now proves that a loaded local has no
+stores or `inout` writes in the natural loop before treating it as invariant.
+JIT and LLVM AOT consume that proof directly; the self-host mirrors the same
+pure-expression rules.
 `simd_reductions_do_not_treat_inlined_return_slots_as_invariants` is the small
 four-tier regression. `tools/verify_corpus.py` additionally runs the full
 benchmark inputs across JIT, host AOT, and selfhost AOT and scaled forms
 through the reference interpreter.
+
+## 5. FIXED — selfhost persistent array values aliased
+
+**Symptom:** the observatory's selfhost dot binary was much faster than host
+AOT, but a direct value-semantics check printed `2 2` instead of `1 2`:
+
+```lu
+main {
+  var a = arr(1, 1)
+  var b = a
+  b[0] = 2
+  print(a[0], b[0])
+}
+```
+
+**Cause:** `selfhost/codegen.lu` stored array pointers directly for `let`,
+`var`, and whole-variable assignment. The generated program therefore shared
+mutable backing storage between language values. The dot benchmark happened
+to be read-only, so its numerical-answer check could not expose the violation.
+Host LLVM had the opposite problem: it cloned immutable array parameters on
+every call even though the checker makes them read-only.
+
+**Fix:** the selfhost emitter now recursively locates owning array components
+inside flattened records and clones them at persistent binding and assignment
+boundaries. Parameters borrow: ordinary parameters are immutable and `inout`
+parameters are exclusive. Host LLVM now follows the same calling convention,
+matching the JIT. A compiled regression covers direct arrays, record-contained
+arrays, and rebinding. Bootstrap again reaches a stage-1/2/3 byte-identical
+fixpoint. Fresh observatory medians put host and selfhost dot AOT at 16.102 ms
+and 15.746 ms respectively, replacing the unsound 64.053/13.677 comparison.
 
 ## Incident note: lost uncommitted jit.rs delta
 

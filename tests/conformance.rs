@@ -639,6 +639,24 @@ fn simd_reductions_do_not_treat_inlined_return_slots_as_invariants() {
 }
 
 #[test]
+fn simd_reductions_handle_odd_lengths_with_a_scalar_tail() {
+    assert_success(
+        "simd_odd_length_tail",
+        "main {\n\
+           let n = 11\n\
+           var a = arr(n, 0.0)\n\
+           var b = arr(n, 0.0)\n\
+           for i in 0..n {\n\
+             a[i] = float(i)\n\
+             b[i] = float(i + 1)\n\
+           }\n\
+           print(sum(i in 0..n) a[i] * b[i])\n\
+         }\n",
+        b"440\n",
+    );
+}
+
+#[test]
 fn unresolved_ffi_symbols_fail_cleanly_in_every_tier() {
     let source = "extern fn lulang_symbol_that_does_not_exist_7f42(x: i64): i64\n\
          main { print(lulang_symbol_that_does_not_exist_7f42(1)) }\n";

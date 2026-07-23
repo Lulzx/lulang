@@ -33,6 +33,194 @@ pub struct Reduction {
     pub value: ValueId,
 }
 
+/// Target-independent expression tree for an automatically vectorizable
+/// order-free reduction. Backends choose their native lane width, but consume
+/// the same legality proof and scalar-tail expression.
+#[derive(Clone, Debug)]
+pub enum SimdExpr {
+    F64(f64),
+    I64(i64),
+    Invariant(LocalId),
+    Neg(Box<SimdExpr>),
+    Binary {
+        op: BinaryOp,
+        lhs: Box<SimdExpr>,
+        rhs: Box<SimdExpr>,
+    },
+    Array {
+        local: LocalId,
+    },
+    Field {
+        local: LocalId,
+        record: usize,
+        field: usize,
+    },
+    Builtin {
+        name: String,
+        args: Vec<SimdExpr>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct SimdReductionPlan {
+    pub accumulator: LocalId,
+    pub value: SimdExpr,
+}
+
+/// Proves that a canonical `sum` loop can be evaluated lane-wise. This proof
+/// lives in the shared middle-end so JIT, LLVM, selfhost parity tests, and
+/// future WASM lowering agree on what may be vectorized.
+pub fn simd_reduction_plan(
+    function: &Function,
+    analysis: &CfgAnalysis,
+    loop_index: usize,
+    soa: bool,
+) -> Option<SimdReductionPlan> {
+    let loop_info = analysis.loops.get(loop_index)?;
+    let reduction = loop_info.reduction.as_ref()?;
+    if function.locals[reduction.accumulator as usize].ty != Type::F64 {
+        return None;
+    }
+    let value = simd_expr(function, analysis, loop_index, reduction.value, soa)?;
+    Some(SimdReductionPlan {
+        accumulator: reduction.accumulator,
+        value,
+    })
+}
+
+fn simd_expr(
+    function: &Function,
+    analysis: &CfgAnalysis,
+    loop_index: usize,
+    value: ValueId,
+    soa: bool,
+) -> Option<SimdExpr> {
+    let (block, instruction, inst) = cfg_value_definition(function, value)?;
+    Some(match &inst.kind {
+        InstKind::Constant(Constant::F64(value)) => SimdExpr::F64(*value),
+        InstKind::Constant(Constant::I64(value)) => SimdExpr::I64(*value),
+        InstKind::Load(local)
+            if *local != analysis.loops[loop_index].induction
+                && function.locals[*local as usize].ty == Type::F64
+                && cfg_loop_invariant_local(function, analysis, loop_index, *local) =>
+        {
+            SimdExpr::Invariant(*local)
+        }
+        InstKind::Unary {
+            op: crate::ir::UnaryOp::Neg,
+            value,
+        } => SimdExpr::Neg(Box::new(simd_expr(
+            function, analysis, loop_index, *value, soa,
+        )?)),
+        InstKind::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+            ) =>
+        {
+            SimdExpr::Binary {
+                op: *op,
+                lhs: Box::new(simd_expr(function, analysis, loop_index, *lhs, soa)?),
+                rhs: Box::new(simd_expr(function, analysis, loop_index, *rhs, soa)?),
+            }
+        }
+        InstKind::Index { base, index }
+            if function.values[value as usize] == Type::F64
+                && analysis.trusted_accesses.get(&(block, instruction)) == Some(&loop_index)
+                && cfg_value_is_load(function, *index, analysis.loops[loop_index].induction) =>
+        {
+            SimdExpr::Array {
+                local: array_local_for_value(function, *base)?,
+            }
+        }
+        InstKind::Field {
+            base,
+            record,
+            field,
+        } if soa => {
+            let (base_block, base_instruction, indexed) = cfg_value_definition(function, *base)?;
+            let InstKind::Index { base: array, index } = indexed.kind else {
+                return None;
+            };
+            if function.values[value as usize] != Type::F64
+                || analysis
+                    .trusted_accesses
+                    .get(&(base_block, base_instruction))
+                    != Some(&loop_index)
+                || !cfg_value_is_load(function, index, analysis.loops[loop_index].induction)
+            {
+                return None;
+            }
+            SimdExpr::Field {
+                local: array_local_for_value(function, array)?,
+                record: *record,
+                field: *field,
+            }
+        }
+        InstKind::Call {
+            callee: Callee::Builtin(name),
+            args,
+            ..
+        } if matches!(name.as_str(), "sqrt" | "abs" | "min" | "max") => SimdExpr::Builtin {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|value| simd_expr(function, analysis, loop_index, *value, soa))
+                .collect::<Option<Vec<_>>>()?,
+        },
+        _ => return None,
+    })
+}
+
+fn cfg_loop_invariant_local(
+    function: &Function,
+    analysis: &CfgAnalysis,
+    loop_index: usize,
+    local: LocalId,
+) -> bool {
+    analysis.loops[loop_index].blocks.iter().all(|block| {
+        function.blocks[*block as usize]
+            .instructions
+            .iter()
+            .all(|instruction| match &instruction.kind {
+                InstKind::Store { local: target, .. } => *target != local,
+                InstKind::Call { inout, .. } => {
+                    !inout.iter().flatten().any(|target| *target == local)
+                }
+                _ => true,
+            })
+    })
+}
+
+fn cfg_value_definition(function: &Function, value: ValueId) -> Option<(BlockId, usize, &Inst)> {
+    function
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(block, contents)| {
+            contents
+                .instructions
+                .iter()
+                .enumerate()
+                .find(|(_, inst)| inst.result == Some(value))
+                .map(|(instruction, inst)| (block as BlockId, instruction, inst))
+        })
+}
+
+fn cfg_value_is_load(function: &Function, value: ValueId, local: LocalId) -> bool {
+    cfg_value_definition(function, value)
+        .is_some_and(|(_, _, inst)| matches!(inst.kind, InstKind::Load(id) if id == local))
+}
+
+pub(crate) fn array_local_for_value(function: &Function, value: ValueId) -> Option<LocalId> {
+    cfg_value_definition(function, value)
+        .and_then(|(_, _, inst)| match inst.kind {
+            InstKind::Load(local) => Some(local),
+            _ => None,
+        })
+        .filter(|local| matches!(function.locals[*local as usize].ty, Type::Arr(_)))
+}
+
 /// Analyze natural loops and the canonical induction shape produced by the
 /// frontend.  The analysis deliberately checks definitions, mutations and
 /// dominance instead of relying on local names from the source AST.
@@ -1029,6 +1217,15 @@ mod cfg_tests {
         assert!(analysis.loops[0].reduction.is_some(), "{analysis:#?}");
         assert_eq!(analysis.loops[0].arrays.len(), 1, "{analysis:#?}");
         assert!(!analysis.trusted_accesses.is_empty(), "{analysis:#?}");
+        let plan = simd_reduction_plan(&function, &analysis, 0, true)
+            .expect("the shared middle-end should prove this reduction");
+        assert!(matches!(
+            plan.value,
+            SimdExpr::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
     }
 
     #[test]
