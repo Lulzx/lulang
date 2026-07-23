@@ -170,6 +170,7 @@ pub struct ExternDef {
 pub struct RecordDef {
     pub name: String,
     pub fields: Vec<(String, Type)>,
+    pub c_layout: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +278,7 @@ impl LoweredProgram {
             .map(|record| {
                 Ok(RecordDef {
                     name: record.name.clone(),
+                    c_layout: record.c_layout,
                     fields: record
                         .fields
                         .iter()

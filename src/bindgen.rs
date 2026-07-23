@@ -48,7 +48,7 @@ struct Header {
     enums: Vec<CEnum>,
     functions: Vec<CFunction>,
     aliases: BTreeMap<String, CType>,
-    structs: BTreeSet<String>,
+    structs: BTreeMap<String, Option<Vec<CParam>>>,
     warnings: Vec<String>,
 }
 
@@ -71,13 +71,37 @@ pub fn generate(header: &str, input: &Path, library: &str) -> Result<Generated, 
     );
     let _ = writeln!(source, "// C library: {}\n", library);
 
-    for structure in &parsed.structs {
-        let _ = writeln!(
-            source,
-            "// Opaque C aggregate; usable only behind c_ptr[{}].",
-            structure
-        );
-        let _ = writeln!(source, "type {} {{}}\n", structure);
+    for (structure, fields) in &parsed.structs {
+        let rendered_fields = fields.as_ref().and_then(|fields| {
+            fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    map_c_layout_field(&field.ty, &parsed.aliases)
+                        .map(|ty| format!("  {}: {},", sanitize_identifier(&field.name, index), ty))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        });
+        if let Some(fields) = rendered_fields {
+            let _ = writeln!(source, "@c_layout type {} {{", structure);
+            for field in fields {
+                let _ = writeln!(source, "{field}");
+            }
+            source.push_str("}\n\n");
+        } else {
+            let _ = writeln!(
+                source,
+                "// Opaque C aggregate; usable only behind c_ptr[{}].",
+                structure
+            );
+            let _ = writeln!(source, "type {} {{}}\n", structure);
+            if fields.is_some() {
+                parsed.warnings.push(format!(
+                    "struct `{structure}` has fields without exact @c_layout representations and remains opaque"
+                ));
+            }
+        }
     }
 
     for declaration in &parsed.enums {
@@ -262,6 +286,32 @@ fn map_type(
         }
         base => Err(format!(
             "C type `{base}` has no exact boundary representation"
+        )),
+    }
+}
+
+fn map_c_layout_field(ty: &CType, aliases: &BTreeMap<String, CType>) -> Result<String, String> {
+    let resolved = resolve_alias(ty, aliases)?;
+    if resolved.function_pointer {
+        return Err("function pointer field".into());
+    }
+    if resolved.pointers != 0 {
+        return map_type(&resolved, aliases, false);
+    }
+    match canonical_base(&resolved.base).as_str() {
+        "double" => Ok("f64".into()),
+        "float" => Ok("f32".into()),
+        "int64_t" | "signed long" | "signed long int" | "long" | "long int" | "intptr_t"
+        | "ptrdiff_t" => Ok("i64".into()),
+        base if base.starts_with("struct ") => base
+            .split_whitespace()
+            .nth(1)
+            .filter(|name| valid_identifier(name))
+            .map(String::from)
+            .ok_or_else(|| "unnamed struct field".into()),
+        _ => Err(format!(
+            "C field type `{}` has no exact layout representation",
+            resolved.base
         )),
     }
 }
@@ -640,17 +690,53 @@ fn parse_enum(tokens: &[String], alias: Option<String>) -> Option<CEnum> {
 }
 
 fn index_struct(tokens: &[String], header: &mut Header) {
-    if let Some(name) = tokens.get(1).filter(|token| valid_identifier(token)) {
-        header.structs.insert(name.clone());
-    }
-    if let Some(close) = tokens.iter().rposition(|token| token == "}") {
-        if let Some(alias) = tokens
-            .get(close + 1)
-            .filter(|token| valid_identifier(token))
-        {
-            header.structs.insert(alias.clone());
+    let tag = tokens
+        .get(1)
+        .filter(|token| valid_identifier(token))
+        .cloned();
+    let open = tokens.iter().position(|token| token == "{");
+    let close = tokens.iter().rposition(|token| token == "}");
+    let alias = close
+        .and_then(|close| tokens.get(close + 1))
+        .filter(|token| valid_identifier(token))
+        .cloned();
+    let Some(name) = tag.or(alias) else {
+        return;
+    };
+    let fields = match (tokens.first().map(String::as_str), open, close) {
+        (Some("struct"), Some(open), Some(close)) if open < close => {
+            let mut fields = Vec::new();
+            let mut start = open + 1;
+            let mut valid = true;
+            for end in open + 1..=close {
+                if end == close || tokens[end] == ";" {
+                    let declaration = &tokens[start..end];
+                    if !declaration.is_empty() {
+                        if declaration.iter().any(|token| token == "[")
+                            || declaration.iter().any(|token| token == ":")
+                            || declaration.iter().any(|token| token == ",")
+                        {
+                            valid = false;
+                            break;
+                        }
+                        fields.push(parse_parameter(declaration, fields.len()));
+                    }
+                    start = end + 1;
+                }
+            }
+            (valid && !fields.is_empty()).then_some(fields)
         }
-    }
+        _ => None,
+    };
+    header
+        .structs
+        .entry(name)
+        .and_modify(|existing| {
+            if fields.is_some() {
+                *existing = fields.clone();
+            }
+        })
+        .or_insert(fields);
 }
 
 fn parse_function(tokens: &[String]) -> Option<CFunction> {

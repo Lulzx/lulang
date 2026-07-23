@@ -38,6 +38,8 @@ fn bindgen_generates_checker_valid_imports_and_reports_deferred_types() {
     assert!(source.contains("enum mini_state"));
     assert!(source.contains("fn MINI_LIMIT(): i64"));
     assert!(source.contains("fn MINI_RATE(): f64"));
+    assert!(source.contains("@c_layout type mini_vector"));
+    assert!(source.contains("x: f64"));
     assert!(source.contains("extern \"m\" fn hypot(x: f64, y: f64): f64"));
     assert!(source.contains("extern \"m\" fn clamp_index(value: i64, low: i64, high: i64): i64"));
     assert!(!source.contains("extern \"m\" fn narrow_float"));

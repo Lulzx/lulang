@@ -988,6 +988,14 @@ fn parse_top(inout p: P) {
   var going = true
   while going and p.err == 0 {
     skipnl(p)
+    if cur_is_sym(p, "@") {
+      p.pos = p.pos + 1
+      if cur_is_kw(p, "c_layout") {
+        p.pos = p.pos + 1
+      } else {
+        fail(p, "c_layout")
+      }
+    }
     if p.toks[p.pos].kind == Kind.KEof {
       going = false
     } else {

@@ -104,7 +104,11 @@ fn exported_opaque_pointer_uses_void_pointer_header_abi() {
     let source = directory.join("pointer_echo.lu");
     std::fs::write(
         &source,
-        "export fn pointer_echo(pointer: c_ptr[()]): c_ptr[()] {\n  return pointer\n}\n",
+        "@c_layout type Vec2 { x: f32, y: f32 }\n\
+         @c_layout type Packet { position: Vec2, tag: i64 }\n\
+         export fn pointer_echo(pointer: c_ptr[Packet]): c_ptr[Packet] {\n\
+           return pointer\n\
+         }\n",
     )
     .expect("write source");
     let base = directory.join("pointer_echo");
@@ -115,11 +119,16 @@ fn exported_opaque_pointer_uses_void_pointer_header_abi() {
         .arg(&source));
 
     let header = std::fs::read_to_string(directory.join("pointer_echo.h")).expect("read header");
+    assert!(header.contains("typedef struct Vec2 {\n    float x;\n    float y;\n} Vec2;"));
+    assert!(
+        header.contains("typedef struct Packet {\n    Vec2 position;\n    int64_t tag;\n} Packet;")
+    );
     assert!(header.contains("void * pointer_echo(void * pointer);"));
     let manifest =
         std::fs::read_to_string(directory.join("pointer_echo.json")).expect("read manifest");
-    assert!(manifest.contains("\"type\": \"c_ptr[()]\""));
-    assert!(manifest.contains("\"ret\": \"c_ptr[()]\""));
+    assert!(manifest.contains("\"Vec2\": [{\"name\": \"x\", \"type\": \"f32\"}"));
+    assert!(manifest.contains("\"type\": \"c_ptr[Packet]\""));
+    assert!(manifest.contains("\"ret\": \"c_ptr[Packet]\""));
 
     let _ = std::fs::remove_dir_all(directory);
 }

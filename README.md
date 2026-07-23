@@ -103,7 +103,9 @@ handles: they may cross an `extern` boundary, be stored, passed, and compared,
 but cannot be dereferenced or used to expose C layout. Declarations involving
 narrower C integers, `float`, C `bool`, callbacks, or by-value aggregates are
 parsed but reported as explicit diagnostics. They are not silently widened or
-reinterpreted. Fixed-layout declarations require the future `@c_layout` type.
+reinterpreted. Exact C structs are emitted as `@c_layout` records and included
+in generated headers/manifests; passing them by value remains deliberately
+disabled until each target's aggregate calling convention is implemented.
 
 ### Editor tooling
 

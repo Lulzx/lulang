@@ -188,6 +188,15 @@ does not give lulang access to C layout. The JIT and AOT represent `c_ptr[T]`
 as a native pointer. The interpreters carry the same pointer bits through the
 FFI bridge without inspecting the pointee.
 
+`@c_layout type Name { ... }` opts a record into stable C field order and
+layout metadata. Its fields are restricted to exact-width boundary scalars,
+`c_ptr[T]`, and nested `@c_layout` records; empty records, layout cycles,
+strings, and arrays are rejected. The annotation does not change ordinary
+lulang records, which retain compiler-owned layout. C headers and ABI
+manifests describe annotated records. By-value aggregate calls remain rejected
+until the backend implements the target C ABI's aggregate classification;
+using an annotated record behind `c_ptr[Name]` is already supported.
+
 ---
 
 # v0.2 additions (M6 — the self-hosting surface)

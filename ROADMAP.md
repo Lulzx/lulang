@@ -145,8 +145,10 @@ explicit untyped handle `c_ptr[()]`; no C layout is inferred. Narrower
 integers, `float`, C `bool`, callbacks, and by-value aggregates remain
 diagnostics instead of being unsafely widened. A macOS `math.h` preflight
 currently produces 41 checker-valid imports. The remaining work for the full
-promised subset is `@c_layout` records and conversion shims for C-width
-scalars, followed by callbacks.
+promised subset is now split cleanly: bindgen emits validated `@c_layout`
+record declarations plus header/manifest layout metadata, while by-value
+aggregate calls stay disabled until target ABI classification lands.
+Conversion shims for C-width scalars follow, then callbacks.
 
 ### 8. WASM target
 

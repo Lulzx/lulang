@@ -70,6 +70,32 @@ fn duplicate_record_fields_are_rejected_by_the_checker() {
 }
 
 #[test]
+fn c_layout_is_explicit_and_rejects_non_boundary_fields() {
+    assert_modes(
+        "@c_layout type Pair { x: i64, y: f64 }\n\
+         main {\n let p = Pair { x: 7, y: 2.5 }\n print(p.x, p.y)\n }\n",
+        b"7 2.5\n",
+    );
+
+    for source in [
+        "@c_layout type Empty {}\nmain {}\n",
+        "@c_layout type Bad { values: [i64] }\nmain {}\n",
+        "@c_layout type Cycle { next: Cycle }\nmain {}\n",
+    ] {
+        let output = run("check", source);
+        assert!(
+            !output.status.success(),
+            "accepted invalid @c_layout record: {source}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("`@c_layout`"),
+            "unexpected error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn array_assignment_has_unobservable_aliasing() {
     assert_modes(
         "main {\n var a = arr(2, 0)\n let snapshot = a\n a[0] = 9\n print(a[0], snapshot[0])\n}\n",
