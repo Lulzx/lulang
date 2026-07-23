@@ -27,12 +27,49 @@ never cross the boundary. The invariant is exercised by
 | 4 | LSP and VS Code v0.1 | Tree-sitter grammar, VS Code grammar/snippets/extension, `lu lsp`, typed hover/completion, function/operator definitions, format-on-save, property lenses and inline counterexamples; `tests/lsp.rs` plus `tools/tests/test_lulang_lsp.py`. |
 | 5 | `lu-numerics` v0.1 | 26 kernels, 11 law groups, per-function benchmark registry, C++/NumPy/Julia twins, generated docs and all-tier/generated-Python execution; enforced by `tests/numerics.rs` and `lib/lu-numerics/test_numerics.py`. |
 | 6 | Public playground v0.1 | Local browser interpreter with editable examples and no server execution in `playground/app/playground.tsx`; rendered-route tests in `playground/tests`; production site at `lulang.lulzx.space`. |
-| 7 | `lu bindgen` foundation | Dependency-free C parser, typedefs/macros/enums/functions, opaque pointers, direct portable homogeneous records, exact-layout metadata and generated narrow/non-portable aggregate adapters in `src/bindgen.rs`; checker-valid and real-library integration in `tests/bindgen.rs`. Unsupported unions, bitfields, variadics, callbacks, and aggregate returns are explicit diagnostics. |
+| 7 | `lu bindgen` expanded importer | Dependency-free C parser, typedefs/macros/enums/functions, opaque struct/union pointers, typed callbacks, direct portable homogeneous records and returns, bitfield adapters, flat scalar aggregate-result adapters, and explicit zero-to-three-value i64/f64 variadic wrappers in `src/bindgen.rs`; checker-valid and four-tier real-library integration in `tests/bindgen.rs`. Unsupported by-value unions, nested result aggregates, shimmed callback combinations, and wider variadics remain explicit diagnostics. |
 | 8 | WASI and web targets | `lu build --target wasm32-wasi|wasm32-web`, web loader, executable parity and native-extern rejection in `tests/wasm.rs`. |
 | 9 | Git package foundation | `lu init/add/fetch`, immutable commit/tree lockfile, content-addressed cache, dependency graph composition and package-default commands in `src/package.rs`; moving-revision and whole-program verification in `tests/package.rs`. A registry is an explicit non-goal before a real package corpus exists. |
 | 10 | `luphysics` showcase | Value vectors/bodies, N-body gravity, integration, impulses, conservation laws, C SoA export, WASI and raylib adapter under `lib/luphysics`; all-tier, property, C, WASM and notebook checks in `tests/luphysics.rs`. |
 | 11 | Executable docs and observatory | Package-aware `lu doc`/`lu bench` in `src/{docgen,benchmark}.rs`; laws, status, source, C ABI, history and LLVM verified by `tests/docs.rs`; reproducible cross-language runner/workflow under `benchmarks/` and `.github/workflows/observatory.yml`; public `/observatory` route. |
 | 12 | Forward autodiff | `lib/ludiff` implements dual numbers and operators as ordinary library code with nine laws; interpreter/JIT/AOT/selfhost/WASI/C coverage in `tests/ludiff.rs`. |
+
+## Post-C-ABI ecosystem evidence
+
+- ABI release gating ships as `lu abi check old.json new.json`; `src/abi.rs`
+  parses versioned manifests and `tests/abi.rs` covers compatible additions,
+  binary breaks, malformed input, and future manifest versions.
+- Writable borrowed buffers ship as `c_mut_slice[i64|f64]` across the checker,
+  all four execution tiers, generated C/Python interfaces, bindgen, editor
+  grammars, and the conformance/export/regression/selfhost suites.
+- `lu sdk rust|cpp|julia|node|go|swift|r` consumes the same ABI manifest.
+  `src/sdk.rs` and `src/sdk_extra.rs` generate host-owned string returns,
+  bool/error conversion, records, callbacks, borrowed buffers, and owning
+  results. `tests/sdk.rs` runs Rust, C++, Go, and Swift callers against a real
+  library, runs Julia/R when installed, and syntax-checks the dependency-based
+  Node package without a network install.
+- `lib/luimage` is the visible-output embedding proof: it renders Mandelbrot
+  pixels directly into C-owned memory, writes a validated PGM preview, and
+  ships image laws, docs metadata, interpreter/JIT/AOT/selfhost parity, generated
+  headers/manifests, and the end-to-end `tests/luimage.rs` gate.
+- Portable homogeneous one/two-field `@c_layout` returns execute from C into
+  all four tiers and from generated Lulang libraries into C, Rust, C++, Julia
+  (when installed), and Python. The import/export paths are exercised in
+  `tests/conformance.rs`, `tests/ffi_export.rs`, and `tests/sdk.rs`.
+- Exported scalar arrays use opaque owning handles with typed data/length and
+  release functions. Host and selfhost wrappers transfer the allocation
+  without an element copy; C, Rust RAII, C++ RAII, Julia finalization, and
+  `pylulang.OwnedArray` consumers are covered by `tests/ffi_export.rs`,
+  `tests/sdk.rs`, and the Python package tests.
+- The standard homogeneous `status: i64, value: i64` result ABI emits
+  `LU_STATUS_OK` for C and maps into Rust/C++ result values plus Julia/Python
+  errors. Success and failure paths execute through host and selfhost exports,
+  generated SDK tests, and `pylulang`.
+- Typed `c_fn[(...) -> T]` values preserve exact callback signatures across
+  imports, exports, generated headers, Rust/C++/Julia SDKs, and Python.
+  `tests/conformance.rs` has C invoke transported callbacks in every tier;
+  `tests/ffi_export.rs`, `tests/sdk.rs`, and the Python package tests cover
+  generated-library callers and callback lifetime.
 
 ## M8 plan evidence
 
@@ -48,6 +85,13 @@ never cross the boundary. The invariant is exercised by
   index and import the read-only view, export wrappers pass `(const T*, len)`
   without `lu_arr_new_raw`, C callers use generated const-pointer headers,
   and `pylulang` accepts read-only contiguous NumPy buffers.
+- Borrowed `c_mut_slice[i64|f64]` is a shipped compatible extension: the
+  checker enforces mutable-variable and exclusivity rules; interpreter, JIT,
+  AOT, and self-hosted calls preserve array snapshots; C imports copy writes
+  back where a tier marshals storage; generated exports and `pylulang` mutate
+  caller-owned buffers without `lu_arr_new_raw`; headers use non-const
+  pointers; and bindgen recognizes conventional mutable pointer-plus-length
+  pairs.
 - Portable by-value `@c_layout` parameters are a shipped compatible extension:
   homogeneous two-`f64` and two-`i64` records execute in all four tiers,
   generated exports are called from C without adapters, bindgen removes the

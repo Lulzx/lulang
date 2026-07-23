@@ -40,6 +40,17 @@ than exposing internals.
 | 11 | `lu doc` + benchmark observatory — **shipped** | High credibility | Medium |
 | 12 | Autodiff (`ludiff`, forward-mode duals first) — **shipped** | High technical value | High |
 
+### Post-C-ABI ecosystem program
+
+The post-C-ABI adoption program is shipped: ABI compatibility checking,
+exclusive writable borrowed slices, generated Rust/C++/Julia/Node/Go/Swift/R
+SDKs, the visible-output `luimage` package, portable and adapted aggregate
+returns, zero-copy owning scalar-array results, the portable status/value
+error ABI, typed C function pointers, and expanded bindgen coverage. Real Go
+and Swift callers join the existing Rust/C++/Python tests; Julia and R execute
+when installed, while Node is dependency-free syntax checked in the release
+suite.
+
 ### 1–2. C ABI: `extern` + `export` (milestone M8)
 
 Both directions, landed together with generated artifacts:
@@ -78,11 +89,19 @@ records have C layout. Direct `f32` parameters and returns now work in all
 four tiers and bindgen emits C `float` directly. Borrowed
 `c_slice[i64|f64]` parameters are read-only `(const T*, length)` views in all
 four tiers; exported kernels and `pylulang` consume C-contiguous buffers
-without an array copy. Portable by-value `@c_layout` parameters—flat, one or
-two homogeneous 64-bit fields—now work without adapters in every tier,
-generated C libraries, bindgen, and `pylulang`. Remaining follow-ups: broader
-aggregate classification, callbacks, and owning zero-copy array export
-handles.
+without an array copy. Borrowed `c_mut_slice[i64|f64]` parameters are
+exclusive writable `(T*, length)` views; they preserve compiler-owned value
+semantics and mutate exported C/NumPy buffers without a boundary allocation or
+copy. Bindgen recognizes conventional const/mutable pointer-plus-length pairs.
+Portable by-value `@c_layout` parameters and returns—flat, one or two
+homogeneous 64-bit fields—now work without adapters in every tier, generated C
+libraries and host SDKs; parameters also flow through bindgen and `pylulang`.
+Typed `c_fn[(...) -> T]` values now transport C callbacks through every tier,
+generated libraries, host SDKs, and `pylulang`; exported scalar Lulang
+functions can be installed and invoked by C. Platform-specific mixed/wide
+aggregate classification stays outside the stable direct ABI by design;
+bindgen's generated scalar/result adapters cover those declarations without
+duplicating target ABI rules in every backend.
 
 ### 3. `pylulang`
 
@@ -159,7 +178,7 @@ counterexamples, and numerical-instability demos.
 Exporting lulang is useful; **calling the existing world is dramatically more
 useful**. `lu bindgen fftw3.h -o fftw3.lu` over a deliberately small C subset
 (functions, primitives, pointers, fixed-layout structs, enums, constants,
-opaque handles; callbacks later). Demonstration targets in order: BLAS, FFTW,
+opaque handles, and callbacks). Demonstration targets in order: BLAS, FFTW,
 SQLite, raylib, libpng, SuiteSparse. BLAS/FFTW reinforce the numerics
 identity; raylib produces visible demos.
 
@@ -178,8 +197,12 @@ externs use only the proven scalar boundary ABI. Exact records carry
 never false layout claims. The adapters run through all four tiers and avoid
 duplicating platform aggregate classification in each backend. A macOS
 `math.h` preflight currently produces 41 direct checker-valid imports.
-Remaining explicit diagnostics are aggregate returns, unions, bitfields,
-variadics, and callbacks.
+Callback typedefs map to typed `c_fn` values; unions are typed opaque pointer
+targets; bitfield parameters and flat scalar aggregate returns use generated
+adapters. Variadic functions produce explicit zero-to-three-value i64/f64
+pattern wrappers. Remaining explicit diagnostics cover by-value unions,
+nested aggregate-result adapters, callback signatures that also require
+conversion shims, and wider variadic patterns.
 
 ### 8. WASM target
 
@@ -228,9 +251,11 @@ kernel, and an optional raylib visualizer with an explicit C boundary adapter.
 Its integration test exercises interpreter, JIT, AOT, properties, WASM
 production, generated headers, and a real C caller.
 
-Other candidates as the ecosystem matures: `luspice` (circuit simulation),
-`lurocket` (orbital mechanics), `luquant` (Monte Carlo pricing), and `luimage`
-(kernels with visible output).
+`lib/luimage` now fills the visible-output role with a Mandelbrot renderer,
+exposure/inversion kernels, image laws, and a real C host that writes a PGM
+file from a caller-owned pixel plane. Other candidates as the ecosystem
+matures: `luspice` (circuit simulation), `lurocket` (orbital mechanics), and
+`luquant` (Monte Carlo pricing).
 
 ### 11. `lu doc` + benchmark observatory
 

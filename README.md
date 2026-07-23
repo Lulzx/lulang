@@ -58,6 +58,9 @@ cargo build --release
 ./target/release/lu build --target wasm32-web corpus/slerp.lu
 ./target/release/lu build --lib -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu build --lib --shared -o kernel corpus/kernel_saxpy.lu
+./target/release/lu abi check released/kernel.json kernel.json
+./target/release/lu sdk rust -o kernel.rs kernel.json
+./target/release/lu sdk go -o kernel-go kernel.json
 ./target/release/lu bindgen --lib m -o math.lu /usr/include/math.h
 ./target/release/lu bench --runs 7 corpus/bench_dot.lu
 ./target/release/lu doc --runs 100 -o target/doc corpus/kernel_saxpy.lu
@@ -117,11 +120,79 @@ Flat `@c_layout` records containing one or two homogeneous 64-bit fields
 (integer/pointer or `f64`) pass directly by value on SysV x86-64 and AArch64.
 The public lulang wrapper keeps the useful logical type while a remaining
 private adapter crosses only the stable scalar ABI.
+Callback typedefs and inline function-pointer parameters become typed
+`c_fn[(...) -> T]` values. C unions remain opaque but are available behind
+typed `c_ptr[Union]` handles. Bitfield records use logical Lulang records and
+adapter-side field initialization/access. Portable aggregate returns pass
+directly; other flat scalar struct returns are captured once in an
+adapter-owned temporary, copied field-by-field into a Lulang record, and
+released before the wrapper returns.
+
+With adapters enabled, a C variadic function produces explicit wrappers for
+zero through three `i64`/`f64` varargs, named with their exact pattern—for
+example `log_v_i64_f64`. The caller must select the wrapper matching the C
+function's promoted argument contract. This deliberately avoids pretending
+that an untyped `...` is type-safe.
 
 Borrowed `c_slice[i64]` and `c_slice[f64]` parameters cross as
 `(const T *data, int64_t length)`. They are read-only, cannot escape by
 returning, and let exported kernels consume C and NumPy buffers without an
-array copy.
+array copy. Borrowed `c_mut_slice[i64]` and `c_mut_slice[f64]` cross as
+`(T *data, int64_t length)` and write caller-owned buffers directly. Mutable
+slices are parameter-only, require a mutable variable at lulang call sites,
+and are exclusive: they cannot alias any sibling argument. Compiler-owned
+arrays retain value semantics when borrowed; exported C and NumPy buffers are
+never wrapped in or copied through the ordinary array runtime.
+
+### ABI compatibility
+
+`lu abi check <old.json> <new.json>` compares generated ABI manifests for CI
+and release gating. Added exports, records, and enum values are compatible;
+parameter renames are reported without failing. Removed exports, changed
+parameter or return types, changed record layouts, changed existing enum tags,
+and library renames are breaking and produce a failing exit status. Both
+inputs must use a manifest version understood by the compiler.
+
+### Generated host SDKs
+
+An ABI manifest can be turned into host wrappers or complete package
+directories:
+
+```text
+lu sdk rust  -o kernels.rs  kernels.json
+lu sdk cpp   -o kernels.hpp kernels.json
+lu sdk julia -o Kernels.jl  kernels.json
+lu sdk node  -o kernels-node  kernels.json
+lu sdk go    -o kernels-go    kernels.json
+lu sdk swift -o kernels-swift kernels.json
+lu sdk r     -o kernels-r     kernels.json
+```
+
+The Rust SDK exposes slices and mutable slices as `&[T]` and `&mut [T]`, the
+C++ SDK uses `std::span`/`std::string_view`, and the Julia SDK pins arrays
+across `ccall`. All three copy returned length-delimited strings into
+host-owned storage, preserve embedded NUL bytes, convert ABI booleans, and
+generate exact `@c_layout` record definitions where the host language needs
+them. Exported `[i64]`/`[f64]` results become zero-copy owning handles: Rust
+and C++ release them with RAII, Julia supplies a finalizer and `close`, and
+`pylulang.OwnedArray` supplies sequence access plus a context manager. Rust
+and C++ wrappers are compiled and executed against a generated static library
+in the release suite; Julia is executed too when its runtime is available.
+The standard `@c_layout { status: i64, value: i64 }` result convention maps
+status zero to success and nonzero codes to each host SDK's error path.
+Typed `c_fn[(...) -> T]` parameters and returns become exact C function
+pointer typedefs, Rust `extern "C" fn` values, C++ callback aliases, Julia
+`Ptr{Cvoid}`, and retained Python callables.
+
+The Node target emits an npm package using `ffi-napi`, including typed
+records, callbacks, buffer views, owning-result wrappers, and error
+translation. Go emits a cgo module with zero-copy slices and owning views;
+Swift emits a SwiftPM package with a system-library target and native
+convenience wrappers; R emits an installable source package with registered
+`.Call` adapters. The release suite executes real Go and Swift callers,
+syntax-checks Node without downloading dependencies, and runs Julia/R when
+their runtimes are installed.
+
 Returned strings use `const char *fn(..., int64_t *out_len)`: the hidden
 length pointer is the final C argument. Imports copy the returned bytes into
 lulang-owned storage before the foreign call completes. Exports return
@@ -130,9 +201,16 @@ length-delimited and may contain embedded NUL bytes.
 This works in the interpreter, JIT, LLVM AOT, and self-hosted compiler without
 making compiler-owned record layout part of the C ABI. The reproducible
 adapter source is written beside the bindings as `*.bindgen.c`; use
-`--no-shims` to emit only declarations that need no adapter. Variadic
-functions, callbacks, unions, bitfields, and by-value aggregate returns remain
-explicit diagnostics.
+`--no-shims` to emit only declarations that need no adapter. By-value unions,
+callbacks mixed with otherwise shim-only parameters, nested aggregate-result
+adapters, and variadic patterns wider than three values remain explicit
+diagnostics.
+
+Bindgen recognizes conventional adjacent `const T *data, int64_t length` and
+`T *data, int64_t length` pairs for 64-bit scalar elements and emits
+`c_slice[T]` and `c_mut_slice[T]` respectively. Pairing requires a conventional
+length name (`n`, `len`, `length`, `count`, or a data-name suffix), avoiding
+speculative conversion of unrelated pointer and integer parameters.
 
 ### Editor tooling
 
@@ -196,6 +274,15 @@ The [Embedded notebook](examples/lulang_embedded.ipynb) compiles the
 quaternion-slerp export with `pylulang`, checks it against NumPy, and measures
 both implementations. Run it without a Jupyter dependency with
 `python3 examples/run_embedded_notebook.py`.
+
+### Visible C embedding: luimage
+
+[`lib/luimage`](lib/luimage) renders a Mandelbrot image through a real C host.
+The host allocates the pixels, Lulang fills them through
+`c_mut_slice[f64]`, and the resulting `target/mandelbrot.pgm` is directly
+viewable. Run `./run_preview.sh` from that directory. The package also ships
+exposure, inversion, and luminance kernels, executable image laws, generated
+documentation, and interpreter/JIT/AOT/C integration coverage.
 
 ### First-party numerics
 

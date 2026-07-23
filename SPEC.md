@@ -197,6 +197,31 @@ call. Converting an ordinary scalar array to a slice passes its existing data
 buffer without copying; an exported function receives the caller's C buffer
 directly. This does not expose the layout of ordinary arrays or records.
 
+`c_mut_slice[i64]` and `c_mut_slice[f64]` are borrowed, mutable boundary
+views. They cross C as `(T *data, int64_t length)`, may be indexed, passed to
+`len`, and updated through indexed assignment. Like `c_slice`, they cannot be
+stored in records or returned. A mutable-slice argument must be a mutable
+variable, and it may not overlap any other argument for the duration of the
+call. The checker rejects direct and nested aliases it can express in lulang;
+foreign callers are responsible for honoring the same exclusivity contract.
+Converting a compiler-owned array preserves value semantics: shared JIT
+storage is made unique before the borrow, while AOT and self-hosted tiers
+already clone at value-copy boundaries. An exported function mutates the
+caller's C or NumPy buffer directly without allocating, copying, or invoking
+the compiler-owned array runtime.
+
+`c_fn[(P1, P2) -> R]` is a typed C function pointer. It may cross an
+`extern` or `export` boundary, be stored in a local, and be returned or passed
+unchanged. Its parameter and result types are checked structurally, use the
+same boundary lowering and register limits as an ordinary C ABI function, and
+may themselves include another callback. `c_fn[() -> ()]` denotes a callback
+with no arguments and no result. Lulang does not invoke a function pointer
+directly; foreign C code invokes it. An exported scalar Lulang function has a
+compatible address and can therefore be installed as a callback. Generated C
+headers emit exact function-pointer typedefs, and the Rust, C++, Julia, and
+Python SDKs preserve the signature. Python wrappers retain callback owners
+for the lifetime of a returned callable.
+
 String parameters cross as `(const char *data, int64_t length)`. A function
 returning `str` has the C signature `const char *fn(..., int64_t *out_len)`;
 the length pointer is an additional final integer-class argument and counts
@@ -206,6 +231,25 @@ foreign call completes, so the source pointer need only remain valid through
 the call. An exported return points to library-lifetime storage and writes the
 exact byte length through `out_len`.
 
+An exported `[i64]` or `[f64]` return becomes an opaque owning C handle,
+`lu_owned_i64 *` or `lu_owned_f64 *`. The generated header exposes typed
+`data`, `len`, and `release` functions. The export wrapper transfers the
+fresh array allocation into a separate boundary handle without copying
+elements; its data pointer remains valid until `release`. This is export-only:
+an `extern` cannot return an ordinary array, and no compiler-owned array
+header or record layout is public. Generated Rust/C++ wrappers release with
+RAII, Julia uses a finalizer plus `close`, and `pylulang.OwnedArray` is a
+context manager.
+
+A standard portable error result is an `@c_layout` record with exactly
+`status: i64` followed by `value: i64`. Status zero (`LU_STATUS_OK` in
+generated C headers) means success; any nonzero value is an application error
+code and the value field is ignored. The exact two-register record works in
+both ABI directions and every execution tier. Generated Rust returns
+`Result<i64, LuError>`, C++ returns `Result<int64_t>`, Julia throws
+`LulangError`, and `pylulang` raises `LulangError`. Error codes remain
+domain-defined and stable ABI changes are checked through the record manifest.
+
 `@c_layout type Name { ... }` opts a record into stable C field order and
 layout metadata. Its fields are restricted to exact-width boundary scalars,
 `c_ptr[T]`, and nested `@c_layout` records; empty records, layout cycles,
@@ -214,18 +258,25 @@ lulang records, which retain compiler-owned layout. C headers and ABI
 manifests describe annotated records. By-value aggregate calls remain rejected
 except for a deliberately portable register subset: a flat annotated record
 with one or two fields, either all `f64` or all 64-bit integer/pointer-class
-fields, may be a parameter. It is passed as a real C value aggregate in LLVM
-imports and export wrappers and as the equivalent registers in the
-interpreter and JIT. Mixed-class, `f32`, nested, wider, and returned aggregates
-still require an adapter. Using any annotated record behind `c_ptr[Name]`
-remains supported.
+fields, may be a parameter or return value. It is passed as a real C value
+aggregate in LLVM imports and export wrappers and as the equivalent return or
+argument registers in both interpreters and the JIT. Mixed-class, `f32`,
+nested, and wider aggregates still require an adapter. Using any annotated
+record behind `c_ptr[Name]` remains supported.
 
 Generated bindgen adapters may expose a record-valued lulang parameter without
 passing that record through the boundary. The generated lulang wrapper
 flattens its logical fields into supported scalar arguments, and generated C
 code reconstructs the C value before the real call. Narrow integer and C
 `_Bool` conversions follow the same rule; C `float` maps directly to boundary
-`f32`. This is an adapter contract,
+`f32`. Flat scalar record returns that are not in the direct portable subset
+use a temporary C-owned result handle plus typed field accessors; the Lulang
+wrapper constructs the logical result and releases the temporary before
+returning. Bitfields use these same parameter and result adapters. Unions are
+opaque typed pointer targets and never claim record layout. Callback
+declarations map to `c_fn`, while variadic declarations produce explicitly
+typed zero-to-three-argument `i64`/`f64` wrapper patterns whose selection is
+part of the caller's C contract. This is an adapter contract,
 not a relaxation of the boundary type set or a promise about internal record
 layout.
 
