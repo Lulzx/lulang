@@ -33,7 +33,7 @@ than exposing internals.
 | 4 | LSP + VS Code extension (tree-sitter first) — **complete (v0.1)** | Very high | Medium |
 | 5 | `lu-numerics` first-party library corpus — **foundation shipped** | Very high | Continuous |
 | 6 | Web playground (interpreter → wasm32) — **v0.1 shipped** | High | Medium |
-| 7 | `lu bindgen` C-header importer | Very high | Medium–high |
+| 7 | `lu bindgen` C-header importer — **foundation shipped** | Very high | Medium–high |
 | 8 | `wasm32-wasi` / `wasm32-web` target | High | Medium |
 | 9 | Git-based package manager (`lu.toml`) | High once libraries exist | Medium |
 | 10 | Flagship demo (`luphysics`) | High visibility | Medium |
@@ -134,6 +134,17 @@ useful**. `lu bindgen fftw3.h -o fftw3.lu` over a deliberately small C subset
 opaque handles; callbacks later). Demonstration targets in order: BLAS, FFTW,
 SQLite, raylib, libpng, SuiteSparse. BLAS/FFTW reinforce the numerics
 identity; raylib produces visible demos.
+
+The first slice ships a dependency-free C lexer/parser, typedef resolution,
+numeric macros, sequential enums, function prototypes, register-cap checking,
+and checker-valid `extern` generation. It deliberately emits only exact
+boundary matches (`int64_t`/LP64 `long`, `double`, and `void`); narrower
+integers, `float`, C `bool`, pointers, callbacks, and by-value aggregates are
+diagnosed instead of unsafely widened. A macOS `math.h` preflight currently
+produces 41 checker-valid imports. The remaining work for the full promised
+subset is therefore language work, not parser work: add `c_ptr[T]`, opaque
+handles, `@c_layout` records, and conversion shims for C-width scalars before
+turning those indexed declarations into bindings.
 
 ### 8. WASM target
 

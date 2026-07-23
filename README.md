@@ -55,6 +55,7 @@ cargo build --release
 ./target/release/lu build corpus/slerp.lu  # AOT-compile via LLVM
 ./target/release/lu build --lib -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu build --lib --shared -o kernel corpus/kernel_saxpy.lu
+./target/release/lu bindgen --lib m -o math.lu /usr/include/math.h
 ./target/release/lu fmt corpus/slerp.lu    # canonical Unicode operators + layout
 ./target/release/lu fmt --check corpus/slerp.lu
 ./target/release/lu run selfhost/lexer.lu  # the lulang lexer, written in lulang
@@ -85,6 +86,23 @@ total = module.saxpy(2.0, x, y, 3)  # y is copied back: [12, 24, 36]
 Writable contiguous NumPy `float64`/`int64` arrays and compatible Python
 buffers are passed directly to the generated C shim. Install the local package
 with `python3 -m pip install python/pylulang`.
+
+### C header imports
+
+`lu bindgen` reads C headers and writes lulang `extern` declarations:
+
+```bash
+lu bindgen --lib m -o math.lu /usr/include/math.h
+lu check math.lu
+```
+
+The importer emits constants, sequential enums, typedef-resolved parameters,
+and functions whose C types have an exact lulang boundary representation.
+Declarations involving narrower C integers, `float`, C `bool`, pointers,
+callbacks, or by-value aggregates are parsed but reported as explicit
+diagnostics. They are not silently widened or reinterpreted. Pointer and
+fixed-layout declarations will become emit-capable with the planned
+boundary-only `c_ptr[T]` and `@c_layout` types.
 
 ### Editor tooling
 
