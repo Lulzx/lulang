@@ -1,4 +1,5 @@
 /target
+/lib/luimage/target/
 Cargo.lock
 .DS_Store
 experiments/bench-base
