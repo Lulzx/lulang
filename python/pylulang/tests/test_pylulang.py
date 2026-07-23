@@ -6,6 +6,8 @@ import pylulang
 
 
 SOURCE = """
+@c_layout type Vec2 { x: f64, y: f64 }
+
 export fn saxpy(a: f64, x: [f64], y: [f64], n: i64): f64 {
   var total = 0.0
   for i in 0..n {
@@ -26,6 +28,10 @@ export fn borrowed_sum(values: c_slice[f64]): f64 {
 export fn half32(x: f32): f32 {
   return x * f32(0.5)
 }
+
+export fn vec2_sum(value: Vec2): f64 {
+  return value.x + value.y
+}
 """
 
 
@@ -41,6 +47,8 @@ class PyLulangTest(unittest.TestCase):
         self.assertTrue(module.positive(1))
         self.assertFalse(module.positive(-1))
         self.assertAlmostEqual(module.half32(9.0), 4.5)
+        self.assertEqual(module.vec2_sum((2.5, 4.5)), 7.0)
+        self.assertEqual(module.vec2_sum({"x": 3.0, "y": 4.0}), 7.0)
         module.close()
 
     def test_numpy_without_copying_the_boundary_buffer(self):

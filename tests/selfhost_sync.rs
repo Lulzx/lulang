@@ -158,5 +158,41 @@ fn ffi_import_and_export_ir_match_the_host_byte_for_byte() {
     assert!(host_wrapper.contains("(ptr %c0, i64 %c1)"));
     assert!(!host_wrapper.contains("lu_arr_new_raw"));
 
+    let c_layout_source = directory.join("c-layout-value-boundary.lu");
+    std::fs::write(
+        &c_layout_source,
+        "@c_layout type Vec2 { x: f64, y: f64 }\n\
+         extern \"m\" fn vec2_sum(value: Vec2): f64\n\
+         export fn local_sum(value: Vec2): f64 {\n\
+           return value.x + value.y\n\
+         }\n\
+         main { print(local_sum(Vec2 { 2.5, 4.5 })) }\n",
+    )
+    .expect("write c_layout value boundary fixture");
+    let host_c_layout_path = directory.join("host-c-layout-value.ll");
+    let host_c_layout = emit_host_ir(&c_layout_source, &host_c_layout_path);
+    let selfhost_c_layout = emit_selfhost_ir(&repository, &c_layout_source, triple);
+    let declaration = "declare double @\"vec2_sum\"({ double, double })";
+    assert_eq!(
+        host_c_layout.lines().find(|line| *line == declaration),
+        selfhost_c_layout.lines().find(|line| *line == declaration),
+        "direct @c_layout import declarations drifted between host and selfhost"
+    );
+    let wrapper_start = "define dso_local double @\"local_sum\"({ double, double } %c0)";
+    let host_c_layout_wrapper = host_c_layout
+        .split(wrapper_start)
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("host c_layout wrapper");
+    let selfhost_c_layout_wrapper = selfhost_c_layout
+        .split(wrapper_start)
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("selfhost c_layout wrapper");
+    assert_eq!(
+        host_c_layout_wrapper, selfhost_c_layout_wrapper,
+        "direct @c_layout export wrappers drifted between host and selfhost"
+    );
+
     let _ = std::fs::remove_dir_all(directory);
 }

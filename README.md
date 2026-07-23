@@ -108,10 +108,12 @@ and functions whose C types have an exact lulang boundary representation.
 Raw pointers and opaque structs are emitted as boundary-only `c_ptr[T]`
 handles: they may cross an `extern` boundary, be stored, passed, and compared,
 but cannot be dereferenced or used to expose C layout. Declarations involving
-narrower C integers, C `bool`, or by-value struct parameters use a generated
-C adapter shared library; C `float` maps directly to `f32`. The public lulang
-wrapper keeps the useful
-logical type while the private adapter crosses only the stable scalar ABI.
+narrower C integers, C `bool`, and non-portable by-value struct parameters use
+a generated C adapter shared library; C `float` maps directly to `f32`.
+Flat `@c_layout` records containing one or two homogeneous 64-bit fields
+(integer/pointer or `f64`) pass directly by value on SysV x86-64 and AArch64.
+The public lulang wrapper keeps the useful logical type while a remaining
+private adapter crosses only the stable scalar ABI.
 
 Borrowed `c_slice[i64]` and `c_slice[f64]` parameters cross as
 `(const T *data, int64_t length)`. They are read-only, cannot escape by

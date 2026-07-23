@@ -90,7 +90,13 @@ def _array_argument(
 
 
 class _Function:
-    def __init__(self, library: ctypes.CDLL, spec: dict[str, Any], enums: set[str]):
+    def __init__(
+        self,
+        library: ctypes.CDLL,
+        spec: dict[str, Any],
+        enums: set[str],
+        records: dict[str, type[ctypes.Structure]],
+    ):
         self.__name__ = spec["name"]
         self.__doc__ = (
             f"lulang export {self.__name__}("
@@ -99,6 +105,7 @@ class _Function:
         )
         self._spec = spec
         self._enums = enums
+        self._records = records
         self._function = getattr(library, self.__name__)
         argtypes: list[Any] = []
         for parameter in spec["params"]:
@@ -115,6 +122,8 @@ class _Function:
                 argtypes.extend(
                     [ctypes.POINTER(_scalar_ctype(element, enums)), ctypes.c_int64]
                 )
+            elif type_name in records:
+                argtypes.append(records[type_name])
             else:
                 argtypes.append(_scalar_ctype(type_name, enums))
         self._function.argtypes = argtypes
@@ -150,6 +159,16 @@ class _Function:
                 )
                 flattened.extend([pointer, length])
                 keepalive.append(owner)
+            elif type_name in self._records:
+                record_type = self._records[type_name]
+                if isinstance(value, record_type):
+                    record = value
+                elif isinstance(value, dict):
+                    record = record_type(**value)
+                else:
+                    record = record_type(*value)
+                flattened.append(record)
+                keepalive.append(record)
             elif type_name == "bool":
                 flattened.append(int(bool(value)))
             else:
@@ -171,8 +190,32 @@ class Module:
         self._library = ctypes.CDLL(str(root / f"lib{name}{extension}"))
         self.manifest = manifest
         enums = set(manifest.get("enums", {}))
+        record_specs = manifest.get("c_layout_records", {})
+        records = {
+            record_name: type(record_name, (ctypes.Structure,), {})
+            for record_name in record_specs
+        }
+        defined: set[str] = set()
+
+        def define_record(record_name: str) -> None:
+            if record_name in defined:
+                return
+            field_types = []
+            for field in record_specs[record_name]:
+                type_name = field["type"]
+                if type_name in records:
+                    define_record(type_name)
+                    ctype = records[type_name]
+                else:
+                    ctype = _scalar_ctype(type_name, enums)
+                field_types.append((field["name"], ctype))
+            records[record_name]._fields_ = field_types
+            defined.add(record_name)
+
+        for record_name in records:
+            define_record(record_name)
         self._exports = {
-            spec["name"]: _Function(self._library, spec, enums)
+            spec["name"]: _Function(self._library, spec, enums, records)
             for spec in manifest["exports"]
         }
 

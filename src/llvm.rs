@@ -69,6 +69,7 @@ fn emit_export_wrapper(
     let mut params = Vec::new();
     let mut internal_args = Vec::new();
     let mut arrays = Vec::new();
+    let mut records = Vec::new();
     let mut argument = 0usize;
     for &local_id in &function.params {
         let local = &function.locals[local_id as usize];
@@ -91,6 +92,21 @@ fn emit_export_wrapper(
                 internal_args.push(format!("ptr {}", handle));
                 arrays.push((data, len, handle, element_components[0]));
             }
+            CType::Rec(index) if program.types[*index].c_layout => {
+                let record_components = lty(program, &local.ty)?;
+                let aggregate = comps_ty(&record_components);
+                let source = format!("%c{}", argument);
+                params.push(format!("{} {}", aggregate, source));
+                let record_number = records.len();
+                for (component_index, component) in record_components.iter().enumerate() {
+                    internal_args.push(format!(
+                        "{} %wr{}_{}",
+                        component, record_number, component_index
+                    ));
+                }
+                records.push((source, aggregate, record_components));
+                argument += 1;
+            }
             ty => {
                 for component in lty(program, ty)? {
                     params.push(format!("{} %c{}", component, argument));
@@ -109,6 +125,14 @@ fn emit_export_wrapper(
         decl.name,
         params.join(", ")
     );
+    for (record_index, (source, aggregate, components)) in records.iter().enumerate() {
+        for component_index in 0..components.len() {
+            let _ = writeln!(
+                out,
+                "  %wr{record_index}_{component_index} = extractvalue {aggregate} {source}, {component_index}"
+            );
+        }
+    }
     for (index, (source, len, handle, component)) in arrays.iter().enumerate() {
         let _ = writeln!(
             out,
@@ -471,6 +495,8 @@ fn build_output(
             if matches!(ty, CType::Arr(_)) {
                 params.push("ptr".to_string());
                 params.push("i64".to_string());
+            } else if matches!(ty, CType::Rec(index) if p.types[*index].c_layout) {
+                params.push(comps_ty(&lty(p, ty)?));
             } else {
                 params.extend(lty(p, ty)?.into_iter().map(String::from));
             }
@@ -1539,6 +1565,22 @@ impl<'a> Emit<'a> {
                     };
                     parts.push(format!("ptr {}", data));
                     parts.push(format!("i64 {}", length));
+                }
+                CType::Rec(index) if self.p.types[*index].c_layout => {
+                    let components = lty(self.p, want)?;
+                    let aggregate = comps_ty(&components);
+                    let mut packed = "poison".to_string();
+                    for (component_index, (component, register)) in
+                        components.iter().zip(&value.regs).enumerate()
+                    {
+                        let next = self.t();
+                        self.line(format!(
+                            "{} = insertvalue {} {}, {} {}, {}",
+                            next, aggregate, packed, component, register, component_index
+                        ));
+                        packed = next;
+                    }
+                    parts.push(format!("{} {}", aggregate, packed));
                 }
                 _ => {
                     for (component, register) in lty(self.p, want)?.iter().zip(&value.regs) {

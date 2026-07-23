@@ -331,6 +331,16 @@ static int lu_ffi_unpack(long long *control, long long control_len,
           value + length > float_len) return 0;
       ints[ni++] = (long long)(intptr_t)(floats + value);
       ints[ni++] = length;
+    } else if (kind == 6) {
+      if (length < 1 || ni + length > 6 || value < 0 ||
+          value + length > control_len) return 0;
+      for (long long i = 0; i < length; i++)
+        ints[ni++] = control[value + i];
+    } else if (kind == 7) {
+      if (length < 1 || nf + length > 8 || value < 0 ||
+          value + length > float_len) return 0;
+      for (long long i = 0; i < length; i++)
+        fp[nf++] = floats[value + i];
     } else {
       return 0;
     }

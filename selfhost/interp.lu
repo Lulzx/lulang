@@ -228,7 +228,7 @@ type P {
   pname: [str], ptype: [i64], pmut: [i64], np: i64,
   opglyph: [str], opfname: [str], opprec: [i64], nops: i64,
   copen: [str], cclose: [str], cfname: [str], ncirc: i64,
-  tyname: [str], tfo: [i64], tnf: [i64], nty: i64,
+  tyname: [str], tfo: [i64], tnf: [i64], tyclayout: [i64], nty: i64,
   flname: [str], flty: [i64], nfl: i64,
   ename: [str], evo: [i64], evn: [i64], nen: i64,
   vrname: [str], nvr: i64,
@@ -924,6 +924,27 @@ fn parse_property(inout p: P) {
   add_fn(p, name, ret, po, np2, body, 1)
 }
 
+// Portable direct aggregate subset: a flat @c_layout record with one or two
+// 64-bit fields, all integer/pointer class (10 + width) or all f64 (20 + width).
+fn ffi_record_shape(p: P, t: i64): i64 {
+  if not is_rect(t) { return 0 }
+  let ti = t - 64
+  if p.tyclayout[ti] == 0 { return 0 }
+  let width = p.tnf[ti]
+  if width < 1 or width > 2 { return 0 }
+  var class = 0
+  for i in 0..width {
+    let ft = p.flty[p.tfo[ti] + i]
+    var field_class = 0
+    if ft == 0 or ft == 2 or is_ptrt(ft) { field_class = 1 }
+    if ft == 1 { field_class = 2 }
+    if field_class == 0 { return 0 }
+    if class != 0 and class != field_class { return 0 }
+    class = field_class
+  }
+  return class * 10 + width
+}
+
 fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
   var ni = 0
   var nflo = 0
@@ -942,8 +963,17 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
         if t == 0 or t == 2 or is_enumt(t) or is_ptrt(t) {
           ni = ni + 1
         } else {
-          print("type error: unsupported FFI parameter in", name)
-          p.err = 1
+          let shape = ffi_record_shape(p, t)
+          if shape >= 20 {
+            nflo = nflo + shape - 20
+          } else {
+            if shape >= 10 {
+              ni = ni + shape - 10
+            } else {
+              print("type error: unsupported FFI parameter in", name)
+              p.err = 1
+            }
+          }
         }
       }
     }
@@ -1013,10 +1043,12 @@ fn parse_top(inout p: P) {
   var going = true
   while going and p.err == 0 {
     skipnl(p)
+    var c_layout = 0
     if cur_is_sym(p, "@") {
       p.pos = p.pos + 1
       if cur_is_kw(p, "c_layout") {
         p.pos = p.pos + 1
+        c_layout = 1
       } else {
         fail(p, "c_layout")
       }
@@ -1044,6 +1076,7 @@ fn parse_top(inout p: P) {
         if cur_is_kw(p, "type") {
           p.pos = p.pos + 1
           parse_type_decl(p)
+          p.tyclayout[p.nty - 1] = c_layout
         } else {
           if cur_is_kw(p, "enum") {
             p.pos = p.pos + 1
@@ -1935,6 +1968,9 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
     if v.t == 3 { control_len = control_len + len(v.s) }
     if v.t == 1024 or v.t == 3072 { control_len = control_len + v.n }
     if v.t == 1025 or v.t == 3073 { float_len = float_len + v.n }
+    let shape = ffi_record_shape(p, v.t)
+    if shape >= 20 { float_len = float_len + v.n }
+    if shape >= 10 and shape < 20 { control_len = control_len + v.n }
   }
   var control = arr(control_len, 0)
   var floats = arr(float_len, 0.0)
@@ -1944,6 +1980,25 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
   for j in 0..p.fnp[f] {
     let v = vals[j]
     let descriptor = 1 + j * 3
+    let shape = ffi_record_shape(p, v.t)
+    if shape >= 20 {
+      control[descriptor] = 7
+      control[descriptor + 1] = float_data
+      control[descriptor + 2] = v.n
+      for k in 0..v.n {
+        floats[float_data + k] = m.heap[v.o + k].f
+      }
+      float_data = float_data + v.n
+    } else {
+    if shape >= 10 {
+      control[descriptor] = 6
+      control[descriptor + 1] = control_data
+      control[descriptor + 2] = v.n
+      for k in 0..v.n {
+        control[control_data + k] = m.heap[v.o + k].i
+      }
+      control_data = control_data + v.n
+    } else {
     if v.t == 1 {
       control[descriptor] = 1
       control[descriptor + 1] = float_data
@@ -1989,6 +2044,8 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
         }
       }
       }
+    }
+    }
     }
   }
   if lu_ffi_prepare(p.flib[f], p.fname[f]) == 0 {
@@ -2444,7 +2501,7 @@ fn run_src(src: str, heapfac: i64, argbase: i64) {
     pname: arr(2048, ""), ptype: arr(2048, 5), pmut: arr(2048, 0), np: 0,
     opglyph: arr(32, ""), opfname: arr(32, ""), opprec: arr(32, 0), nops: 0,
     copen: arr(32, ""), cclose: arr(32, ""), cfname: arr(32, ""), ncirc: 0,
-    tyname: arr(64, ""), tfo: arr(64, 0), tnf: arr(64, 0), nty: 0,
+    tyname: arr(64, ""), tfo: arr(64, 0), tnf: arr(64, 0), tyclayout: arr(64, 0), nty: 0,
     flname: arr(512, ""), flty: arr(512, 5), nfl: 0,
     ename: arr(32, ""), evo: arr(32, 0), evn: arr(32, 0), nen: 0,
     vrname: arr(256, ""), nvr: 0,
