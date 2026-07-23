@@ -53,6 +53,8 @@ cargo build --release
 ./target/release/lu run  corpus/slerp.lu   # execute main
 ./target/release/lu test --runs 1000 corpus/slerp.lu # property tests, configurable runs
 ./target/release/lu build corpus/slerp.lu  # AOT-compile via LLVM
+./target/release/lu build --target wasm32-wasi corpus/slerp.lu
+./target/release/lu build --target wasm32-web corpus/slerp.lu
 ./target/release/lu build --lib -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu build --lib --shared -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu bindgen --lib m -o math.lu /usr/include/math.h
@@ -118,6 +120,23 @@ diagnostics, formatting, symbols, completion, hover, and go-to-definition.
 Set `LULANG_BIN` if `lu` is not on `PATH`. A VS Code extension with syntax
 highlighting and native editor providers lives in `editors/vscode`; the
 tree-sitter grammar and highlight query live in `editors/tree-sitter-lulang`.
+
+### WebAssembly targets
+
+With [Zig](https://ziglang.org/) on `PATH`, `lu build --target wasm32-wasi`
+produces a command module for a preview1 WASI host. The `wasm32-web` target
+produces a reactor module plus a small dependency-free JavaScript loader:
+
+```javascript
+import { instantiateLulang } from "./slerp.js";
+
+const program = await instantiateLulang("./slerp.wasm", console.log);
+program.run();
+```
+
+Both targets consume the same validated CFG and runtime as native AOT.
+Native dynamic `extern` declarations are rejected for wasm builds rather than
+becoming unresolved imports.
 
 ## Architecture
 

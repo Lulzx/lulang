@@ -12,6 +12,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: lu <run|build|check|interp> <file.lu> [program args...]\n\
          \x20      lu build --lib [--shared] [-o name] <file.lu>\n\
+         \x20      lu build --target <wasm32-wasi|wasm32-web> [-o file.wasm] <file.lu>\n\
          \x20      lu bindgen [--lib name] [--no-shims] [-o file.lu] <header.h>\n\
          \x20      lu test [--runs N] <file.lu>\n\
          \x20      lu fmt [--check] <file.lu>"
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
     let mut check_format = false;
     let mut build_library = false;
     let mut build_shared = false;
+    let mut build_target = None;
     let mut output_name = None;
     let mut bindgen_library = None;
     let mut bindgen_shims = true;
@@ -73,6 +75,14 @@ fn main() -> ExitCode {
             "--shared" if mode == "build" => {
                 build_shared = true;
                 i += 1;
+            }
+            "--target" if mode == "build" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("error: --target needs a value");
+                    return ExitCode::FAILURE;
+                };
+                build_target = Some(value.clone());
+                i += 2;
             }
             "-o" if matches!(mode, "build" | "bindgen") => {
                 let Some(value) = args.get(i + 1) else {
@@ -153,6 +163,7 @@ fn main() -> ExitCode {
     let mode_owned = mode.to_string();
     let path_owned = path.to_string();
     let output_name_owned = output_name.clone();
+    let build_target_owned = build_target.clone();
     let result = std::thread::Builder::new()
         .stack_size(512 << 20)
         .spawn(move || {
@@ -163,6 +174,7 @@ fn main() -> ExitCode {
                 runs,
                 build_library,
                 build_shared,
+                build_target_owned.as_deref(),
                 output_name_owned.as_deref(),
             )
         })
@@ -318,6 +330,7 @@ fn run_pipeline(
     property_runs: u32,
     build_library: bool,
     build_shared: bool,
+    build_target: Option<&str>,
     output_name: Option<&str>,
 ) -> Result<bool, String> {
     (|| -> Result<bool, String> {
@@ -335,10 +348,26 @@ fn run_pipeline(
                 Ok(true)
             }
             "build" => {
+                if build_target.is_some() && (build_library || build_shared) {
+                    return Err("`--target` cannot be combined with `--lib` or `--shared`".into());
+                }
                 if build_shared && !build_library {
                     return Err("`--shared` requires `--lib`".into());
                 }
-                if build_library {
+                if let Some(target) = build_target {
+                    let target = match target {
+                        "wasm32-wasi" => llvm::WasmTarget::Wasi,
+                        "wasm32-web" => llvm::WasmTarget::Web,
+                        target => {
+                            return Err(format!(
+                                "unsupported target `{target}`; expected wasm32-wasi or wasm32-web"
+                            ))
+                        }
+                    };
+                    for out in llvm::build_wasm(&ir, path, output_name, target)? {
+                        eprintln!("built {}", out);
+                    }
+                } else if build_library {
                     for out in llvm::build_library(&ir, path, output_name, build_shared)? {
                         eprintln!("built {}", out);
                     }

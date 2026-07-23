@@ -1,6 +1,8 @@
 // Native runtime linked into lu-built binaries.
+#if !defined(__wasm__)
 #include <pthread.h>
 #include <dlfcn.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -226,6 +228,7 @@ const char *lu_concat(const char *ap, long long al, const char *bp, long long bl
    one packed i64 control array and one packed f64 data array. */
 static void *lu_ffi_prepared;
 
+#if !defined(__wasm__)
 long long lu_ffi_prepare(const char *lib, long long ll,
                          const char *symbol, long long sl) {
   char *library = malloc((size_t)ll + 1);
@@ -364,12 +367,46 @@ double lu_ffi_call_f(long long *control, long long control_len,
   for (int i = 0; i < string_count; i++) free(strings[i]);
   return result;
 }
+#else
+long long lu_ffi_prepare(const char *lib, long long ll,
+                         const char *symbol, long long sl) {
+  (void)lib; (void)ll; (void)symbol; (void)sl;
+  fprintf(stderr, "runtime error: dynamic FFI is unavailable on wasm32\n");
+  return 0;
+}
+
+long long lu_ffi_call_i(long long *control, long long control_len,
+                        double *floats, long long float_len) {
+  (void)control; (void)control_len; (void)floats; (void)float_len;
+  return 0;
+}
+
+double lu_ffi_call_f(long long *control, long long control_len,
+                     double *floats, long long float_len) {
+  (void)control; (void)control_len; (void)floats; (void)float_len;
+  return 0.0;
+}
+#endif
 
 /* Compiled programs enter through lu_entry; main runs it on a 512 MiB stack
    so deep recursion (e.g. self-hosted interpreter towers) doesn't overflow. */
 #ifndef LU_LIB
 extern int lu_entry(void);
 
+#if defined(LU_WEB)
+int lu_web_run(void) {
+  int result = lu_entry();
+  fflush(stdout);
+  return result;
+}
+#elif defined(__wasm__)
+int main(int argc, char **argv) {
+  lu_set_args(argc, argv);
+  int result = lu_entry();
+  fflush(stdout);
+  return result;
+}
+#else
 static void *entry_thunk(void *unused) {
   (void)unused;
   return (void *)(long)lu_entry();
@@ -390,4 +427,5 @@ int main(int argc, char **argv) {
   fflush(stdout);
   return (int)(long)ret;
 }
+#endif
 #endif

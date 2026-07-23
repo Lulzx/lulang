@@ -205,6 +205,12 @@ and C `_Bool` conversions follow the same rule. This is an adapter contract,
 not a relaxation of the boundary type set or a promise about internal record
 layout.
 
+`lu build --target wasm32-wasi` emits a WASI command module.
+`--target wasm32-web` emits a reactor module and JavaScript host loader.
+WebAssembly uses the same checked program and LLVM lowering as native AOT, but
+dynamic native `extern` declarations are rejected. The target does not weaken
+the C-boundary rules or imply native SIMD parity.
+
 ---
 
 # v0.2 additions (M6 — the self-hosting surface)

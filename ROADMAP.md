@@ -34,7 +34,7 @@ than exposing internals.
 | 5 | `lu-numerics` first-party library corpus — **foundation shipped** | Very high | Continuous |
 | 6 | Web playground (interpreter → wasm32) — **v0.1 shipped** | High | Medium |
 | 7 | `lu bindgen` C-header importer — **foundation shipped** | Very high | Medium–high |
-| 8 | `wasm32-wasi` / `wasm32-web` target | High | Medium |
+| 8 | `wasm32-wasi` / `wasm32-web` target — **shipped** | High | Medium |
 | 9 | Git-based package manager (`lu.toml`) | High once libraries exist | Medium |
 | 10 | Flagship demo (`luphysics`) | High visibility | Medium |
 | 11 | `lu doc` + benchmark observatory | High credibility | Medium |
@@ -154,12 +154,16 @@ variadics, and callbacks.
 
 ### 8. WASM target
 
-The second backend target after the C ABI — not GPU. `lu build --target
-wasm32-wasi` (and `wasm32-web`). Enables playground execution, browser
-kernels, serverless, JS embedding, portable benchmark artifacts, sandboxed
-plugins. Because every tier already consumes one validated CFG IR, another
-backend is architecturally cheap here. Treat WASM as distribution leverage;
-don't promise native SIMD parity immediately.
+The second backend target after the C ABI — not GPU — now ships as `lu build
+--target wasm32-wasi` and `--target wasm32-web`. WASI produces a command
+module; the web target produces a reactor plus a dependency-free loader with a
+minimal byte-output host. Both are executable integration-tested. Native
+dynamic externs fail early because they have no portable wasm meaning.
+
+This enables browser kernels, serverless, JS embedding, portable benchmark
+artifacts, and sandboxed plugins. The next playground increment is to package
+its editable evaluator with this target; native SIMD parity remains an
+explicit non-promise.
 
 ### 9. Package manager — deliberately minimal
 
