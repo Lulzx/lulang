@@ -1,5 +1,4 @@
 use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
-use std::cell::RefCell;
 use std::io::Write as _;
 use std::rc::Rc;
 
@@ -9,10 +8,11 @@ const ATOL: f64 = 7.888609052210118e-31; // 2^-100
 #[derive(Clone, Debug)]
 pub enum Value {
     Int(i64),
+    Float32(f32),
     Float(f64),
     Bool(bool),
     Str(Rc<Vec<u8>>),
-    Arr(Rc<RefCell<Vec<Value>>>),
+    Arr(Rc<Vec<Value>>),
     Rec(usize, Rc<Vec<Value>>),
     Enum(usize, i64),
     Unit,
@@ -24,10 +24,23 @@ pub struct Interp<'a> {
 
 fn as_f64(v: &Value) -> Result<f64, String> {
     match v {
+        Value::Float32(f) => Ok(*f as f64),
         Value::Float(f) => Ok(*f),
         Value::Int(i) => Ok(*i as f64),
         v => Err(format!("expected number, got {:?}", v)),
     }
+}
+
+fn coerce(value: Value, ty: &crate::check::Type) -> Result<Value, String> {
+    use crate::check::Type;
+    Ok(match (ty, value) {
+        (Type::F32, Value::Int(v)) => Value::Float32(v as f32),
+        (Type::F32, Value::Float(v)) => Value::Float32(v as f32),
+        (Type::F32, Value::Float32(v)) => Value::Float32(v),
+        (Type::F64, Value::Int(v)) => Value::Float(v as f64),
+        (Type::F64, Value::Float32(v)) => Value::Float(v as f64),
+        (_, value) => value,
+    })
 }
 
 fn as_i64(v: &Value) -> Result<i64, String> {
@@ -50,6 +63,27 @@ fn set_field(slot: &mut Value, path: &[usize], v: Value) -> Result<(), String> {
         }
         v => Err(format!("cannot assign field {} on {:?}", field, v)),
     }
+}
+
+fn set_index(slot: &mut Value, path: &[usize], index: usize, value: Value) -> Result<(), String> {
+    if let Some((&field, rest)) = path.split_first() {
+        let Value::Rec(_, fields) = slot else {
+            return Err(format!("cannot traverse array field on {:?}", slot));
+        };
+        let fields = Rc::make_mut(fields);
+        let field = fields
+            .get_mut(field)
+            .ok_or_else(|| "invalid array field path".to_string())?;
+        return set_index(field, rest, index, value);
+    }
+    let Value::Arr(cells) = slot else {
+        return Err("cannot assign through non-array".into());
+    };
+    let cells = Rc::make_mut(cells);
+    *cells
+        .get_mut(index)
+        .ok_or_else(|| format!("index {} out of bounds", index))? = value;
+    Ok(())
 }
 
 fn approx_eq(a: f64, b: f64) -> bool {
@@ -134,6 +168,15 @@ impl<'a> Interp<'a> {
     /// Candidate simplifications of a value, most aggressive first.
     fn simpler(v: &Value) -> Vec<Value> {
         match v {
+            Value::Float32(f) => {
+                let mut out = Vec::new();
+                for c in [0.0f32, 1.0, -1.0, f.trunc(), f / 2.0] {
+                    if c != *f && c.is_finite() && (c == 0.0 || c.abs() < f.abs()) {
+                        out.push(Value::Float32(c));
+                    }
+                }
+                out
+            }
             Value::Float(f) => {
                 let mut out = Vec::new();
                 for c in [0.0, 1.0, -1.0, f.trunc(), f / 2.0] {
@@ -178,6 +221,10 @@ impl<'a> Interp<'a> {
             *rng
         }
         match ty {
+            crate::check::Type::F32 => {
+                let u = (next(rng) >> 40) as f32 / 16777216.0;
+                Ok(Value::Float32(u * 2.0 - 1.0))
+            }
             crate::check::Type::F64 => {
                 let u = (next(rng) >> 11) as f64 / 9007199254740992.0;
                 Ok(Value::Float(u * 2.0 - 1.0))
@@ -199,7 +246,7 @@ impl<'a> Interp<'a> {
 
     fn type_name(&self, ty: &crate::check::Type) -> String {
         use crate::check::Type::*;
-        match ty { I64=>"i64".into(),F64=>"f64".into(),Bool=>"bool".into(),Str=>"str".into(),Unit=>"()".into(),Arr(t)=>format!("[{}]",self.type_name(t)),Rec(i)=>self.ir.records[*i].name.clone(),Enum(i)=>self.ir.enums[*i].name.clone() }
+        match ty { I64=>"i64".into(),F32=>"f32".into(),F64=>"f64".into(),Bool=>"bool".into(),Str=>"str".into(),Unit=>"()".into(),Arr(t)=>format!("[{}]",self.type_name(t)),Rec(i)=>self.ir.records[*i].name.clone(),Enum(i)=>self.ir.enums[*i].name.clone() }
     }
 
     fn execute(&self, function: &ir::Function, args: Vec<Value>) -> Result<(Value, Vec<Value>), String> {
@@ -207,7 +254,9 @@ impl<'a> Interp<'a> {
             return Err(format!("`{}` expects {} args, got {}", function.name, function.params.len(), args.len()));
         }
         let mut locals = vec![Value::Unit; function.locals.len()];
-        for (&local, value) in function.params.iter().zip(args) { locals[local as usize] = value; }
+        for (&local, value) in function.params.iter().zip(args) {
+            locals[local as usize] = coerce(value, &function.locals[local as usize].ty)?;
+        }
         let mut values = vec![Value::Unit; function.values.len()];
         let mut block_id = function.entry;
         loop {
@@ -215,11 +264,14 @@ impl<'a> Interp<'a> {
             for inst in &block.instructions {
                 let result = match &inst.kind {
                     InstKind::Constant(c) => Some(match c {
-                        Constant::I64(v) => Value::Int(*v), Constant::F64(v) => Value::Float(*v),
+                        Constant::I64(v) => Value::Int(*v), Constant::F32(v) => Value::Float32(*v), Constant::F64(v) => Value::Float(*v),
                         Constant::Bool(v) => Value::Bool(*v), Constant::Bytes(v) => Value::Str(Rc::new(v.clone())), Constant::Unit => Value::Unit,
                     }),
                     InstKind::Load(local) => Some(locals[*local as usize].clone()),
-                    InstKind::Store { local, value } => { locals[*local as usize] = values[*value as usize].clone(); None }
+                    InstKind::Store { local, value } => {
+                        locals[*local as usize] = coerce(values[*value as usize].clone(), &function.locals[*local as usize].ty)?;
+                        None
+                    }
                     InstKind::Unary { op, value } => Some(self.unary(*op, values[*value as usize].clone())?),
                     InstKind::Binary { op, lhs, rhs } => Some(self.binary(*op, &values[*lhs as usize], &values[*rhs as usize])?),
                     InstKind::Select { condition, then_value, else_value } => {
@@ -252,28 +304,34 @@ impl<'a> Interp<'a> {
                     InstKind::Index { base, index } => {
                         let index = as_i64(&values[*index as usize])?;
                         Some(match &values[*base as usize] {
-                            Value::Arr(cells) => cells.borrow().get(index as usize).cloned().ok_or_else(|| format!("index {} out of bounds", index))?,
+                            Value::Arr(cells) => cells.get(index as usize).cloned().ok_or_else(|| format!("index {} out of bounds", index))?,
                             Value::Str(bytes) => Value::Int(*bytes.get(index as usize).ok_or_else(|| format!("index {} out of bounds (length {})", index, bytes.len()))? as i64),
                             value => return Err(format!("cannot index into {:?}", value)),
                         })
                     }
-                    InstKind::Array(items) => Some(Value::Arr(Rc::new(RefCell::new(items.iter().map(|v| values[*v as usize].clone()).collect())))),
+                    InstKind::Array(items) => Some(Value::Arr(Rc::new(items.iter().map(|v| values[*v as usize].clone()).collect()))),
                     InstKind::Record { record, fields } => Some(Value::Rec(*record, Rc::new(fields.iter().map(|v| values[*v as usize].clone()).collect()))),
                     InstKind::Enum { enumeration, tag } => Some(Value::Enum(*enumeration, *tag)),
-                    InstKind::SetIndex { base, index, value } => {
+                    InstKind::SetIndex { root, path, index, value, .. } => {
                         let index = as_i64(&values[*index as usize])?;
-                        let Value::Arr(cells) = &values[*base as usize] else { return Err("cannot assign through non-array".into()) };
-                        let mut cells = cells.borrow_mut();
-                        *cells.get_mut(index as usize).ok_or_else(|| format!("index {} out of bounds", index))? = values[*value as usize].clone(); None
+                        set_index(
+                            &mut locals[*root as usize],
+                            path,
+                            index as usize,
+                            values[*value as usize].clone(),
+                        )?;
+                        None
                     }
                     InstKind::SetField { root, path, value } => { set_field(&mut locals[*root as usize], path, values[*value as usize].clone())?; None }
                 };
-                if let (Some(id), Some(result)) = (inst.result, result) { values[id as usize] = result; }
+                if let (Some(id), Some(result)) = (inst.result, result) {
+                    values[id as usize] = coerce(result, &inst.ty)?;
+                }
             }
             match block.terminator {
                 Terminator::Jump(next) => block_id = next,
                 Terminator::Branch { condition, then_block, else_block } => block_id = if matches!(values[condition as usize], Value::Bool(true)) { then_block } else { else_block },
-                Terminator::Return(value) => return Ok((values[value as usize].clone(), locals)),
+                Terminator::Return(value) => return Ok((coerce(values[value as usize].clone(), &function.ret)?, locals)),
                 Terminator::Unreachable => return Err(format!("reached unterminated IR block in `{}`", function.name)),
             }
         }
@@ -282,6 +340,7 @@ impl<'a> Interp<'a> {
     fn unary(&self, op: UnaryOp, value: Value) -> Result<Value, String> {
         match (op, value) {
             (UnaryOp::Neg, Value::Int(v)) => Ok(Value::Int(v.wrapping_neg())),
+            (UnaryOp::Neg, Value::Float32(v)) => Ok(Value::Float32(-v)),
             (UnaryOp::Neg, Value::Float(v)) => Ok(Value::Float(-v)),
             (UnaryOp::Not, Value::Bool(v)) => Ok(Value::Bool(!v)),
             (op, value) => Err(format!("cannot apply {:?} to {:?}", op, value)),
@@ -299,6 +358,7 @@ impl<'a> Interp<'a> {
                         if op==Div {a/b} else {a%b}
                     }, _=>unreachable!() }; Ok(Value::Int(value))
                 }
+                (Value::Float32(a), Value::Float32(b)) => Ok(Value::Float32(match op {Add=>a+b,Sub=>a-b,Mul=>a*b,Div=>a/b,Rem=>a%b,_=>unreachable!()})),
                 _ => { let (a,b)=(as_f64(lhs)?,as_f64(rhs)?); Ok(Value::Float(match op {Add=>a+b,Sub=>a-b,Mul=>a*b,Div=>a/b,Rem=>a%b,_=>unreachable!()})) }
             },
             Eq | Ne => { let eq=match(lhs,rhs){(Value::Int(a),Value::Int(b))=>a==b,(Value::Bool(a),Value::Bool(b))=>a==b,(Value::Str(a),Value::Str(b))=>a==b,(Value::Enum(ae,a),Value::Enum(be,b))=>ae==be&&a==b,_=>as_f64(lhs)?==as_f64(rhs)?};Ok(Value::Bool(if op==Eq{eq}else{!eq})) }
@@ -415,12 +475,13 @@ impl<'a> Interp<'a> {
                 }))
             }
             "float" => Ok(Value::Float(as_f64(&args[0])?)),
+            "f32" => Ok(Value::Float32(as_f64(&args[0])? as f32)),
             "int" => match &args[0] {
                 Value::Enum(_, tag) => Ok(Value::Int(*tag)),
                 v => Ok(Value::Int(as_f64(v)? as i64)),
             },
             "len" => match &args[0] {
-                Value::Arr(cells) => Ok(Value::Int(cells.borrow().len() as i64)),
+                Value::Arr(cells) => Ok(Value::Int(cells.len() as i64)),
                 Value::Str(s) => Ok(Value::Int(s.len() as i64)),
                 v => Err(format!("`len` expects array or str, got {:?}", v)),
             },
@@ -445,7 +506,7 @@ impl<'a> Interp<'a> {
                     .try_reserve_exact(n)
                     .map_err(|_| "array allocation failed".to_string())?;
                 cells.resize(n, init);
-                Ok(Value::Arr(Rc::new(RefCell::new(cells))))
+                Ok(Value::Arr(Rc::new(cells)))
             }
             _ => {
                 Err(format!("unknown builtin `{}`", name))
@@ -456,12 +517,13 @@ impl<'a> Interp<'a> {
     fn display(&self, v: &Value) -> String {
         match v {
             Value::Int(i) => i.to_string(),
+            Value::Float32(f) => format!("{}", f),
             Value::Float(f) => format!("{}", f),
             Value::Bool(b) => b.to_string(),
             Value::Str(s) => String::from_utf8_lossy(s).into_owned(),
             Value::Unit => "()".into(),
             Value::Arr(cells) => {
-                let parts: Vec<String> = cells.borrow().iter().map(|v| self.display(v)).collect();
+                let parts: Vec<String> = cells.iter().map(|v| self.display(v)).collect();
                 format!("[{}]", parts.join(", "))
             }
             Value::Rec(ti, fields) => {

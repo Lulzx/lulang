@@ -10,6 +10,7 @@ pub type FunctionId = u32;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constant {
     I64(i64),
+    F32(f32),
     F64(f64),
     Bool(bool),
     Bytes(Vec<u8>),
@@ -64,7 +65,15 @@ pub enum InstKind {
     Array(Vec<ValueId>),
     Record { record: usize, fields: Vec<ValueId> },
     Enum { enumeration: usize, tag: i64 },
-    SetIndex { base: ValueId, index: ValueId, value: ValueId },
+    /// Array update with an explicit owning local. Compiled backends update the
+    /// materialized storage; the interpreter copy-on-writes and stores to root.
+    SetIndex {
+        root: LocalId,
+        path: Vec<usize>,
+        base: ValueId,
+        index: ValueId,
+        value: ValueId,
+    },
     SetField { root: LocalId, path: Vec<usize>, value: ValueId },
 }
 
@@ -313,13 +322,16 @@ fn operands(k: &InstKind) -> Vec<ValueId> {
         InstKind::Call { args, .. } | InstKind::Array(args) | InstKind::Record { fields: args, .. } => args.clone(),
         InstKind::Field { base, .. } => vec![*base],
         InstKind::Index { base, index } => vec![*base, *index],
-        InstKind::SetIndex { base, index, value } => vec![*base, *index, *value],
+        InstKind::SetIndex { base, index, value, .. } => vec![*base, *index, *value],
         InstKind::Constant(_) | InstKind::Load(_) | InstKind::Enum { .. } => Vec::new(),
     }
 }
 
 fn compatible(expected: &Type, actual: &Type) -> bool {
-    expected == actual || (*expected == Type::F64 && *actual == Type::I64)
+    expected == actual
+        || (matches!(expected, Type::F32 | Type::F64) && *actual == Type::I64)
+        || (*expected == Type::F32 && *actual == Type::F64)
+        || (*expected == Type::F64 && *actual == Type::F32)
 }
 
 struct Builder<'a> {
@@ -422,8 +434,38 @@ impl<'a> Builder<'a> {
                 match self.p.expr(*target) {
                     ast::Expr::Ident(name) => { let l = self.lookup(name)?; self.store(l, value); }
                     ast::Expr::Index(base, index) => {
+                        let mut names = Vec::new();
+                        let mut current = *base;
+                        let root = loop {
+                            match self.p.expr(current) {
+                                ast::Expr::Ident(name) => break self.lookup(name)?,
+                                ast::Expr::Field(parent, name) => {
+                                    names.push(name.as_str());
+                                    current = *parent;
+                                }
+                                _ => return Err("lowering: invalid indexed assignment root".into()),
+                            }
+                        };
+                        names.reverse();
+                        let mut current_ty = self.locals[root as usize].ty.clone();
+                        let mut path = Vec::new();
+                        for name in names {
+                            let Type::Rec(record) = current_ty else {
+                                return Err("lowering: indexed path crosses non-record".into());
+                            };
+                            let field = self.p.types[record]
+                                .fields
+                                .iter()
+                                .position(|(field, _)| field == name)
+                                .ok_or_else(|| format!("unknown field `{}`", name))?;
+                            current_ty = crate::check::resolve_type(
+                                self.p,
+                                &self.p.types[record].fields[field].1,
+                            )?;
+                            path.push(field);
+                        }
                         let b = self.expr(*base)?; let i = self.expr(*index)?;
-                        self.effect(InstKind::SetIndex { base: b, index: i, value });
+                        self.effect(InstKind::SetIndex { root, path, base: b, index: i, value });
                     }
                     ast::Expr::Field(..) => {
                         let mut names = Vec::new(); let mut cur = *target;
@@ -554,7 +596,7 @@ impl<'a> Builder<'a> {
     fn sum(&mut self,var:&str,lo:ExprId,hi:ExprId,body:ExprId,ty:Type)->Result<ValueId,String>{
         let lo=self.expr(lo)?; let hi=self.expr(hi)?; self.scopes.push(HashMap::new());
         let index=self.add_local(var,Type::I64,false); let acc=self.temp_local(ty.clone()); self.store(index,lo);
-        let zero=match ty {Type::I64=>self.constant(Constant::I64(0),Type::I64),Type::F64=>self.constant(Constant::F64(0.0),Type::F64),_=>return Err("lowering: non-numeric sum".into())}; self.store(acc,zero);
+        let zero=match ty {Type::I64=>self.constant(Constant::I64(0),Type::I64),Type::F32=>self.constant(Constant::F32(0.0),Type::F32),Type::F64=>self.constant(Constant::F64(0.0),Type::F64),_=>return Err("lowering: non-numeric sum".into())}; self.store(acc,zero);
         let head=self.new_block();let loop_body=self.new_block();let exit=self.new_block();self.terminate(Terminator::Jump(head));self.switch(head);
         let iv=self.load(index);let cond=self.emit(InstKind::Binary{op:BinaryOp::Lt,lhs:iv,rhs:hi},Type::Bool);self.terminate(Terminator::Branch{condition:cond,then_block:loop_body,else_block:exit});
         self.switch(loop_body);let value=self.expr(body)?;let old=self.load(acc);let next=self.emit(InstKind::Binary{op:BinaryOp::Add,lhs:old,rhs:value},ty.clone());self.store(acc,next);

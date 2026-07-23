@@ -1,0 +1,14 @@
+[package]
+name = "lu_jit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lu_check.workspace = true
+lu_ir.workspace = true
+lu_syntax.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true

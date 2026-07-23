@@ -1,18 +1,32 @@
-[package]
-name = "lu"
+[workspace]
+members = [
+  "crates/lu_syntax",
+  "crates/lu_check",
+  "crates/lu_ir",
+  "crates/lu_jit",
+  "crates/lu_llvm",
+  "crates/lu_test",
+  "crates/lu",
+]
+default-members = ["crates/lu"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "lu"
-path = "src/main.rs"
-
-[profile.release]
-opt-level = 3
-
-[dependencies]
+[workspace.dependencies]
+lu_syntax = { path = "crates/lu_syntax" }
+lu_check = { path = "crates/lu_check" }
+lu_ir = { path = "crates/lu_ir" }
+lu_jit = { path = "crates/lu_jit" }
+lu_llvm = { path = "crates/lu_llvm" }
+lu_test = { path = "crates/lu_test" }
 cranelift-codegen = "0.131.3"
 cranelift-frontend = "0.131.3"
 cranelift-jit = "0.131.3"
 cranelift-module = "0.131.3"
 cranelift-native = "0.131.3"
+
+[profile.release]
+opt-level = 3

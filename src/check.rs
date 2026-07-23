@@ -5,6 +5,7 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type {
     I64,
+    F32,
     F64,
     Bool,
     Str,
@@ -49,7 +50,8 @@ fn writes_var(p: &Program, e: ExprId, name: &str) -> bool {
 
 pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
     match s {
-        "f64" | "f32" => Ok(Type::F64),
+        "f32" => Ok(Type::F32),
+        "f64" => Ok(Type::F64),
         "i64" | "i32" => Ok(Type::I64),
         "bool" => Ok(Type::Bool),
         "str" => Ok(Type::Str),
@@ -120,7 +122,8 @@ impl<'a> Checker<'a> {
 
     fn resolve(&self, s: &str) -> Result<Type, String> {
         match s {
-            "f64" | "f32" => Ok(Type::F64),
+            "f32" => Ok(Type::F32),
+            "f64" => Ok(Type::F64),
             "i64" | "i32" => Ok(Type::I64),
             "bool" => Ok(Type::Bool),
             "str" => Ok(Type::Str),
@@ -143,6 +146,7 @@ impl<'a> Checker<'a> {
     fn name(&self, t: &Type) -> String {
         match t {
             Type::I64 => "i64".into(),
+            Type::F32 => "f32".into(),
             Type::F64 => "f64".into(),
             Type::Bool => "bool".into(),
             Type::Str => "str".into(),
@@ -154,7 +158,10 @@ impl<'a> Checker<'a> {
     }
 
     fn compat(expected: &Type, actual: &Type) -> bool {
-        expected == actual || (*expected == Type::F64 && *actual == Type::I64)
+        expected == actual
+            || (matches!(expected, Type::F32 | Type::F64) && *actual == Type::I64)
+            || (*expected == Type::F32 && *actual == Type::F64)
+            || (*expected == Type::F64 && *actual == Type::F32)
     }
 
     fn check_fn(&self, f: &FnDecl) -> Result<(), String> {
@@ -240,12 +247,24 @@ impl<'a> Checker<'a> {
                             }
                             t => return Err(format!("cannot index into {}", self.name(&t))),
                         }
-                        if let Expr::Ident(n) = self.p.expr(*a) {
-                            let (_, mutable) =
-                                self.lookup(scopes, n).ok_or(format!("unknown variable `{}`", n))?;
-                            if !mutable {
-                                return Err(format!("cannot write through immutable binding `{}`", n));
+                        let mut current = *a;
+                        let root = loop {
+                            match self.p.expr(current) {
+                                Expr::Ident(name) => break name,
+                                Expr::Field(base, _) => current = *base,
+                                _ => {
+                                    return Err(
+                                        "indexed assignment root must be a variable or its field"
+                                            .into(),
+                                    )
+                                }
                             }
+                        };
+                        let (_, mutable) = self
+                            .lookup(scopes, root)
+                            .ok_or(format!("unknown variable `{}`", root))?;
+                        if !mutable {
+                            return Err(format!("cannot write through immutable binding `{}`", root));
                         }
                     }
                     Expr::Field(_, _) => {
@@ -348,7 +367,7 @@ impl<'a> Checker<'a> {
     }
 
     fn numeric(&self, t: &Type) -> bool {
-        matches!(t, Type::I64 | Type::F64)
+        matches!(t, Type::I64 | Type::F32 | Type::F64)
     }
 
     fn check_expr(&self, eid: ExprId, scopes: &mut Vec<Scope>) -> Result<Type, String> {
@@ -405,7 +424,13 @@ impl<'a> Checker<'a> {
                                 self.name(&rt)
                             ));
                         }
-                        Ok(if lt == Type::F64 || rt == Type::F64 { Type::F64 } else { Type::I64 })
+                        Ok(if lt == Type::F64 || rt == Type::F64 {
+                            Type::F64
+                        } else if lt == Type::F32 || rt == Type::F32 {
+                            Type::F32
+                        } else {
+                            Type::I64
+                        })
                     }
                     "==" | "!=" => {
                         if lt == rt || (self.numeric(&lt) && self.numeric(&rt)) {
@@ -573,8 +598,8 @@ impl<'a> Checker<'a> {
                     }
                     "putf" => {
                         need(1)?;
-                        if ats[0] != Type::F64 {
-                            return Err("`putf` expects an f64".into());
+                        if !matches!(ats[0], Type::F32 | Type::F64) {
+                            return Err("`putf` expects a float".into());
                         }
                         Ok(Type::Unit)
                     }
@@ -636,18 +661,29 @@ impl<'a> Checker<'a> {
                         if !self.numeric(&ats[0]) {
                             return Err(format!("`{}` needs a numeric arg", name));
                         }
-                        Ok(Type::F64)
+                        Ok(if ats[0] == Type::F32 { Type::F32 } else { Type::F64 })
                     }
                     "min" | "max" | "pow" | "atan2" => {
                         need(2)?;
                         if !self.numeric(&ats[0]) || !self.numeric(&ats[1]) {
                             return Err(format!("`{}` needs numeric args", name));
                         }
-                        Ok(Type::F64)
+                        Ok(if ats.iter().all(|t| *t == Type::F32) {
+                            Type::F32
+                        } else {
+                            Type::F64
+                        })
                     }
                     "float" => {
                         need(1)?;
                         Ok(Type::F64)
+                    }
+                    "f32" => {
+                        need(1)?;
+                        if !self.numeric(&ats[0]) {
+                            return Err("`f32` expects a numeric argument".into());
+                        }
+                        Ok(Type::F32)
                     }
                     "int" => {
                         need(1)?;

@@ -95,6 +95,23 @@ char *lu_arr_new_i64(long long n, long long init) {
    (record arrays are laid out SoA — a compiler decision, not a runtime one). */
 char *lu_arr_new_raw(long long n, long long stride) { return arr_alloc(n, stride); }
 
+char *lu_arr_clone(const char *source) {
+  if (!source) return 0;
+  long long slots = *(const long long *)source;
+  if (slots < 0 || (unsigned long long)slots > (SIZE_MAX - 8) / 8) {
+    fprintf(stderr, "error: array allocation size overflow\n");
+    exit(1);
+  }
+  size_t bytes = 8 + (size_t)slots * 8;
+  char *copy = malloc(bytes);
+  if (!copy) {
+    fprintf(stderr, "error: out of memory cloning array\n");
+    exit(1);
+  }
+  memcpy(copy, source, bytes);
+  return copy;
+}
+
 long long lu_str_eq(const char *ap, long long al, const char *bp, long long bl) {
   if (al != bl) return 0;
   for (long long i = 0; i < al; i++)

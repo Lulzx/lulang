@@ -1,0 +1,10 @@
+[package]
+name = "lu_llvm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lu_check.workspace = true
+lu_ir.workspace = true
+lu_syntax.workspace = true
+cranelift-codegen.workspace = true

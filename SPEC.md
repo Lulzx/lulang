@@ -28,7 +28,7 @@ evidence.*
 ## 3. Types
 
 ```
-scalar  := i64 | f64 | bool
+scalar  := i64 | f32 | f64 | bool
 array   := [T; N]          // fixed length, N a literal or const generic (v0.2)
 record  := type Name { field: T, ... }
 ```

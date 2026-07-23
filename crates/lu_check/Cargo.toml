@@ -1,0 +1,7 @@
+[package]
+name = "lu_check"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lu_syntax.workspace = true

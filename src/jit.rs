@@ -5,7 +5,9 @@
 // CFG reduction analysis emits vector accumulators when possible: the language
 // defines `sum` as order-free, so reassociation is legal by construction.
 use crate::ast::{FnDecl, Program};
-use crate::backend::layout::{components as layout_components, field_offset, Component};
+use crate::backend::layout::{
+    array_component_offsets, components as layout_components, field_offset, Component,
+};
 use crate::backend::optimization::{analyze_cfg, if_convert, inline_calls, licm, CfgAnalysis};
 use crate::check::{resolve_type, Type as CType};
 use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
@@ -24,6 +26,7 @@ fn comps(p: &Program, t: &CType) -> Result<Vec<cranelift_codegen::ir::Type>, Str
     Ok(layout_components(p, t)?
         .into_iter()
         .map(|component| match component {
+            Component::F32 => types::F32,
             Component::F64 => types::F64,
             Component::I64 | Component::Ptr => types::I64,
         })
@@ -119,6 +122,7 @@ impl<'a> Jit<'a> {
             ("lu_arr_new_f64", runtime::lu_arr_new_f64 as *const u8),
             ("lu_arr_new_i64", runtime::lu_arr_new_i64 as *const u8),
             ("lu_arr_new_raw", runtime::lu_arr_new_raw as *const u8),
+            ("lu_arr_clone", runtime::lu_arr_clone as *const u8),
             ("lu_str_eq", runtime::lu_str_eq as *const u8),
             ("lu_oob", runtime::lu_oob as *const u8),
             ("lu_i64_div", runtime::lu_i64_div as *const u8),
@@ -203,6 +207,7 @@ impl<'a> Jit<'a> {
             ("lu_arr_new_f64", 1, &[types::I64, types::F64], false),
             ("lu_arr_new_i64", 1, &[types::I64, types::I64], false),
             ("lu_arr_new_raw", 1, &[types::I64, types::I64], false),
+            ("lu_arr_clone", 1, &[types::I64], false),
             (
                 "lu_str_eq",
                 1,
@@ -344,7 +349,14 @@ impl<'a> Jit<'a> {
             let mut cursor = 0;
             for &local in &function.params {
                 let n = comps(g.p, &function.locals[local as usize].ty)?.len();
-                g.define_ir_local(local, &incoming[cursor..cursor + n])?;
+                let mut values = incoming[cursor..cursor + n].to_vec();
+                for offset in array_component_offsets(
+                    g.p,
+                    &function.locals[local as usize].ty,
+                )? {
+                    values[offset] = g.call_import("lu_arr_clone", &[values[offset]])[0];
+                }
+                g.define_ir_local(local, &values)?;
                 cursor += n;
             }
             for (&local, &io) in function.params.iter().zip(&function.inouts) {
@@ -492,6 +504,29 @@ impl<'a, 'b> Gen<'a, 'b> {
             .ok_or_else(|| format!("IR value %{} unavailable", id))
     }
 
+    fn coerce(
+        &mut self,
+        want: &CType,
+        got: &CType,
+        mut values: Vec<Value>,
+    ) -> Result<Vec<Value>, String> {
+        if want == got {
+            return Ok(values);
+        }
+        values = match (want, got) {
+            (CType::F32, CType::I64) => {
+                vec![self.b.ins().fcvt_from_sint(types::F32, values[0])]
+            }
+            (CType::F64, CType::I64) => {
+                vec![self.b.ins().fcvt_from_sint(types::F64, values[0])]
+            }
+            (CType::F32, CType::F64) => vec![self.b.ins().fdemote(types::F32, values[0])],
+            (CType::F64, CType::F32) => vec![self.b.ins().fpromote(types::F64, values[0])],
+            _ => return Err(format!("cannot coerce IR value {:?} to {:?}", got, want)),
+        };
+        Ok(values)
+    }
+
     fn gen_ir_body(
         &mut self,
         function: &ir::Function,
@@ -548,12 +583,8 @@ impl<'a, 'b> Gen<'a, 'b> {
                     );
                 }
                 Terminator::Return(id) => {
-                    let (mut ty, mut vals) = Self::ir_value(&values, id)?;
-                    if function.ret == CType::F64 && ty == CType::I64 {
-                        vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
-                        ty = CType::F64;
-                    }
-                    let _ = ty;
+                    let (ty, vals) = Self::ir_value(&values, id)?;
+                    let vals = self.coerce(&function.ret, &ty, vals)?;
                     self.emit_inout_stores();
                     self.b.ins().return_(&vals);
                 }
@@ -977,6 +1008,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         Ok(match kind {
             InstKind::Constant(c) => Some(match c {
                 Constant::I64(v) => (CType::I64, vec![self.b.ins().iconst(types::I64, *v)]),
+                Constant::F32(v) => (CType::F32, vec![self.b.ins().f32const(*v)]),
                 Constant::F64(v) => (CType::F64, vec![self.b.ins().f64const(*v)]),
                 Constant::Bool(v) => (
                     CType::Bool,
@@ -998,13 +1030,12 @@ impl<'a, 'b> Gen<'a, 'b> {
                 Some((ty, vars.iter().map(|v| self.b.use_var(*v)).collect()))
             }
             InstKind::Store { local, value: id } => {
-                let (mut got, mut vals) = value(*id)?;
+                let (got, vals) = value(*id)?;
                 let want = &function.locals[*local as usize].ty;
-                if *want == CType::F64 && got == CType::I64 {
-                    vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
-                    got = CType::F64;
+                let mut vals = self.coerce(want, &got, vals)?;
+                for offset in array_component_offsets(self.p, want)? {
+                    vals[offset] = self.call_import("lu_arr_clone", &[vals[offset]])[0];
                 }
-                let _ = got;
                 self.define_ir_local(*local, &vals)?;
                 None
             }
@@ -1093,11 +1124,9 @@ impl<'a, 'b> Gen<'a, 'b> {
             InstKind::Record { record, fields } => {
                 let mut out = Vec::new();
                 for (id, (_, type_name)) in fields.iter().zip(&self.p.types[*record].fields) {
-                    let (got, mut vals) = value(*id)?;
+                    let (got, vals) = value(*id)?;
                     let want = resolve_type(self.p, type_name)?;
-                    if want == CType::F64 && got == CType::I64 {
-                        vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
-                    }
+                    let vals = self.coerce(&want, &got, vals)?;
                     out.extend(vals);
                 }
                 Some((ty.clone(), out))
@@ -1110,6 +1139,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 base,
                 index,
                 value: stored,
+                ..
             } => {
                 let base_id = *base;
                 let (base_ty, base) = value(*base)?;
@@ -1253,10 +1283,10 @@ impl<'a, 'b> Gen<'a, 'b> {
     }
 
     fn f64_of(&mut self, t: &CType, v: Value) -> Value {
-        if *t == CType::I64 {
-            self.b.ins().fcvt_from_sint(types::F64, v)
-        } else {
-            v
+        match t {
+            CType::I64 => self.b.ins().fcvt_from_sint(types::F64, v),
+            CType::F32 => self.b.ins().fpromote(types::F64, v),
+            _ => v,
         }
     }
 
@@ -1281,17 +1311,28 @@ impl<'a, 'b> Gen<'a, 'b> {
                 };
                 return Ok((CType::I64, vec![v]));
             }
-            let a = self.f64_of(&lt, lv[0]);
-            let b = self.f64_of(&rt, rv[0]);
+            let result_ty = if lt == CType::F64 || rt == CType::F64 {
+                CType::F64
+            } else {
+                CType::F32
+            };
+            let a = self.coerce(&result_ty, &lt, lv)?[0];
+            let b = self.coerce(&result_ty, &rt, rv)?[0];
             let v = match op {
                 Add => self.b.ins().fadd(a, b),
                 Sub => self.b.ins().fsub(a, b),
                 Mul => self.b.ins().fmul(a, b),
                 Div => self.b.ins().fdiv(a, b),
-                Rem => self.call_import("lu_fmod", &[a, b])[0],
+                Rem if result_ty == CType::F64 => self.call_import("lu_fmod", &[a, b])[0],
+                Rem => {
+                    let ap = self.b.ins().fpromote(types::F64, a);
+                    let bp = self.b.ins().fpromote(types::F64, b);
+                    let rem = self.call_import("lu_fmod", &[ap, bp])[0];
+                    self.b.ins().fdemote(types::F32, rem)
+                }
                 _ => unreachable!(),
             };
-            return Ok((CType::F64, vec![v]));
+            return Ok((result_ty, vec![v]));
         }
         if matches!(op, Eq | Ne) && lt == CType::Str && rt == CType::Str {
             let eq = self.call_import("lu_str_eq", &[lv[0], lv[1], rv[0], rv[1]])[0];
@@ -1422,11 +1463,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let params = info.params.clone();
         let mut flat = Vec::new();
         for ((got, vals), want) in args.into_iter().zip(&params) {
-            if *want == CType::F64 && got == CType::I64 {
-                flat.push(self.b.ins().fcvt_from_sint(types::F64, vals[0]));
-            } else {
-                flat.extend(vals);
-            }
+            flat.extend(self.coerce(want, &got, vals)?);
         }
         let mut slots = Vec::new();
         for (i, (&io, ty)) in decl.inouts.iter().zip(&params).enumerate() {
@@ -1598,6 +1635,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                         self.call_import("lu_print_sep", &[]);
                     }
                     match t {
+                        CType::F32 => {
+                            let value = self.b.ins().fpromote(types::F64, vals[0]);
+                            self.call_import("lu_print_f64", &[value]);
+                        }
                         CType::F64 => {
                             self.call_import("lu_print_f64", &[vals[0]]);
                         }
@@ -1621,7 +1662,8 @@ impl<'a, 'b> Gen<'a, 'b> {
                 Ok((CType::Unit, vec![]))
             }
             "putf" => {
-                self.call_import("lu_print_f64", &[avals[0][0]]);
+                let value = self.f64_of(&atys[0], avals[0][0]);
+                self.call_import("lu_print_f64", &[value]);
                 Ok((CType::Unit, vec![]))
             }
             "putb" => {
@@ -1687,7 +1729,11 @@ impl<'a, 'b> Gen<'a, 'b> {
                     "cos" => self.call_import("lu_cos", &[x])[0],
                     _ => self.call_import("lu_acos", &[x])[0],
                 };
-                Ok((CType::F64, vec![v]))
+                if atys[0] == CType::F32 {
+                    Ok((CType::F32, vec![self.b.ins().fdemote(types::F32, v)]))
+                } else {
+                    Ok((CType::F64, vec![v]))
+                }
             }
             "min" | "max" | "pow" | "atan2" => {
                 let a = self.f64_of(&atys[0], avals[0][0]);
@@ -1698,14 +1744,22 @@ impl<'a, 'b> Gen<'a, 'b> {
                     "pow" => self.call_import("lu_pow", &[a, b])[0],
                     _ => self.call_import("lu_atan2", &[a, b])[0],
                 };
-                Ok((CType::F64, vec![v]))
+                if atys.iter().all(|t| *t == CType::F32) {
+                    Ok((CType::F32, vec![self.b.ins().fdemote(types::F32, v)]))
+                } else {
+                    Ok((CType::F64, vec![v]))
+                }
             }
             "float" => {
                 let v = self.f64_of(&atys[0], avals[0][0]);
                 Ok((CType::F64, vec![v]))
             }
+            "f32" => {
+                let value = self.coerce(&CType::F32, &atys[0], avals[0].clone())?;
+                Ok((CType::F32, value))
+            }
             "int" => {
-                let v = if atys[0] == CType::F64 {
+                let v = if matches!(atys[0], CType::F32 | CType::F64) {
                     self.b.ins().fcvt_to_sint(types::I64, avals[0][0])
                 } else {
                     avals[0][0] // i64, bool, enum tag: already an integer
@@ -1769,7 +1823,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                         let p = self.call_import("lu_arr_new_i64", &[n, avals[1][0]])[0];
                         Ok((CType::Arr(Box::new(elem)), vec![p]))
                     }
-                    t @ (CType::Rec(_) | CType::Str) => {
+                    t @ (CType::F32 | CType::Rec(_) | CType::Str) => {
                         let elem = t.clone();
                         let stride = comps(self.p, &elem)?.len() as i64;
                         let stride_val = self.b.ins().iconst(types::I64, stride);

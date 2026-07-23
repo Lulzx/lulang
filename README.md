@@ -38,8 +38,10 @@ testing.
 ```
 cargo build --release
 ./target/release/lu run  corpus/slerp.lu   # execute main
-./target/release/lu test corpus/slerp.lu   # run property-based tests
+./target/release/lu test --runs 1000 corpus/slerp.lu # property tests, configurable runs
 ./target/release/lu build corpus/slerp.lu  # AOT-compile via LLVM
+./target/release/lu fmt corpus/slerp.lu    # canonical Unicode operators + layout
+./target/release/lu fmt --check corpus/slerp.lu
 ./target/release/lu run selfhost/lexer.lu  # the lulang lexer, written in lulang
 ./target/release/lu run selfhost/parser.lu # the lulang parser, written in lulang
 ./target/release/lu run selfhost/checker.lu # the lulang typechecker, written in lulang
@@ -53,8 +55,9 @@ cargo build --release
 
 ## Architecture
 
-One front end, four back ends. Every mode runs lex → parse → typecheck over a
-flat arena AST, then dispatches:
+One front end, four back ends, packaged as the `lu_syntax`, `lu_check`, `lu_ir`,
+`lu_jit`, `lu_llvm`, `lu_test`, and `lu` workspace crates. Every execution mode
+runs lex → parse → typecheck over a flat arena AST, then dispatches:
 
 ```
                          prog.lu
@@ -188,6 +191,9 @@ planes for record arrays. Each is ablatable (`LU_MATH=call`, `LU_IFCONV=off`,
 `LU_LICM=off`, `LU_SIMD=off`, `LU_LAYOUT=aos`) — measurements in
 [experiments/RESULTS.md](experiments/RESULTS.md).
 
-Known v0.1 deviations from spec: arrays are reference-backed in the interpreter
-(aliasing is observable through them — will be fixed when the IR lands); functions
-must end in an explicit `return` unless they return the block's final expression.
+The v0.1 surface is fully represented in the checked CFG. Arrays use value
+semantics in every host tier (copy-on-write in the reference interpreter and
+explicit compiler-owned copies in compiled tiers), including arrays nested in
+records. Functions may return the final expression of their body. `f32` is a
+distinct IEEE-754 binary32 type throughout the host interpreter, JIT, and AOT
+pipelines.

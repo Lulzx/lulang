@@ -637,10 +637,14 @@ fn remap_inst(
             tag: *tag,
         },
         InstKind::SetIndex {
+            root,
+            path,
             base,
             index,
             value: stored,
         } => InstKind::SetIndex {
+            root: local(*root),
+            path: path.clone(),
             base: value(*base),
             index: value(*index),
             value: value(*stored),

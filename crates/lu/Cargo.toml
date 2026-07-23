@@ -1,0 +1,27 @@
+[package]
+name = "lu"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lu"
+path = "../../src/main.rs"
+
+[[test]]
+name = "regressions"
+path = "../../tests/regressions.rs"
+
+[[test]]
+name = "conformance"
+path = "../../tests/conformance.rs"
+
+[[test]]
+name = "frontend_perf"
+path = "../../tests/frontend_perf.rs"
+
+[dependencies]
+lu_syntax.workspace = true
+lu_ir.workspace = true
+lu_jit.workspace = true
+lu_llvm.workspace = true
+lu_test.workspace = true

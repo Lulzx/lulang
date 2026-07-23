@@ -1,0 +1,8 @@
+[package]
+name = "lu_test"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lu_check.workspace = true
+lu_ir.workspace = true

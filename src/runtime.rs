@@ -157,6 +157,34 @@ pub extern "C" fn lu_arr_new_raw(n: i64, stride: i64) -> *mut u8 {
     arr_alloc(n, stride)
 }
 
+/// Clone the complete compiler-owned array allocation (header plus component
+/// planes). This is the copy primitive used at language value-copy boundaries.
+pub extern "C" fn lu_arr_clone(source: *const u8) -> *mut u8 {
+    if source.is_null() {
+        return std::ptr::null_mut();
+    }
+    let slots = unsafe { *(source as *const i64) };
+    let bytes = usize::try_from(slots)
+        .ok()
+        .and_then(|n| n.checked_mul(8))
+        .and_then(|n| n.checked_add(8))
+        .unwrap_or_else(|| {
+            eprintln!("error: array allocation size overflow");
+            std::process::exit(1);
+        });
+    let layout = Layout::from_size_align(bytes, 8).unwrap_or_else(|_| {
+        eprintln!("error: array allocation size overflow");
+        std::process::exit(1);
+    });
+    let copy = unsafe { alloc(layout) };
+    if copy.is_null() {
+        eprintln!("error: out of memory cloning array");
+        std::process::exit(1);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(source, copy, bytes) };
+    copy
+}
+
 pub extern "C" fn lu_str_eq(ap: *const u8, al: i64, bp: *const u8, bl: i64) -> i64 {
     if al != bl {
         return 0;

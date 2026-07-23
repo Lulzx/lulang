@@ -60,7 +60,7 @@ fn aot(dir: &CaseDir) -> Output {
 
 fn selfhost(source: &Path) -> Output {
     let interpreter = SELFHOST_INTERP.get_or_init(|| {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("selfhost/interp.lu");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../selfhost/interp.lu");
         let dir = std::env::temp_dir().join(format!("lulang-selfhost-{}", std::process::id()));
         fs::create_dir(&dir).expect("create self-host build directory");
         let built = run(Command::new(lu())
@@ -83,6 +83,23 @@ fn assert_success(name: &str, source: &str, expected: &[u8]) {
         ("JIT", host("run", &dir.source())),
         ("AOT", aot(&dir)),
         ("self-hosted", selfhost(&dir.source())),
+    ];
+    for (backend, output) in outputs {
+        assert!(
+            output.status.success(),
+            "{name} failed in {backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, expected, "{name} disagreed in {backend}");
+    }
+}
+
+fn assert_host_success(name: &str, source: &str, expected: &[u8]) {
+    let dir = CaseDir::new(name, source);
+    let outputs = [
+        ("interpreter", host("interp", &dir.source())),
+        ("JIT", host("run", &dir.source())),
+        ("AOT", aot(&dir)),
     ];
     for (backend, output) in outputs {
         assert!(
@@ -165,5 +182,35 @@ fn allocation_size_overflow_traps_everywhere() {
     assert_failure(
         "allocation_size_overflow",
         "type P { x: i64, y: i64 }\nmain {\n let a = arr(9223372036854775807, P { 0, 0 })\n print(len(a))\n}\n",
+    );
+}
+
+#[test]
+fn f32_is_a_distinct_width_in_all_host_tiers() {
+    assert_host_success(
+        "f32_width",
+        "type P { x: f32 }\n\
+         fn narrow(x: f32): f32 { x + f32(1) }\n\
+         fn wrapped(x: f32): P { P { x } }\n\
+         main {\n\
+           var a = arr(2, f32(16777217))\n\
+           print(narrow(16777217), wrapped(16777217).x, a[0])\n\
+         }\n",
+        b"16777216 16777216 16777216\n",
+    );
+}
+
+#[test]
+fn arrays_nested_in_records_still_have_value_semantics() {
+    assert_host_success(
+        "nested_array_value_semantics",
+        "type Bag { values: [i64] }\n\
+         main {\n\
+           var original = Bag { arr(1, 0) }\n\
+           let snapshot = original\n\
+           original.values[0] = 7\n\
+           print(original.values[0], snapshot.values[0])\n\
+         }\n",
+        b"7 0\n",
     );
 }

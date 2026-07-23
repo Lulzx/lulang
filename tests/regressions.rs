@@ -2,8 +2,12 @@ use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
 
 fn run(mode: &str, source: &str) -> Output {
+    run_args(&[mode, "/dev/stdin"], source)
+}
+
+fn run_args(args: &[&str], source: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lu"))
-        .args([mode, "/dev/stdin"])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -60,4 +64,43 @@ fn duplicate_record_fields_are_rejected_by_the_checker() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn array_assignment_has_unobservable_aliasing() {
+    assert_modes(
+        "main {\n var a = arr(2, 0)\n let snapshot = a\n a[0] = 9\n print(a[0], snapshot[0])\n}\n",
+        b"9 0\n",
+    );
+}
+
+#[test]
+fn a_function_may_return_its_final_expression() {
+    assert_modes(
+        "fn twice(x: i64): i64 {\n x * 2\n}\nmain {\n print(twice(21))\n}\n",
+        b"42\n",
+    );
+}
+
+#[test]
+fn unicode_operators_have_stable_ascii_callable_names() {
+    assert_modes(
+        "operator+ (a: i64) ⊕ (b: i64): i64 { a + b }\n\
+         operator ‖(x: i64)‖: i64 { x * x }\n\
+         main {\n\
+           print(2 ⊕ 3, operator_u2295(2, 3))\n\
+           print(‖4‖, operator_u2016_u2016(4))\n\
+         }\n",
+        b"5 5\n16 16\n",
+    );
+}
+
+#[test]
+fn property_run_count_is_configurable() {
+    let output = run_args(
+        &["test", "--runs", "7", "/dev/stdin"],
+        "property reflexive(x: i64) { x == x }\n",
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"property reflexive ... ok (7 runs)\n");
 }

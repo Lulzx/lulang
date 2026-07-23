@@ -2,6 +2,16 @@ use crate::ast::*;
 use crate::lexer::Tok;
 use std::collections::{HashMap, HashSet};
 
+fn operator_ascii_name(glyphs: &[&str]) -> String {
+    let mut name = String::from("operator");
+    for glyph in glyphs {
+        for scalar in glyph.chars() {
+            name.push_str(&format!("_u{:x}", scalar as u32));
+        }
+    }
+    name
+}
+
 pub struct Parser {
     toks: Vec<Tok>,
     pos: usize,
@@ -238,7 +248,9 @@ impl Parser {
             };
             self.eat_sym(":")?;
             let ret = self.parse_type_str()?;
-            let fname = format!("operator{}", glyph);
+            // Stable ASCII-callable spelling required by the language spec.
+            // Example: `⊕` is the ordinary function `operator_u2295`.
+            let fname = operator_ascii_name(&[&glyph]);
             self.prec.insert(glyph.clone(), anchor_prec);
             self.prog.infix_ops.insert(glyph, fname.clone());
             let body = self.parse_block()?;
@@ -260,7 +272,7 @@ impl Parser {
             };
             self.eat_sym(":")?;
             let ret = self.parse_type_str()?;
-            let fname = format!("operator{}{}", open, close);
+            let fname = operator_ascii_name(&[&open, &close]);
             self.circum_close.insert(close.clone());
             self.prog.circum_ops.insert(open, (close, fname.clone()));
             let body = self.parse_block()?;
