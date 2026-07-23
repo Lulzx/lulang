@@ -154,6 +154,9 @@ conformance_cases! {
     left_to_right_and_short_circuit:
         "fn bump(inout x: i64): i64 {\n x = x + 1\n return x\n}\nfn pair(a: i64, b: i64): i64 { return a * 10 + b }\nmain {\n var x = 0\n print(pair(bump(x), x), x)\n print(false and (1 / 0 == 0), true or (1 / 0 == 0))\n}\n"
         => b"11 1\nfalse true\n";
+    string_constants_in_outlined_functions_stay_alive:
+        "fn text(n: i64): str {\n if n == 0 { return \"stable string\" }\n return text(n - 1)\n}\nmain {\n print(text(1))\n}\n"
+        => b"stable string\n";
 }
 
 #[test]

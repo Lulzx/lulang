@@ -377,6 +377,72 @@ fn find_reduction(
 /// locals are remapped, returns converge on a continuation block, and inout
 /// copy-out becomes ordinary stores in the caller.
 pub fn inline_calls(function: &Function, callees: &[Function], budget: usize) -> Function {
+    let mut out = inline_calls_unordered(function, callees, budget);
+    normalize_block_order(&mut out);
+    out
+}
+
+/// Renumber blocks into reverse postorder from the entry.  Inlining appends
+/// continuation and callee blocks out of control-flow order, but the emitters
+/// walk blocks by index and require every value's defining block to precede
+/// its uses; a definition dominates its uses and dominators precede what they
+/// dominate in reverse postorder, so this ordering restores that contract.
+/// Unreachable blocks are dropped.
+fn normalize_block_order(function: &mut Function) {
+    let count = function.blocks.len();
+    let mut visited = vec![false; count];
+    let mut postorder = Vec::with_capacity(count);
+    let mut stack = vec![(function.entry, 0usize)];
+    visited[function.entry as usize] = true;
+    while let Some(&mut (block, ref mut next)) = stack.last_mut() {
+        let successors = successors(&function.blocks[block as usize].terminator);
+        if let Some(&successor) = successors.get(*next) {
+            *next += 1;
+            if !visited[successor as usize] {
+                visited[successor as usize] = true;
+                stack.push((successor, 0));
+            }
+        } else {
+            postorder.push(block);
+            stack.pop();
+        }
+    }
+    let order: Vec<BlockId> = postorder.into_iter().rev().collect();
+    if order
+        .iter()
+        .enumerate()
+        .all(|(index, &block)| index as BlockId == block)
+        && order.len() == count
+    {
+        return;
+    }
+    let mut renumbered = vec![0 as BlockId; count];
+    for (index, &block) in order.iter().enumerate() {
+        renumbered[block as usize] = index as BlockId;
+    }
+    let old_blocks = std::mem::take(&mut function.blocks);
+    let mut old_blocks: Vec<Option<crate::ir::Block>> = old_blocks.into_iter().map(Some).collect();
+    for &old in &order {
+        let mut block = old_blocks[old as usize].take().unwrap();
+        block.terminator = match block.terminator {
+            Terminator::Jump(target) => Terminator::Jump(renumbered[target as usize]),
+            Terminator::Branch {
+                condition,
+                then_block,
+                else_block,
+            } => Terminator::Branch {
+                condition,
+                then_block: renumbered[then_block as usize],
+                else_block: renumbered[else_block as usize],
+            },
+            other => other,
+        };
+        function.blocks.push(block);
+    }
+    function.entry = 0;
+}
+
+fn inline_calls_unordered(function: &Function, callees: &[Function], budget: usize) -> Function {
     let mut out = function.clone();
     let recursive = recursive_functions(callees);
     let mut spent = 0;

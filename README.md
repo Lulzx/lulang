@@ -32,6 +32,9 @@ testing.
 | [DESIGN.md](DESIGN.md) | Reverse-engineering AE's architecture; three revisions deep |
 | [SPEC.md](SPEC.md) | The frozen lulang v0.1 language specification |
 | [experiments/RESULTS.md](experiments/RESULTS.md) | Measurements validating the semantics thesis (~1.9× over idiomatic C++ from defaults alone) |
+| [ROADMAP.md](ROADMAP.md) | Ecosystem growth plan: C ABI boundary, pylulang, bindgen, tooling, playground, showcase apps |
+| [M8-PLAN.md](M8-PLAN.md) | Implementation plan for the C ABI milestone (extern/export, per-tier, slices, test plan) |
+| [KNOWN-ISSUES.md](KNOWN-ISSUES.md) | Fixed JIT correctness regressions; open bootstrap memory blocker |
 
 ## Usage
 

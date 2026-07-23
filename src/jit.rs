@@ -87,6 +87,10 @@ pub struct Jit<'a> {
     fns: HashMap<String, FnInfo>,
     imports: HashMap<&'static str, FuncId>,
     pure_imports: std::collections::HashSet<u32>,
+    // String constants are addressed directly by generated code. Optimized
+    // functions are temporary IR clones, so keep copies alive until execution
+    // finishes instead of embedding pointers into those short-lived clones.
+    strings: Vec<Box<[u8]>>,
 }
 
 impl<'a> Jit<'a> {
@@ -168,6 +172,7 @@ impl<'a> Jit<'a> {
             fns: HashMap::new(),
             imports: HashMap::new(),
             pure_imports: std::collections::HashSet::new(),
+            strings: Vec::new(),
         };
         jit.declare_imports()?;
         jit.declare_fns()?;
@@ -344,6 +349,7 @@ impl<'a> Jit<'a> {
                 cfg_trusted: HashMap::new(),
                 location: (0, 0),
                 skipped_cfg_blocks: std::collections::HashSet::new(),
+                strings: &mut self.strings,
             };
             g.declare_ir_locals(function)?;
             let mut cursor = 0;
@@ -415,6 +421,7 @@ impl<'a> Jit<'a> {
                 cfg_trusted: HashMap::new(),
                 location: (0, 0),
                 skipped_cfg_blocks: std::collections::HashSet::new(),
+                strings: &mut self.strings,
             };
             g.declare_ir_locals(function)?;
             g.gen_ir_body(function, &blocks)?;
@@ -457,6 +464,7 @@ struct Gen<'a, 'b> {
     cfg_trusted: HashMap<(usize, ir::LocalId), Value>,
     location: (ir::BlockId, usize),
     skipped_cfg_blocks: std::collections::HashSet<ir::BlockId>,
+    strings: &'a mut Vec<Box<[u8]>>,
 }
 
 impl<'a, 'b> Gen<'a, 'b> {
@@ -1014,13 +1022,19 @@ impl<'a, 'b> Gen<'a, 'b> {
                     CType::Bool,
                     vec![self.b.ins().iconst(types::I64, *v as i64)],
                 ),
-                Constant::Bytes(bytes) => (
-                    CType::Str,
-                    vec![
-                        self.b.ins().iconst(types::I64, bytes.as_ptr() as i64),
-                        self.b.ins().iconst(types::I64, bytes.len() as i64),
-                    ],
-                ),
+                Constant::Bytes(bytes) => {
+                    let bytes = bytes.clone().into_boxed_slice();
+                    let ptr = bytes.as_ptr();
+                    let len = bytes.len();
+                    self.strings.push(bytes);
+                    (
+                        CType::Str,
+                        vec![
+                            self.b.ins().iconst(types::I64, ptr as i64),
+                            self.b.ins().iconst(types::I64, len as i64),
+                        ],
+                    )
+                }
                 Constant::Unit => (CType::Unit, vec![]),
             }),
             InstKind::Load(local) => {
