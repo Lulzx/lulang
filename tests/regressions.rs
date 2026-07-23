@@ -212,6 +212,10 @@ fn ffi_boundary_subset_and_register_caps_are_checked() {
             "@c_layout type Wide { x: i64, y: i64, z: i64 }\nextern fn bad(value: Wide)\nmain {}\n",
             "one or two 64-bit fields",
         ),
+        (
+            "extern fn bad(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64): str\nmain {}\n",
+            "maximum is 6 and 8",
+        ),
     ];
     for (source, message) in cases {
         let output = run("interp", source);

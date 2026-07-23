@@ -80,6 +80,7 @@ pub fn resolve(lib: Option<&str>, symbol: &str) -> Result<usize, String> {
         "lu_ffi_call_i" => Some(lu_ffi_call_i as *const () as usize),
         "lu_ffi_call_f" => Some(lu_ffi_call_f as *const () as usize),
         "lu_ffi_call_f32" => Some(lu_ffi_call_f32 as *const () as usize),
+        "lu_ffi_call_str" => Some(lu_ffi_call_str as *const () as usize),
         _ => None,
     };
     if let Some(pointer) = bridge {
@@ -147,7 +148,7 @@ unsafe fn unpack_call(
     control_length: i64,
     float_pointer: *mut f64,
     float_length: i64,
-) -> Result<([i64; 6], [f64; 8], Vec<Vec<u8>>), String> {
+) -> Result<([i64; 6], [f64; 8], Vec<Vec<u8>>, usize, usize), String> {
     if control_length < 1 || float_length < 0 {
         return Err("invalid packed FFI call".into());
     }
@@ -253,7 +254,13 @@ unsafe fn unpack_call(
             _ => return Err(format!("unknown packed FFI argument kind {}", kind)),
         }
     }
-    Ok((ints, float_registers, string_buffers))
+    Ok((
+        ints,
+        float_registers,
+        string_buffers,
+        integer_index,
+        float_index,
+    ))
 }
 
 pub unsafe extern "C" fn lu_ffi_call_i(
@@ -264,7 +271,7 @@ pub unsafe extern "C" fn lu_ffi_call_i(
 ) -> i64 {
     let pointer = *PREPARED.get_or_init(|| Mutex::new(0)).lock().unwrap();
     match unpack_call(control, control_length, floats, float_length) {
-        Ok((ints, float_registers, _strings)) if pointer != 0 => {
+        Ok((ints, float_registers, _strings, _, _)) if pointer != 0 => {
             call_i64(pointer, ints, float_registers)
         }
         Ok(_) => {
@@ -286,7 +293,7 @@ pub unsafe extern "C" fn lu_ffi_call_f(
 ) -> f64 {
     let pointer = *PREPARED.get_or_init(|| Mutex::new(0)).lock().unwrap();
     match unpack_call(control, control_length, floats, float_length) {
-        Ok((ints, float_registers, _strings)) if pointer != 0 => {
+        Ok((ints, float_registers, _strings, _, _)) if pointer != 0 => {
             call_f64(pointer, ints, float_registers)
         }
         Ok(_) => {
@@ -308,7 +315,7 @@ pub unsafe extern "C" fn lu_ffi_call_f32(
 ) -> f64 {
     let pointer = *PREPARED.get_or_init(|| Mutex::new(0)).lock().unwrap();
     match unpack_call(control, control_length, floats, float_length) {
-        Ok((ints, float_registers, _strings)) if pointer != 0 => {
+        Ok((ints, float_registers, _strings, _, _)) if pointer != 0 => {
             call_f32(pointer, ints, float_registers) as f64
         }
         Ok(_) => {
@@ -318,6 +325,51 @@ pub unsafe extern "C" fn lu_ffi_call_f32(
         Err(error) => {
             eprintln!("runtime error: {}", error);
             0.0
+        }
+    }
+}
+
+pub unsafe extern "C" fn lu_ffi_call_str(
+    control: *mut i64,
+    control_length: i64,
+    floats: *mut f64,
+    float_length: i64,
+    out_length: *mut i64,
+) -> *const u8 {
+    let pointer = *PREPARED.get_or_init(|| Mutex::new(0)).lock().unwrap();
+    let result: Result<*const u8, String> = (|| {
+        let (mut ints, float_registers, _strings, integer_count, _) =
+            unpack_call(control, control_length, floats, float_length)?;
+        if pointer == 0 {
+            return Err("no prepared FFI symbol".into());
+        }
+        if integer_count >= ints.len() {
+            return Err("packed FFI string return register overflow".into());
+        }
+        let mut length = 0i64;
+        ints[integer_count] = (&mut length as *mut i64) as i64;
+        let returned = call_i64(pointer, ints, float_registers) as *const u8;
+        if length < 0 || (returned.is_null() && length != 0) {
+            return Err("invalid returned FFI string".into());
+        }
+        let bytes = if length == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(returned, length as usize).to_vec()
+        };
+        if !out_length.is_null() {
+            *out_length = length;
+        }
+        Ok(Box::leak(bytes.into_boxed_slice()).as_ptr())
+    })();
+    match result {
+        Ok(pointer) => pointer,
+        Err(error) => {
+            eprintln!("runtime error: {}", error);
+            if !out_length.is_null() {
+                *out_length = 0;
+            }
+            std::ptr::null()
         }
     }
 }

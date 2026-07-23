@@ -964,7 +964,8 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
       }
     }
   }
-  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or ret == 5 or is_enumt(ret) or is_ptrt(ret)) {
+  if ret == 3 { ni = ni + 1 }
+  if not (ret == 0 or ret == 1 or ret == 2 or ret == 3 or ret == 4 or ret == 5 or is_enumt(ret) or is_ptrt(ret)) {
     print("type error: unsupported FFI return in", name)
     p.err = 1
   }
@@ -2784,6 +2785,18 @@ fn emit_user_call(p: P, inout g: G, fi: i64, at: [i64], ao: [i64], argv: [i64]):
       }
     }
   }
+  if p.fextern[fi] == 1 and p.fret[fi] == 3 {
+    let length_pointer = newt(g)
+    eline(c2str(length_pointer, " = alloca i64"))
+    parts = join2(parts, c2str("ptr ", length_pointer))
+    let returned = newt(g)
+    eline(c7(returned, " = call ptr @\"", emitted_name(p, fi), "\"(", parts, ")", ""))
+    let length = newt(g)
+    eline(c4(length, " = load i64, ptr ", length_pointer, ""))
+    let copied = newt(g)
+    eline(c6(copied, " = call ptr @lu_str_copy(ptr ", returned, ", i64 ", length, ")"))
+    return rpush2(g, 3, copied, length)
+  }
   var nc = abi_nc(p, fi)
   var rt = agg_ty(nc, abi_join(p, fi))
   if p.fextern[fi] == 1 {
@@ -3354,8 +3367,15 @@ fn emit_export_wrapper(p: P, f: i64) {
     }
   }
   var rt = "void"
-  if p.fret[f] != 4 { rt = compty(p, p.fret[f], 0) }
-  puts(c8("define dso_local ", rt, " @\"", p.fname[f], "\"(", params, ") {", ""))
+  if p.fret[f] != 4 { rt = agg_ty(wcount(p, p.fret[f]), comps_join(p, p.fret[f])) }
+  var wrapper_rt = rt
+  var string_length_out = ""
+  if p.fret[f] == 3 {
+    string_length_out = c2str("%c", i2s(ci))
+    params = join2(params, c2str("ptr ", string_length_out))
+    wrapper_rt = "ptr"
+  }
+  puts(c8("define dso_local ", wrapper_rt, " @\"", p.fname[f], "\"(", params, ") {", ""))
   putnl()
   puts("entry:")
   putnl()
@@ -3419,10 +3439,17 @@ fn emit_export_wrapper(p: P, f: i64) {
     puts(c2str(lq, "_out_done:"))
     putnl()
   }
+  if p.fret[f] == 3 {
+    eline("%wrapper_str_ptr = extractvalue { ptr, i64 } %wrapper_result, 0")
+    eline("%wrapper_str_len = extractvalue { ptr, i64 } %wrapper_result, 1")
+    eline(c3("store i64 %wrapper_str_len, ptr ", string_length_out, ""))
+    eline("ret ptr %wrapper_str_ptr")
+  } else {
   if rt == "void" {
     eline("ret void")
   } else {
     eline(c3("ret ", rt, " %wrapper_result"))
+  }
   }
   puts("}")
   putnl()
@@ -3446,8 +3473,13 @@ fn emit_extern_decl(p: P, f: i64) {
       }
     }
   }
+  if p.fret[f] == 3 { parts = join2(parts, "ptr") }
   var rt = "void"
-  if p.fret[f] != 4 { rt = compty(p, p.fret[f], 0) }
+  if p.fret[f] == 3 {
+    rt = "ptr"
+  } else {
+    if p.fret[f] != 4 { rt = compty(p, p.fret[f], 0) }
+  }
   puts(c8("declare ", rt, " @\"", p.fname[f], "\"(", parts, ")", ""))
   putnl()
   if p.flib[f] != "" {
@@ -3523,6 +3555,8 @@ fn emit_module(p: P, inout g: G, triple: str) {
   puts("declare ptr @lu_arr_clone(ptr)")
   putnl()
   puts("declare i64 @lu_str_eq(ptr, i64, ptr, i64) #0")
+  putnl()
+  puts("declare ptr @lu_str_copy(ptr, i64)")
   putnl()
   puts("declare ptr @lu_arr_new_f64(i64, double)")
   putnl()

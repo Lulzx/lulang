@@ -118,10 +118,22 @@ fn emit_export_wrapper(
     }
 
     let ret_components = lty(program, &function.ret)?;
-    let ret_type = comps_ty(&ret_components);
+    let internal_ret_type = comps_ty(&ret_components);
+    let string_length_out = if function.ret == CType::Str {
+        let name = format!("%c{}", argument);
+        params.push(format!("ptr {}", name));
+        Some(name)
+    } else {
+        None
+    };
+    let wrapper_ret_type = if string_length_out.is_some() {
+        "ptr".into()
+    } else {
+        internal_ret_type.clone()
+    };
     let mut out = format!(
         "define dso_local {} @\"{}\"({}) {{\nentry:\n",
-        ret_type,
+        wrapper_ret_type,
         decl.name,
         params.join(", ")
     );
@@ -167,7 +179,7 @@ fn emit_export_wrapper(
         let _ = writeln!(
             out,
             "  %wrapper_result = call {} @\"{}\"({})",
-            ret_type,
+            internal_ret_type,
             internal_symbol(decl),
             internal_args.join(", ")
         );
@@ -194,10 +206,18 @@ fn emit_export_wrapper(
              wa{index}_out_done:"
         );
     }
-    if ret_components.is_empty() {
+    if let Some(length_out) = string_length_out {
+        let _ = writeln!(
+            out,
+            "  %wrapper_str_ptr = extractvalue {{ ptr, i64 }} %wrapper_result, 0\n\
+             \x20 %wrapper_str_len = extractvalue {{ ptr, i64 }} %wrapper_result, 1\n\
+             \x20 store i64 %wrapper_str_len, ptr {length_out}\n\
+             \x20 ret ptr %wrapper_str_ptr\n}}\n"
+        );
+    } else if ret_components.is_empty() {
         out.push_str("  ret void\n}\n\n");
     } else {
-        let _ = writeln!(out, "  ret {} %wrapper_result\n}}\n", ret_type);
+        let _ = writeln!(out, "  ret {} %wrapper_result\n}}\n", wrapper_ret_type);
     }
     Ok(out)
 }
@@ -478,6 +498,7 @@ fn build_output(
          declare ptr @lu_arr_new_raw(i64, i64)\n\
          declare ptr @lu_arr_clone(ptr)\n\
          declare i64 @lu_str_eq(ptr, i64, ptr, i64) #0\n\
+         declare ptr @lu_str_copy(ptr, i64)\n\
          declare ptr @lu_arr_new_f64(i64, double)\ndeclare ptr @lu_arr_new_i64(i64, i64)\n\
          declare void @lu_oob(i64, i64) #1\n\
          declare i64 @lu_i64_div(i64, i64)\ndeclare i64 @lu_i64_rem(i64, i64)\n\
@@ -489,7 +510,11 @@ fn build_output(
          attributes #1 = { noreturn }\n\n",
     );
     for declaration in &ir.externs {
-        let ret = comps_ty(&lty(p, &declaration.ret)?);
+        let ret = if declaration.ret == CType::Str {
+            "ptr".into()
+        } else {
+            comps_ty(&lty(p, &declaration.ret)?)
+        };
         let mut params = Vec::new();
         for (_, ty) in &declaration.params {
             if matches!(ty, CType::Arr(_)) {
@@ -500,6 +525,9 @@ fn build_output(
             } else {
                 params.extend(lty(p, ty)?.into_iter().map(String::from));
             }
+        }
+        if declaration.ret == CType::Str {
+            params.push("ptr".into());
         }
         let _ = writeln!(
             module,
@@ -1588,6 +1616,29 @@ impl<'a> Emit<'a> {
                     }
                 }
             }
+        }
+        if declaration.ret == CType::Str {
+            let length_pointer = self.t();
+            self.line(format!("{} = alloca i64", length_pointer));
+            parts.push(format!("ptr {}", length_pointer));
+            let returned = self.t();
+            self.line(format!(
+                "{} = call ptr @\"{}\"({})",
+                returned,
+                declaration.name,
+                parts.join(", ")
+            ));
+            let length = self.t();
+            self.line(format!("{} = load i64, ptr {}", length, length_pointer));
+            let copied = self.t();
+            self.line(format!(
+                "{} = call ptr @lu_str_copy(ptr {}, i64 {})",
+                copied, returned, length
+            ));
+            return Ok(EV {
+                ty: CType::Str,
+                regs: vec![copied, length],
+            });
         }
         let components = lty(self.p, &declaration.ret)?;
         if components.is_empty() {

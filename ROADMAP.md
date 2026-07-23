@@ -65,9 +65,10 @@ more viral direction: nobody rewrites their app, but everyone will try a
 2×-faster kernel. The JSON manifest is the foundation for automatic bindings
 (`pylulang`, future `lu bindgen` output verification).
 
-M8 boundary subset plus its first compatible extension: `i64`, `f32`, `f64`,
+M8 boundary subset plus its compatible extensions: `i64`, `f32`, `f64`,
 `bool` (0/1 as `int64_t`), enums (i64 tag),
-`str` as `(const char*, int64_t)` parameters, `[i64]`/`[f64]` as
+`str` as `(const char*, int64_t)` parameters and
+`const char *fn(..., int64_t *out_len)` returns, `[i64]`/`[f64]` as
 `(T* data, int64_t n)`. Signatures capped at 6 integer-class + 8 float-class
 components (a language rule that keeps every argument in registers on both
 SysV x86-64 and AArch64). Boundary-only `c_ptr[T]` opaque handles now work in
@@ -80,8 +81,8 @@ four tiers; exported kernels and `pylulang` consume C-contiguous buffers
 without an array copy. Portable by-value `@c_layout` parameters—flat, one or
 two homogeneous 64-bit fields—now work without adapters in every tier,
 generated C libraries, bindgen, and `pylulang`. Remaining follow-ups: broader
-aggregate classification, `str` returns, callbacks, and owning zero-copy array
-export handles.
+aggregate classification, callbacks, and owning zero-copy array export
+handles.
 
 ### 3. `pylulang`
 

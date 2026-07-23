@@ -194,5 +194,42 @@ fn ffi_import_and_export_ir_match_the_host_byte_for_byte() {
         "direct @c_layout export wrappers drifted between host and selfhost"
     );
 
+    let string_return_source = directory.join("string-return-boundary.lu");
+    std::fs::write(
+        &string_return_source,
+        "extern \"labels\" fn make_label(prefix: str): str\n\
+         export fn greeting(prefix: str): str {\n\
+           return concat(prefix, \"!\")\n\
+         }\n\
+         main { print(greeting(\"hi\")) }\n",
+    )
+    .expect("write string return boundary fixture");
+    let host_string_return_path = directory.join("host-string-return.ll");
+    let host_string_return = emit_host_ir(&string_return_source, &host_string_return_path);
+    let selfhost_string_return = emit_selfhost_ir(&repository, &string_return_source, triple);
+    let declaration = "declare ptr @\"make_label\"(ptr, i64, ptr)";
+    assert_eq!(
+        host_string_return.lines().find(|line| *line == declaration),
+        selfhost_string_return
+            .lines()
+            .find(|line| *line == declaration),
+        "string-return import declarations drifted between host and selfhost"
+    );
+    let wrapper_start = "define dso_local ptr @\"greeting\"(ptr %c0, i64 %c1, ptr %c2)";
+    let host_string_wrapper = host_string_return
+        .split(wrapper_start)
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("host string-return wrapper");
+    let selfhost_string_wrapper = selfhost_string_return
+        .split(wrapper_start)
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("selfhost string-return wrapper");
+    assert_eq!(
+        host_string_wrapper, selfhost_string_wrapper,
+        "string-return export wrappers drifted between host and selfhost"
+    );
+
     let _ = std::fs::remove_dir_all(directory);
 }

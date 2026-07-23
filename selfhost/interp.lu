@@ -25,6 +25,7 @@ extern fn lu_ffi_prepare(library: str, symbol: str): i64
 extern fn lu_ffi_call_i(control: [i64], floats: [f64]): i64
 extern fn lu_ffi_call_f(control: [i64], floats: [f64]): f64
 extern fn lu_ffi_call_f32(control: [i64], floats: [f64]): f64
+extern fn lu_ffi_call_str(control: [i64], floats: [f64]): str
 
 // ---------- lexer (same as selfhost/lexer.lu) ----------
 
@@ -978,7 +979,8 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
       }
     }
   }
-  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or ret == 5 or is_enumt(ret) or is_ptrt(ret)) {
+  if ret == 3 { ni = ni + 1 }
+  if not (ret == 0 or ret == 1 or ret == 2 or ret == 3 or ret == 4 or ret == 5 or is_enumt(ret) or is_ptrt(ret)) {
     print("type error: unsupported FFI return in", name)
     p.err = 1
   }
@@ -2054,6 +2056,10 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
   }
   var integer_result = 0
   var float_result = 0.0
+  var string_result = ""
+  if p.fret[f] == 3 {
+    string_result = lu_ffi_call_str(control, floats)
+  } else {
   if p.fret[f] == 1 {
     float_result = lu_ffi_call_f(control, floats)
   } else {
@@ -2062,6 +2068,7 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
     } else {
       integer_result = lu_ffi_call_i(control, floats)
     }
+  }
   }
   for j in 0..p.fnp[f] {
     let v = vals[j]
@@ -2082,6 +2089,7 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
   if p.fret[f] == 1 { return vfloat(float_result) }
   if p.fret[f] == 5 { return vf32(float_result) }
   if p.fret[f] == 2 { return vbool(integer_result) }
+  if p.fret[f] == 3 { return vstr(string_result) }
   if is_enumt(p.fret[f]) {
     return V { t: p.fret[f], i: integer_result, f: 0.0, s: "", o: 0, n: 0 }
   }

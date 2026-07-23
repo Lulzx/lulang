@@ -126,9 +126,16 @@ class _Function:
                 argtypes.append(records[type_name])
             else:
                 argtypes.append(_scalar_ctype(type_name, enums))
-        self._function.argtypes = argtypes
         ret = spec["ret"]
-        self._function.restype = None if ret == "()" else _scalar_ctype(ret, enums)
+        if ret == "str":
+            argtypes.append(ctypes.POINTER(ctypes.c_int64))
+        self._function.argtypes = argtypes
+        if ret == "()":
+            self._function.restype = None
+        elif ret == "str":
+            self._function.restype = ctypes.c_void_p
+        else:
+            self._function.restype = _scalar_ctype(ret, enums)
 
     def __call__(self, *args: Any) -> Any:
         if len(args) != len(self._spec["params"]):
@@ -173,9 +180,14 @@ class _Function:
                 flattened.append(int(bool(value)))
             else:
                 flattened.append(value)
+        returned_length = ctypes.c_int64()
+        if self._spec["ret"] == "str":
+            flattened.append(ctypes.byref(returned_length))
         result = self._function(*flattened)
         for copy_back in copy_backs:
             copy_back()
+        if self._spec["ret"] == "str":
+            return ctypes.string_at(result, returned_length.value)
         return bool(result) if self._spec["ret"] == "bool" else result
 
 
