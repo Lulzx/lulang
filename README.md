@@ -87,10 +87,9 @@ flat arena AST, then dispatches:
 
 Execution APIs accept only `LoweredProgram`; unchecked parser output cannot
 reach an interpreter or code generator. The reference interpreter and property
-engine execute its CFG directly. Cranelift and LLVM currently retain a
-source-pattern view for their specialized loop optimizations while their
-emitters are migrated instruction-by-instruction. Lowering/validation lives in
-`ir.rs`; shared
+engine execute its CFG directly. Cranelift and LLVM emit the same CFG's blocks
+and typed instructions directly; the source declaration view is used only for
+record layout and ABI names. Lowering/validation lives in `ir.rs`; shared
 component layout, flattened ABI, and optimization analysis live under
 `src/backend/`, separate from the Cranelift and LLVM emission modules.
 `tests/conformance.rs` generates small programs and diffs reference

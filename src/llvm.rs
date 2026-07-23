@@ -12,7 +12,7 @@ use crate::backend::abi::return_components;
 use crate::backend::layout::{components as layout_components, field_offset, Component};
 use crate::backend::optimization::{scan_trusted, scan_trusted_expr};
 use crate::check::{resolve_type, Type as CType};
-use crate::ir::LoweredProgram;
+use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -28,7 +28,10 @@ fn lty(p: &Program, t: &CType) -> Result<Vec<&'static str>, String> {
 
 /// ABI return components of a function: declared return + inout param comps.
 fn abi_ret_comps<'x>(p: &Program, f: &FnDecl) -> Result<Vec<&'x str>, String> {
-    Ok(return_components(p, f)?.into_iter().map(llvm_component).collect())
+    Ok(return_components(p, f)?
+        .into_iter()
+        .map(llvm_component)
+        .collect())
 }
 
 fn llvm_component(component: Component) -> &'static str {
@@ -53,6 +56,7 @@ struct EV {
     regs: Vec<String>, // literal constants or %regs, one per component
 }
 
+#[allow(dead_code)] // legacy source-pattern helpers remain until the JIT migration lands
 struct Emit<'a> {
     p: &'a Program,
     expr_types: &'a [Option<CType>],
@@ -72,7 +76,11 @@ struct Emit<'a> {
     in_main: bool,
 }
 
-pub fn build(ir: &LoweredProgram, src_path: &str, out_path: Option<&str>) -> Result<String, String> {
+pub fn build(
+    ir: &LoweredProgram,
+    src_path: &str,
+    out_path: Option<&str>,
+) -> Result<String, String> {
     let p = ir.source();
     let mut e = Emit {
         p,
@@ -83,7 +91,9 @@ pub fn build(ir: &LoweredProgram, src_path: &str, out_path: Option<&str>) -> Res
         env: vec![HashMap::new()],
         strings: Vec::new(),
         trusted: Vec::new(),
-        soa: std::env::var("LU_LAYOUT").map(|v| v != "aos").unwrap_or(true),
+        soa: std::env::var("LU_LAYOUT")
+            .map(|v| v != "aos")
+            .unwrap_or(true),
         inout_params: Vec::new(),
         ret: CType::Unit,
         terminated: false,
@@ -108,7 +118,10 @@ pub fn build(ir: &LoweredProgram, src_path: &str, out_path: Option<&str>) -> Res
         .map_err(|e| format!("failed to probe clang target triple: {}", e))?;
     let triple = String::from_utf8_lossy(&probe.stdout)
         .lines()
-        .find_map(|l| l.strip_prefix("target triple = \"").map(|r| r.trim_end_matches('"').to_string()))
+        .find_map(|l| {
+            l.strip_prefix("target triple = \"")
+                .map(|r| r.trim_end_matches('"').to_string())
+        })
         .ok_or("could not determine target triple from clang")?;
     let _ = writeln!(module, "target triple = \"{}\"", triple);
     module.push_str(
@@ -132,11 +145,11 @@ pub fn build(ir: &LoweredProgram, src_path: &str, out_path: Option<&str>) -> Res
          attributes #0 = { nounwind willreturn memory(none) }\n\
          attributes #1 = { noreturn }\n\n",
     );
-    for f in &p.fns {
-        module.push_str(&e.emit_fn(f)?);
+    for (index, f) in p.fns.iter().enumerate() {
+        module.push_str(&e.emit_ir_fn(&ir.functions[index], f)?);
     }
-    let main = p.main.as_ref().ok_or("no `main` block in program")?;
-    module.push_str(&e.emit_main(main)?);
+    let main = ir.main.as_ref().ok_or("no `main` block in program")?;
+    module.push_str(&e.emit_ir_main(main)?);
     for (i, s) in e.strings.iter().enumerate() {
         let bytes: String = s.bytes().map(|b| format!("\\{:02X}", b)).collect();
         let _ = writeln!(
@@ -153,7 +166,9 @@ pub fn build(ir: &LoweredProgram, src_path: &str, out_path: Option<&str>) -> Res
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("out");
-    let out_bin = out_path.map(String::from).unwrap_or_else(|| stem.to_string());
+    let out_bin = out_path
+        .map(String::from)
+        .unwrap_or_else(|| stem.to_string());
     let pid = std::process::id();
     let ll_path = std::env::temp_dir().join(format!("lu_{}_{}.ll", stem, pid));
     std::fs::write(&ll_path, &module).map_err(|e| e.to_string())?;
@@ -165,7 +180,8 @@ pub fn build(ir: &LoweredProgram, src_path: &str, out_path: Option<&str>) -> Res
     let runtime_o = std::env::temp_dir().join(format!("lu_runtime_{:016x}.o", rt_hash));
     if !runtime_o.exists() {
         let runtime_c = std::env::temp_dir().join(format!("lu_runtime_{}.c", pid));
-        let runtime_tmp_o = std::env::temp_dir().join(format!("lu_runtime_{:016x}_{}.o", rt_hash, pid));
+        let runtime_tmp_o =
+            std::env::temp_dir().join(format!("lu_runtime_{:016x}_{}.o", rt_hash, pid));
         std::fs::write(&runtime_c, rt_src).map_err(|e| e.to_string())?;
         let st = std::process::Command::new("clang")
             .args(["-O3", "-mcpu=native", "-c", "-o"])
@@ -196,6 +212,7 @@ pub fn build(ir: &LoweredProgram, src_path: &str, out_path: Option<&str>) -> Res
     Ok(out_bin)
 }
 
+#[allow(dead_code)]
 impl<'a> Emit<'a> {
     fn t(&mut self) -> String {
         self.tmp += 1;
@@ -213,6 +230,618 @@ impl<'a> Emit<'a> {
     fn label(&mut self, l: &str) {
         self.out.push_str(l);
         self.out.push_str(":\n");
+    }
+
+    fn ir_local(id: ir::LocalId) -> String {
+        format!("$l{}", id)
+    }
+
+    fn declare_uninit(&mut self, name: &str, ty: &CType) -> Result<(), String> {
+        let mut ptrs = Vec::new();
+        for component in lty(self.p, ty)? {
+            let ptr = self.t();
+            self.line(format!("{} = alloca {}", ptr, component));
+            ptrs.push(ptr);
+        }
+        self.env
+            .last_mut()
+            .unwrap()
+            .insert(name.to_string(), (ty.clone(), ptrs));
+        Ok(())
+    }
+
+    fn emit_ir_fn(&mut self, function: &ir::Function, decl: &FnDecl) -> Result<String, String> {
+        self.out.clear();
+        self.tmp = 0;
+        self.lbl = 0;
+        self.env = vec![HashMap::new()];
+        self.trusted.clear();
+        self.terminated = false;
+        self.ret = function.ret.clone();
+        self.in_main = false;
+        let mut params = Vec::new();
+        let mut incoming = Vec::new();
+        let mut cursor = 0;
+        for &local in &function.params {
+            let ty = &function.locals[local as usize].ty;
+            let mut regs = Vec::new();
+            for component in lty(self.p, ty)? {
+                params.push(format!("{} %p{}", component, cursor));
+                regs.push(format!("%p{}", cursor));
+                cursor += 1;
+            }
+            incoming.push((local, regs));
+        }
+        self.inout_params = function
+            .params
+            .iter()
+            .zip(&function.inouts)
+            .filter(|(_, io)| **io)
+            .map(|(&local, _)| {
+                (
+                    Self::ir_local(local),
+                    function.locals[local as usize].ty.clone(),
+                )
+            })
+            .collect();
+        let header = format!(
+            "define internal {} @\"{}\"({}) {{\n",
+            comps_ty(&abi_ret_comps(self.p, decl)?),
+            decl.name,
+            params.join(", ")
+        );
+        self.label("entry");
+        for (id, local) in function.locals.iter().enumerate() {
+            self.declare_uninit(&Self::ir_local(id as u32), &local.ty)?;
+        }
+        for (local, regs) in incoming {
+            let value = EV {
+                ty: function.locals[local as usize].ty.clone(),
+                regs,
+            };
+            self.store_var(&Self::ir_local(local), &value)?;
+        }
+        self.emit_ir_body(function)?;
+        Ok(format!("{}{}}}\n\n", header, self.out))
+    }
+
+    fn emit_ir_main(&mut self, function: &ir::Function) -> Result<String, String> {
+        self.out.clear();
+        self.tmp = 0;
+        self.lbl = 0;
+        self.env = vec![HashMap::new()];
+        self.trusted.clear();
+        self.terminated = false;
+        self.ret = CType::Unit;
+        self.in_main = true;
+        self.inout_params.clear();
+        self.label("entry");
+        for (id, local) in function.locals.iter().enumerate() {
+            self.declare_uninit(&Self::ir_local(id as u32), &local.ty)?;
+        }
+        self.emit_ir_body(function)?;
+        Ok(format!("define i32 @lu_entry() {{\n{}}}\n\n", self.out))
+    }
+
+    fn emit_ir_body(&mut self, function: &ir::Function) -> Result<(), String> {
+        let mut values: Vec<Option<EV>> = vec![None; function.values.len()];
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            if block_index != 0 {
+                self.label(&format!("B{}", block_index));
+            }
+            self.terminated = false;
+            for inst in &block.instructions {
+                let value = self.emit_ir_inst(function, &values, &inst.kind, &inst.ty)?;
+                if let Some(id) = inst.result {
+                    values[id as usize] = Some(value.ok_or("value instruction produced no value")?);
+                }
+            }
+            match block.terminator {
+                Terminator::Jump(target) => self.line(format!("br label %B{}", target)),
+                Terminator::Branch {
+                    condition,
+                    then_block,
+                    else_block,
+                } => {
+                    let condition = Self::ir_value(&values, condition)?;
+                    let bit = self.t();
+                    self.line(format!("{} = icmp ne i64 {}, 0", bit, condition.regs[0]));
+                    self.line(format!(
+                        "br i1 {}, label %B{}, label %B{}",
+                        bit, then_block, else_block
+                    ));
+                }
+                Terminator::Return(value) => {
+                    let mut value = Self::ir_value(&values, value)?.clone();
+                    if function.ret == CType::F64 && value.ty == CType::I64 {
+                        value = EV {
+                            ty: CType::F64,
+                            regs: vec![self.to_f64(&value)?],
+                        };
+                    }
+                    self.emit_ret(&value)?;
+                }
+                Terminator::Unreachable => self.line("unreachable".into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn ir_value(values: &[Option<EV>], id: ir::ValueId) -> Result<&EV, String> {
+        values
+            .get(id as usize)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("IR value %{} is unavailable", id))
+    }
+
+    fn emit_ir_inst(
+        &mut self,
+        function: &ir::Function,
+        values: &[Option<EV>],
+        kind: &InstKind,
+        ty: &CType,
+    ) -> Result<Option<EV>, String> {
+        let value = |id| Self::ir_value(values, id).cloned();
+        Ok(match kind {
+            InstKind::Constant(c) => Some(match c {
+                Constant::I64(v) => EV {
+                    ty: CType::I64,
+                    regs: vec![v.to_string()],
+                },
+                Constant::F64(v) => EV {
+                    ty: CType::F64,
+                    regs: vec![format!("0x{:016X}", v.to_bits())],
+                },
+                Constant::Bool(v) => EV {
+                    ty: CType::Bool,
+                    regs: vec![(*v as i64).to_string()],
+                },
+                Constant::Bytes(bytes) => {
+                    let text = String::from_utf8(bytes.clone())
+                        .map_err(|_| "source string is not UTF-8")?;
+                    let id = self
+                        .strings
+                        .iter()
+                        .position(|s| s == &text)
+                        .unwrap_or_else(|| {
+                            self.strings.push(text);
+                            self.strings.len() - 1
+                        });
+                    EV {
+                        ty: CType::Str,
+                        regs: vec![format!("@.str.{}", id), bytes.len().to_string()],
+                    }
+                }
+                Constant::Unit => EV {
+                    ty: CType::Unit,
+                    regs: vec![],
+                },
+            }),
+            InstKind::Load(local) => Some(self.load_var(&Self::ir_local(*local))?),
+            InstKind::Store { local, value: id } => {
+                let mut v = value(*id)?;
+                let want = &function.locals[*local as usize].ty;
+                if *want == CType::F64 && v.ty == CType::I64 {
+                    v = EV {
+                        ty: CType::F64,
+                        regs: vec![self.to_f64(&v)?],
+                    };
+                }
+                self.store_var(&Self::ir_local(*local), &v)?;
+                None
+            }
+            InstKind::Unary { op, value: id } => {
+                let v = value(*id)?;
+                let out = self.t();
+                match (op, &v.ty) {
+                    (UnaryOp::Neg, CType::F64) => {
+                        self.line(format!("{} = fneg fast double {}", out, v.regs[0]))
+                    }
+                    (UnaryOp::Neg, CType::I64) => {
+                        self.line(format!("{} = sub i64 0, {}", out, v.regs[0]))
+                    }
+                    (UnaryOp::Not, CType::Bool) => {
+                        self.line(format!("{} = xor i64 {}, 1", out, v.regs[0]))
+                    }
+                    _ => return Err("invalid IR unary operation".into()),
+                };
+                Some(EV {
+                    ty: ty.clone(),
+                    regs: vec![out],
+                })
+            }
+            InstKind::Binary { op, lhs, rhs } => {
+                Some(self.emit_ir_binary(*op, value(*lhs)?, value(*rhs)?)?)
+            }
+            InstKind::Call {
+                callee,
+                args,
+                inout,
+            } => {
+                let args = args
+                    .iter()
+                    .map(|id| value(*id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(match callee {
+                    Callee::Builtin(name) => self.emit_call(name, args, &[])?,
+                    Callee::Function(id) => self.emit_ir_user_call(*id, args, inout)?,
+                })
+            }
+            InstKind::Field {
+                base,
+                record,
+                field,
+            } => {
+                let base = value(*base)?;
+                let name = &self.p.types[*record].fields[*field].0;
+                let (off, ft) = field_offset(self.p, *record, name)?;
+                let width = lty(self.p, &ft)?.len();
+                Some(EV {
+                    ty: ft,
+                    regs: base.regs[off..off + width].to_vec(),
+                })
+            }
+            InstKind::Index { base, index } => {
+                Some(self.emit_ir_index(value(*base)?, value(*index)?)?)
+            }
+            InstKind::Array(items) => {
+                let items = items
+                    .iter()
+                    .map(|id| value(*id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(self.emit_ir_array(items, ty)?)
+            }
+            InstKind::Record { record, fields } => {
+                let mut regs = Vec::new();
+                for (id, (_, tstr)) in fields.iter().zip(&self.p.types[*record].fields) {
+                    let mut v = value(*id)?;
+                    let want = resolve_type(self.p, tstr)?;
+                    if want == CType::F64 && v.ty == CType::I64 {
+                        v = EV {
+                            ty: CType::F64,
+                            regs: vec![self.to_f64(&v)?],
+                        };
+                    }
+                    regs.extend(v.regs);
+                }
+                Some(EV {
+                    ty: ty.clone(),
+                    regs,
+                })
+            }
+            InstKind::Enum { enumeration, tag } => Some(EV {
+                ty: CType::Enum(*enumeration),
+                regs: vec![tag.to_string()],
+            }),
+            InstKind::SetIndex {
+                base,
+                index,
+                value: stored,
+            } => {
+                let base = value(*base)?;
+                let index = value(*index)?;
+                let stored = value(*stored)?;
+                let CType::Arr(elem) = &base.ty else {
+                    return Err("IR set-index on non-array".into());
+                };
+                let addrs = self.elem_addrs(&base.regs[0], &index.regs[0], elem, None)?;
+                for ((component, reg), addr) in
+                    lty(self.p, elem)?.iter().zip(&stored.regs).zip(addrs)
+                {
+                    self.line(format!("store {} {}, ptr {}", component, reg, addr));
+                }
+                None
+            }
+            InstKind::SetField {
+                root,
+                path,
+                value: stored,
+            } => {
+                let stored = value(*stored)?;
+                let (mut current, ptrs) = self
+                    .lookup(&Self::ir_local(*root))
+                    .ok_or("invalid IR field root")?;
+                let mut offset = 0;
+                for &field in path {
+                    let CType::Rec(record) = current else {
+                        return Err("IR field path on non-record".into());
+                    };
+                    let name = &self.p.types[record].fields[field].0;
+                    let (o, next) = field_offset(self.p, record, name)?;
+                    offset += o;
+                    current = next;
+                }
+                for ((component, ptr), reg) in lty(self.p, &current)?
+                    .iter()
+                    .zip(&ptrs[offset..])
+                    .zip(&stored.regs)
+                {
+                    self.line(format!("store {} {}, ptr {}", component, reg, ptr));
+                }
+                None
+            }
+        })
+    }
+
+    fn emit_ir_binary(&mut self, op: BinaryOp, lhs: EV, rhs: EV) -> Result<EV, String> {
+        use BinaryOp::*;
+        if matches!(op, Add | Sub | Mul | Div | Rem) {
+            if lhs.ty == CType::I64 && rhs.ty == CType::I64 {
+                if matches!(op, Div | Rem) {
+                    return self.emit_checked_int_div(&lhs.regs[0], &rhs.regs[0], op == Rem);
+                }
+                let out = self.t();
+                let opcode = match op {
+                    Add => "add",
+                    Sub => "sub",
+                    Mul => "mul",
+                    _ => unreachable!(),
+                };
+                self.line(format!(
+                    "{} = {} i64 {}, {}",
+                    out, opcode, lhs.regs[0], rhs.regs[0]
+                ));
+                return Ok(EV {
+                    ty: CType::I64,
+                    regs: vec![out],
+                });
+            }
+            let a = self.to_f64(&lhs)?;
+            let b = self.to_f64(&rhs)?;
+            let out = self.t();
+            let opcode = match op {
+                Add => "fadd",
+                Sub => "fsub",
+                Mul => "fmul",
+                Div => "fdiv",
+                Rem => "frem",
+                _ => unreachable!(),
+            };
+            self.line(format!("{} = {} fast double {}, {}", out, opcode, a, b));
+            return Ok(EV {
+                ty: CType::F64,
+                regs: vec![out],
+            });
+        }
+        if matches!(op, Eq | Ne) && lhs.ty == CType::Str && rhs.ty == CType::Str {
+            let eq = self.t();
+            self.line(format!(
+                "{} = call i64 @lu_str_eq(ptr {}, i64 {}, ptr {}, i64 {})",
+                eq, lhs.regs[0], lhs.regs[1], rhs.regs[0], rhs.regs[1]
+            ));
+            if op == Ne {
+                let out = self.t();
+                self.line(format!("{} = xor i64 {}, 1", out, eq));
+                return Ok(EV {
+                    ty: CType::Bool,
+                    regs: vec![out],
+                });
+            }
+            return Ok(EV {
+                ty: CType::Bool,
+                regs: vec![eq],
+            });
+        }
+        if matches!(op, Eq | Ne) && lhs.ty != CType::F64 && rhs.ty != CType::F64 {
+            let bit = self.t();
+            self.line(format!(
+                "{} = icmp {} i64 {}, {}",
+                bit,
+                if op == Eq { "eq" } else { "ne" },
+                lhs.regs[0],
+                rhs.regs[0]
+            ));
+            let out = self.t();
+            self.line(format!("{} = zext i1 {} to i64", out, bit));
+            return Ok(EV {
+                ty: CType::Bool,
+                regs: vec![out],
+            });
+        }
+        let a = self.to_f64(&lhs)?;
+        let b = self.to_f64(&rhs)?;
+        if op == ApproxEq {
+            let d = self.t();
+            self.line(format!("{} = fsub fast double {}, {}", d, a, b));
+            let ad = self.t();
+            self.line(format!("{} = call double @llvm.fabs.f64(double {})", ad, d));
+            let aa = self.t();
+            self.line(format!("{} = call double @llvm.fabs.f64(double {})", aa, a));
+            let ab = self.t();
+            self.line(format!("{} = call double @llvm.fabs.f64(double {})", ab, b));
+            let scale = self.t();
+            self.line(format!(
+                "{} = call double @llvm.maxnum.f64(double {}, double {})",
+                scale, aa, ab
+            ));
+            let rel = self.t();
+            self.line(format!(
+                "{} = fmul fast double {}, 0x{:016X}",
+                rel,
+                scale,
+                RTOL.to_bits()
+            ));
+            let tol = self.t();
+            self.line(format!(
+                "{} = fadd fast double {}, 0x{:016X}",
+                tol,
+                rel,
+                ATOL.to_bits()
+            ));
+            let bit = self.t();
+            self.line(format!("{} = fcmp fast ole double {}, {}", bit, ad, tol));
+            let out = self.t();
+            self.line(format!("{} = zext i1 {} to i64", out, bit));
+            return Ok(EV {
+                ty: CType::Bool,
+                regs: vec![out],
+            });
+        }
+        let pred = match op {
+            Eq => "oeq",
+            Ne => "one",
+            Lt => "olt",
+            Le => "ole",
+            Gt => "ogt",
+            Ge => "oge",
+            _ => return Err("invalid IR comparison".into()),
+        };
+        let bit = self.t();
+        self.line(format!("{} = fcmp fast {} double {}, {}", bit, pred, a, b));
+        let out = self.t();
+        self.line(format!("{} = zext i1 {} to i64", out, bit));
+        Ok(EV {
+            ty: CType::Bool,
+            regs: vec![out],
+        })
+    }
+
+    fn emit_ir_index(&mut self, base: EV, index: EV) -> Result<EV, String> {
+        if base.ty == CType::Str {
+            let bad = self.t();
+            self.line(format!(
+                "{} = icmp uge i64 {}, {}",
+                bad, index.regs[0], base.regs[1]
+            ));
+            let fail = self.l();
+            let ok = self.l();
+            self.line(format!("br i1 {}, label %{}, label %{}", bad, fail, ok));
+            self.label(&fail);
+            self.line(format!(
+                "call void @lu_oob(i64 {}, i64 {})",
+                index.regs[0], base.regs[1]
+            ));
+            self.line("unreachable".into());
+            self.label(&ok);
+            let ptr = self.t();
+            self.line(format!(
+                "{} = getelementptr i8, ptr {}, i64 {}",
+                ptr, base.regs[0], index.regs[0]
+            ));
+            let byte = self.t();
+            self.line(format!("{} = load i8, ptr {}", byte, ptr));
+            let out = self.t();
+            self.line(format!("{} = zext i8 {} to i64", out, byte));
+            return Ok(EV {
+                ty: CType::I64,
+                regs: vec![out],
+            });
+        }
+        let CType::Arr(elem) = base.ty else {
+            return Err("IR index on non-array".into());
+        };
+        let addrs = self.elem_addrs(&base.regs[0], &index.regs[0], &elem, None)?;
+        let mut regs = Vec::new();
+        for (component, addr) in lty(self.p, &elem)?.iter().zip(addrs) {
+            let out = self.t();
+            self.line(format!("{} = load {}, ptr {}", out, component, addr));
+            regs.push(out);
+        }
+        Ok(EV { ty: *elem, regs })
+    }
+
+    fn emit_ir_array(&mut self, items: Vec<EV>, ty: &CType) -> Result<EV, String> {
+        let CType::Arr(elem) = ty else {
+            return Err("IR array has non-array type".into());
+        };
+        let components = lty(self.p, elem)?;
+        let logical = items.len() as i64;
+        let base = self.t();
+        self.line(format!(
+            "{} = call ptr @lu_arr_new_raw(i64 {}, i64 {})",
+            base,
+            logical,
+            components.len()
+        ));
+        for (i, mut value) in items.into_iter().enumerate() {
+            if **elem == CType::F64 && value.ty == CType::I64 {
+                value = EV {
+                    ty: CType::F64,
+                    regs: vec![self.to_f64(&value)?],
+                };
+            }
+            let addrs = self.elem_addrs(&base, &i.to_string(), elem, Some(logical.to_string()))?;
+            for ((component, reg), addr) in components.iter().zip(&value.regs).zip(addrs) {
+                self.line(format!("store {} {}, ptr {}", component, reg, addr));
+            }
+        }
+        Ok(EV {
+            ty: ty.clone(),
+            regs: vec![base],
+        })
+    }
+
+    fn emit_ir_user_call(
+        &mut self,
+        id: ir::FunctionId,
+        args: Vec<EV>,
+        inout: &[Option<ir::LocalId>],
+    ) -> Result<EV, String> {
+        let decl = &self.p.fns[id as usize];
+        let ret = resolve_type(self.p, &decl.ret)?;
+        let mut parts = Vec::new();
+        for ((_, tstr), mut value) in decl.params.iter().zip(args) {
+            let want = resolve_type(self.p, tstr)?;
+            if want == CType::F64 && value.ty == CType::I64 {
+                value = EV {
+                    ty: CType::F64,
+                    regs: vec![self.to_f64(&value)?],
+                };
+            }
+            for (component, reg) in lty(self.p, &want)?.iter().zip(&value.regs) {
+                parts.push(format!("{} {}", component, reg));
+            }
+        }
+        let abi = abi_ret_comps(self.p, decl)?;
+        let rt = comps_ty(&abi);
+        if abi.is_empty() {
+            self.line(format!(
+                "call void @\"{}\"({})",
+                decl.name,
+                parts.join(", ")
+            ));
+            return Ok(EV {
+                ty: CType::Unit,
+                regs: vec![],
+            });
+        }
+        let call = self.t();
+        self.line(format!(
+            "{} = call {} @\"{}\"({})",
+            call,
+            rt,
+            decl.name,
+            parts.join(", ")
+        ));
+        let mut all = Vec::new();
+        if abi.len() == 1 {
+            all.push(call);
+        } else {
+            for i in 0..abi.len() {
+                let out = self.t();
+                self.line(format!("{} = extractvalue {} {}, {}", out, rt, call, i));
+                all.push(out);
+            }
+        }
+        let width = lty(self.p, &ret)?.len();
+        let regs = all[..width].to_vec();
+        let mut cursor = width;
+        for (i, ((_, tstr), io)) in decl.params.iter().zip(&decl.inouts).enumerate() {
+            if *io {
+                let ty = resolve_type(self.p, tstr)?;
+                let w = lty(self.p, &ty)?.len();
+                let target = inout[i].ok_or("missing IR inout target")?;
+                self.store_var(
+                    &Self::ir_local(target),
+                    &EV {
+                        ty,
+                        regs: all[cursor..cursor + w].to_vec(),
+                    },
+                )?;
+                cursor += w;
+            }
+        }
+        Ok(EV { ty: ret, regs })
     }
 
     fn emit_fn(&mut self, f: &FnDecl) -> Result<String, String> {
@@ -245,7 +874,12 @@ impl<'a> Emit<'a> {
             .map(|((n, tstr), _)| Ok((n.clone(), resolve_type(self.p, tstr)?)))
             .collect::<Result<Vec<_>, String>>()?;
         let rt = comps_ty(&abi_ret_comps(self.p, f)?);
-        let header = format!("define internal {} @\"{}\"({}) {{\n", rt, f.name, params.join(", "));
+        let header = format!(
+            "define internal {} @\"{}\"({}) {{\n",
+            rt,
+            f.name,
+            params.join(", ")
+        );
         self.label("entry");
         for (name, t, regs) in binds {
             self.declare(&name, &t, &regs)?;
@@ -255,7 +889,10 @@ impl<'a> Emit<'a> {
             match last {
                 Some(v) if v.ty == self.ret => self.emit_ret(&v)?,
                 _ if self.ret == CType::Unit => {
-                    let unit = EV { ty: CType::Unit, regs: vec![] };
+                    let unit = EV {
+                        ty: CType::Unit,
+                        regs: vec![],
+                    };
                     self.emit_ret(&unit)?;
                 }
                 _ => return Err(format!("function `{}` may end without a value", f.name)),
@@ -301,7 +938,10 @@ impl<'a> Emit<'a> {
                 let mut cur = "undef".to_string();
                 for (i, (c, r)) in comps.iter().zip(regs.iter()).enumerate() {
                     let t = self.t();
-                    self.line(format!("{} = insertvalue {} {}, {} {}, {}", t, sty, cur, c, r, i));
+                    self.line(format!(
+                        "{} = insertvalue {} {}, {} {}, {}",
+                        t, sty, cur, c, r, i
+                    ));
                     cur = t;
                 }
                 self.line(format!("ret {} {}", sty, cur));
@@ -319,7 +959,10 @@ impl<'a> Emit<'a> {
             self.line(format!("store {} {}, ptr {}", c, regs[i], a));
             ptrs.push(a);
         }
-        self.env.last_mut().unwrap().insert(name.to_string(), (t.clone(), ptrs));
+        self.env
+            .last_mut()
+            .unwrap()
+            .insert(name.to_string(), (t.clone(), ptrs));
         Ok(())
     }
 
@@ -328,7 +971,9 @@ impl<'a> Emit<'a> {
     }
 
     fn load_var(&mut self, name: &str) -> Result<EV, String> {
-        let (t, ptrs) = self.lookup(name).ok_or(format!("unknown variable `{}`", name))?;
+        let (t, ptrs) = self
+            .lookup(name)
+            .ok_or(format!("unknown variable `{}`", name))?;
         let comps = lty(self.p, &t)?;
         let mut regs = Vec::new();
         for (c, ptr) in comps.iter().zip(ptrs.iter()) {
@@ -340,7 +985,9 @@ impl<'a> Emit<'a> {
     }
 
     fn store_var(&mut self, name: &str, v: &EV) -> Result<(), String> {
-        let (t, ptrs) = self.lookup(name).ok_or(format!("unknown variable `{}`", name))?;
+        let (t, ptrs) = self
+            .lookup(name)
+            .ok_or(format!("unknown variable `{}`", name))?;
         let comps = lty(self.p, &t)?;
         for ((c, ptr), r) in comps.iter().zip(ptrs.iter()).zip(v.regs.iter()) {
             self.line(format!("store {} {}, ptr {}", c, r, ptr));
@@ -426,8 +1073,7 @@ impl<'a> Emit<'a> {
                             }
                         }
                         let comps = lty(self.p, &t)?;
-                        for ((c, r), ptr) in
-                            comps.iter().zip(v.regs.iter()).zip(ptrs[off..].iter())
+                        for ((c, r), ptr) in comps.iter().zip(v.regs.iter()).zip(ptrs[off..].iter())
                         {
                             self.line(format!("store {} {}, ptr {}", c, r, ptr));
                         }
@@ -537,7 +1183,10 @@ impl<'a> Emit<'a> {
                         // promote int literal returns into float fns
                         let v = if self.ret == CType::F64 && v.ty == CType::I64 {
                             let r = self.to_f64(&v)?;
-                            EV { ty: CType::F64, regs: vec![r] }
+                            EV {
+                                ty: CType::F64,
+                                regs: vec![r],
+                            }
                         } else {
                             v
                         };
@@ -545,7 +1194,10 @@ impl<'a> Emit<'a> {
                     }
                     None => {
                         if self.ret == CType::Unit {
-                            let unit = EV { ty: CType::Unit, regs: vec![] };
+                            let unit = EV {
+                                ty: CType::Unit,
+                                regs: vec![],
+                            };
                             self.emit_ret(&unit)?;
                         }
                     }
@@ -567,10 +1219,18 @@ impl<'a> Emit<'a> {
         }
     }
 
-    fn hoist_checks(&mut self, arrays: &[String], var: &str, lo: &str, hi: &str) -> Result<usize, String> {
+    fn hoist_checks(
+        &mut self,
+        arrays: &[String],
+        var: &str,
+        lo: &str,
+        hi: &str,
+    ) -> Result<usize, String> {
         let mut pushed = 0;
         for name in arrays {
-            let Some((CType::Arr(elem), ptrs)) = self.lookup(name) else { continue };
+            let Some((CType::Arr(elem), ptrs)) = self.lookup(name) else {
+                continue;
+            };
             let stride = lty(self.p, &elem)?.len() as i64;
             let base = self.t();
             self.line(format!("{} = load ptr, ptr {}", base, ptrs[0]));
@@ -596,7 +1256,8 @@ impl<'a> Emit<'a> {
             self.line(format!("call void @lu_oob(i64 {}, i64 {})", hi, logical));
             self.line("unreachable".into());
             self.label(&lg);
-            self.trusted.push((name.clone(), var.to_string(), logical.clone()));
+            self.trusted
+                .push((name.clone(), var.to_string(), logical.clone()));
             pushed += 1;
         }
         Ok(pushed)
@@ -606,7 +1267,13 @@ impl<'a> Emit<'a> {
     /// JIT: scalar/AoS elements contiguous, SoA records (default) in per-field
     /// planes of `n` slots, so field accesses are unit-stride for the
     /// vectorizer. `trusted` carries the loop-hoisted logical length.
-    fn elem_addrs(&mut self, base: &str, idx: &str, elem: &CType, trusted: Option<String>) -> Result<Vec<String>, String> {
+    fn elem_addrs(
+        &mut self,
+        base: &str,
+        idx: &str,
+        elem: &CType,
+        trusted: Option<String>,
+    ) -> Result<Vec<String>, String> {
         let stride = lty(self.p, elem)?.len() as i64;
         let logical = match trusted {
             Some(n) => n,
@@ -644,7 +1311,10 @@ impl<'a> Emit<'a> {
                 let off = self.t();
                 self.line(format!("{} = add i64 {}, {}", off, lane8, plane));
                 let addr = self.t();
-                self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", addr, base, off));
+                self.line(format!(
+                    "{} = getelementptr i8, ptr {}, i64 {}",
+                    addr, base, off
+                ));
                 out.push(addr);
             }
         } else {
@@ -654,22 +1324,33 @@ impl<'a> Emit<'a> {
                 let offc = self.t();
                 self.line(format!("{} = add i64 {}, {}", offc, off, 8 + 8 * c));
                 let addr = self.t();
-                self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", addr, base, offc));
+                self.line(format!(
+                    "{} = getelementptr i8, ptr {}, i64 {}",
+                    addr, base, offc
+                ));
                 out.push(addr);
             }
         }
         Ok(out)
     }
 
-
     fn emit_expr(&mut self, eid: ExprId) -> Result<EV, String> {
         match self.p.expr(eid) {
-            Expr::Int(v) => Ok(EV { ty: CType::I64, regs: vec![v.to_string()] }),
+            Expr::Int(v) => Ok(EV {
+                ty: CType::I64,
+                regs: vec![v.to_string()],
+            }),
             Expr::Float(v) => {
                 let bits = v.to_bits();
-                Ok(EV { ty: CType::F64, regs: vec![format!("0x{:016X}", bits)] })
+                Ok(EV {
+                    ty: CType::F64,
+                    regs: vec![format!("0x{:016X}", bits)],
+                })
             }
-            Expr::Bool(v) => Ok(EV { ty: CType::Bool, regs: vec![(*v as i64).to_string()] }),
+            Expr::Bool(v) => Ok(EV {
+                ty: CType::Bool,
+                regs: vec![(*v as i64).to_string()],
+            }),
             Expr::Str(s) => {
                 let id = self.strings.iter().position(|x| x == s).unwrap_or_else(|| {
                     self.strings.push(s.clone());
@@ -685,12 +1366,17 @@ impl<'a> Emit<'a> {
                 let v = self.emit_expr(*e)?;
                 let t = self.t();
                 match (op.as_str(), &v.ty) {
-                    ("-", CType::F64) => self.line(format!("{} = fneg fast double {}", t, v.regs[0])),
+                    ("-", CType::F64) => {
+                        self.line(format!("{} = fneg fast double {}", t, v.regs[0]))
+                    }
                     ("-", CType::I64) => self.line(format!("{} = sub i64 0, {}", t, v.regs[0])),
                     ("not", CType::Bool) => self.line(format!("{} = xor i64 {}, 1", t, v.regs[0])),
                     _ => return Err(format!("cannot apply `{}` here", op)),
                 }
-                Ok(EV { ty: v.ty, regs: vec![t] })
+                Ok(EV {
+                    ty: v.ty,
+                    regs: vec![t],
+                })
             }
             Expr::Bin(op, l, r) => self.emit_bin(op.clone(), *l, *r),
             Expr::Circum(open, e) => {
@@ -704,7 +1390,10 @@ impl<'a> Emit<'a> {
                     CType::Rec(ti) => {
                         let (off, ft) = field_offset(self.p, ti, fname)?;
                         let w = lty(self.p, &ft)?.len();
-                        Ok(EV { ty: ft, regs: v.regs[off..off + w].to_vec() })
+                        Ok(EV {
+                            ty: ft,
+                            regs: v.regs[off..off + w].to_vec(),
+                        })
                     }
                     _ => Err(format!("cannot access field `{}`", fname)),
                 }
@@ -715,21 +1404,33 @@ impl<'a> Emit<'a> {
                 let iv = self.emit_expr(*i)?;
                 if av.ty == CType::Str {
                     let bad = self.t();
-                    self.line(format!("{} = icmp uge i64 {}, {}", bad, iv.regs[0], av.regs[1]));
+                    self.line(format!(
+                        "{} = icmp uge i64 {}, {}",
+                        bad, iv.regs[0], av.regs[1]
+                    ));
                     let lb = self.l();
                     let lg = self.l();
                     self.line(format!("br i1 {}, label %{}, label %{}", bad, lb, lg));
                     self.label(&lb);
-                    self.line(format!("call void @lu_oob(i64 {}, i64 {})", iv.regs[0], av.regs[1]));
+                    self.line(format!(
+                        "call void @lu_oob(i64 {}, i64 {})",
+                        iv.regs[0], av.regs[1]
+                    ));
                     self.line("unreachable".into());
                     self.label(&lg);
                     let ep = self.t();
-                    self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", ep, av.regs[0], iv.regs[0]));
+                    self.line(format!(
+                        "{} = getelementptr i8, ptr {}, i64 {}",
+                        ep, av.regs[0], iv.regs[0]
+                    ));
                     let b8 = self.t();
                     self.line(format!("{} = load i8, ptr {}", b8, ep));
                     let r = self.t();
                     self.line(format!("{} = zext i8 {} to i64", r, b8));
-                    return Ok(EV { ty: CType::I64, regs: vec![r] });
+                    return Ok(EV {
+                        ty: CType::I64,
+                        regs: vec![r],
+                    });
                 }
                 let elem = match &av.ty {
                     CType::Arr(e) => e.as_ref().clone(),
@@ -768,17 +1469,16 @@ impl<'a> Emit<'a> {
                     } else {
                         v.regs
                     };
-                    let addrs = self.elem_addrs(
-                        &base,
-                        &i.to_string(),
-                        &elem,
-                        Some(logical.to_string()),
-                    )?;
+                    let addrs =
+                        self.elem_addrs(&base, &i.to_string(), &elem, Some(logical.to_string()))?;
                     for ((c, reg), addr) in comps.iter().zip(regs.iter()).zip(addrs.iter()) {
                         self.line(format!("store {} {}, ptr {}", c, reg, addr));
                     }
                 }
-                Ok(EV { ty: CType::Arr(Box::new(elem)), regs: vec![base] })
+                Ok(EV {
+                    ty: CType::Arr(Box::new(elem)),
+                    regs: vec![base],
+                })
             }
             Expr::Record(name, inits) => {
                 let ti = self
@@ -808,14 +1508,20 @@ impl<'a> Emit<'a> {
                 for s in slots {
                     regs.extend(s.expect("checker guarantees all fields"));
                 }
-                Ok(EV { ty: CType::Rec(ti), regs })
+                Ok(EV {
+                    ty: CType::Rec(ti),
+                    regs,
+                })
             }
             Expr::EnumVal(en, vn) => {
                 let (ei, tag) = self
                     .p
                     .enum_tag(en, vn)
                     .ok_or(format!("unknown enum value `{}.{}`", en, vn))?;
-                Ok(EV { ty: CType::Enum(ei), regs: vec![tag.to_string()] })
+                Ok(EV {
+                    ty: CType::Enum(ei),
+                    regs: vec![tag.to_string()],
+                })
             }
             Expr::Sum { var, lo, hi, body } => {
                 let expected_body_ty = self.expr_types[*body as usize]
@@ -888,11 +1594,17 @@ impl<'a> Emit<'a> {
                 if bty == CType::I64 {
                     let total = self.t();
                     self.line(format!("{} = load i64, ptr {}", total, iaccp));
-                    Ok(EV { ty: CType::I64, regs: vec![total] })
+                    Ok(EV {
+                        ty: CType::I64,
+                        regs: vec![total],
+                    })
                 } else {
                     let total = self.t();
                     self.line(format!("{} = load double, ptr {}", total, faccp));
-                    Ok(EV { ty: CType::F64, regs: vec![total] })
+                    Ok(EV {
+                        ty: CType::F64,
+                        regs: vec![total],
+                    })
                 }
             }
             Expr::Call(name, args) => {
@@ -932,7 +1644,10 @@ impl<'a> Emit<'a> {
             self.label(&lm);
             let out = self.t();
             self.line(format!("{} = load i64, ptr {}", out, res));
-            return Ok(EV { ty: CType::Bool, regs: vec![out] });
+            return Ok(EV {
+                ty: CType::Bool,
+                regs: vec![out],
+            });
         }
         let lv = self.emit_expr(l)?;
         let rv = self.emit_expr(r)?;
@@ -944,17 +1659,16 @@ impl<'a> Emit<'a> {
                         "-" => "sub",
                         "*" => "mul",
                         "/" | "%" => {
-                            return self.emit_checked_int_div(
-                                &lv.regs[0],
-                                &rv.regs[0],
-                                op == "%",
-                            )
+                            return self.emit_checked_int_div(&lv.regs[0], &rv.regs[0], op == "%")
                         }
                         _ => unreachable!(),
                     };
                     let t = self.t();
                     self.line(format!("{} = {} i64 {}, {}", t, o, lv.regs[0], rv.regs[0]));
-                    Ok(EV { ty: CType::I64, regs: vec![t] })
+                    Ok(EV {
+                        ty: CType::I64,
+                        regs: vec![t],
+                    })
                 } else {
                     let a = self.to_f64(&lv)?;
                     let b = self.to_f64(&rv)?;
@@ -967,7 +1681,10 @@ impl<'a> Emit<'a> {
                     };
                     let t = self.t();
                     self.line(format!("{} = {} fast double {}, {}", t, o, a, b));
-                    Ok(EV { ty: CType::F64, regs: vec![t] })
+                    Ok(EV {
+                        ty: CType::F64,
+                        regs: vec![t],
+                    })
                 }
             }
             "==" | "!=" if lv.ty == CType::Str && rv.ty == CType::Str => {
@@ -979,9 +1696,15 @@ impl<'a> Emit<'a> {
                 if op == "!=" {
                     let t = self.t();
                     self.line(format!("{} = xor i64 {}, 1", t, eq));
-                    Ok(EV { ty: CType::Bool, regs: vec![t] })
+                    Ok(EV {
+                        ty: CType::Bool,
+                        regs: vec![t],
+                    })
                 } else {
-                    Ok(EV { ty: CType::Bool, regs: vec![eq] })
+                    Ok(EV {
+                        ty: CType::Bool,
+                        regs: vec![eq],
+                    })
                 }
             }
             "==" | "!=" | "<" | "<=" | ">" | ">=" => {
@@ -997,7 +1720,10 @@ impl<'a> Emit<'a> {
                         ">" => "sgt",
                         _ => "sge",
                     };
-                    self.line(format!("{} = icmp {} i64 {}, {}", c1, cc, lv.regs[0], rv.regs[0]));
+                    self.line(format!(
+                        "{} = icmp {} i64 {}, {}",
+                        c1, cc, lv.regs[0], rv.regs[0]
+                    ));
                 } else {
                     let a = self.to_f64(&lv)?;
                     let b = self.to_f64(&rv)?;
@@ -1013,7 +1739,10 @@ impl<'a> Emit<'a> {
                 }
                 let t = self.t();
                 self.line(format!("{} = zext i1 {} to i64", t, c1));
-                Ok(EV { ty: CType::Bool, regs: vec![t] })
+                Ok(EV {
+                    ty: CType::Bool,
+                    regs: vec![t],
+                })
             }
             "~=" | "\u{2248}" => {
                 let a = self.to_f64(&lv)?;
@@ -1021,11 +1750,20 @@ impl<'a> Emit<'a> {
                 let d = self.t();
                 self.line(format!("{} = fsub fast double {}, {}", d, a, b));
                 let ad = self.t();
-                self.line(format!("{} = call fast double @llvm.fabs.f64(double {})", ad, d));
+                self.line(format!(
+                    "{} = call fast double @llvm.fabs.f64(double {})",
+                    ad, d
+                ));
                 let aa = self.t();
-                self.line(format!("{} = call fast double @llvm.fabs.f64(double {})", aa, a));
+                self.line(format!(
+                    "{} = call fast double @llvm.fabs.f64(double {})",
+                    aa, a
+                ));
                 let ab = self.t();
-                self.line(format!("{} = call fast double @llvm.fabs.f64(double {})", ab, b));
+                self.line(format!(
+                    "{} = call fast double @llvm.fabs.f64(double {})",
+                    ab, b
+                ));
                 let mx = self.t();
                 self.line(format!(
                     "{} = call fast double @llvm.maxnum.f64(double {}, double {})",
@@ -1049,17 +1787,35 @@ impl<'a> Emit<'a> {
                 self.line(format!("{} = fcmp fast ole double {}, {}", c1, ad, tol));
                 let t = self.t();
                 self.line(format!("{} = zext i1 {} to i64", t, c1));
-                Ok(EV { ty: CType::Bool, regs: vec![t] })
+                Ok(EV {
+                    ty: CType::Bool,
+                    regs: vec![t],
+                })
             }
             op => Err(format!("unknown operator `{}`", op)),
         }
     }
 
-    fn emit_checked_int_div(&mut self, lhs: &str, rhs: &str, remainder: bool) -> Result<EV, String> {
+    fn emit_checked_int_div(
+        &mut self,
+        lhs: &str,
+        rhs: &str,
+        remainder: bool,
+    ) -> Result<EV, String> {
         let out = self.t();
-        let callee = if remainder { "lu_i64_rem" } else { "lu_i64_div" };
-        self.line(format!("{} = call i64 @{}(i64 {}, i64 {})", out, callee, lhs, rhs));
-        Ok(EV { ty: CType::I64, regs: vec![out] })
+        let callee = if remainder {
+            "lu_i64_rem"
+        } else {
+            "lu_i64_div"
+        };
+        self.line(format!(
+            "{} = call i64 @{}(i64 {}, i64 {})",
+            out, callee, lhs, rhs
+        ));
+        Ok(EV {
+            ty: CType::I64,
+            regs: vec![out],
+        })
     }
 
     fn emit_user_call(
@@ -1091,10 +1847,19 @@ impl<'a> Emit<'a> {
         let rt = comps_ty(&abi);
         if abi.is_empty() {
             self.line(format!("call void @\"{}\"({})", fname, parts.join(", ")));
-            return Ok(EV { ty: CType::Unit, regs: vec![] });
+            return Ok(EV {
+                ty: CType::Unit,
+                regs: vec![],
+            });
         }
         let c = self.t();
-        self.line(format!("{} = call {} @\"{}\"({})", c, rt, fname, parts.join(", ")));
+        self.line(format!(
+            "{} = call {} @\"{}\"({})",
+            c,
+            rt,
+            fname,
+            parts.join(", ")
+        ));
         let mut all = Vec::new();
         if abi.len() == 1 {
             all.push(c);
@@ -1115,8 +1880,7 @@ impl<'a> Emit<'a> {
                 let w = lty(self.p, &t)?.len();
                 let vals = all[cursor..cursor + w].to_vec();
                 cursor += w;
-                let arg_exprs =
-                    arg_exprs.ok_or("inout functions cannot be used as operators")?;
+                let arg_exprs = arg_exprs.ok_or("inout functions cannot be used as operators")?;
                 let Expr::Ident(n) = self.p.expr(arg_exprs[i]) else {
                     return Err("inout arg must be a variable".into());
                 };
@@ -1135,9 +1899,15 @@ impl<'a> Emit<'a> {
                         self.line("call void @lu_print_sep()".into());
                     }
                     match &v.ty {
-                        CType::F64 => self.line(format!("call void @lu_print_f64(double {})", v.regs[0])),
-                        CType::I64 => self.line(format!("call void @lu_print_i64(i64 {})", v.regs[0])),
-                        CType::Bool => self.line(format!("call void @lu_print_bool(i64 {})", v.regs[0])),
+                        CType::F64 => {
+                            self.line(format!("call void @lu_print_f64(double {})", v.regs[0]))
+                        }
+                        CType::I64 => {
+                            self.line(format!("call void @lu_print_i64(i64 {})", v.regs[0]))
+                        }
+                        CType::Bool => {
+                            self.line(format!("call void @lu_print_bool(i64 {})", v.regs[0]))
+                        }
                         CType::Str => self.line(format!(
                             "call void @lu_print_str(ptr {}, i64 {})",
                             v.regs[0], v.regs[1]
@@ -1146,46 +1916,76 @@ impl<'a> Emit<'a> {
                     }
                 }
                 self.line("call void @lu_print_nl()".into());
-                Ok(EV { ty: CType::Unit, regs: vec![] })
+                Ok(EV {
+                    ty: CType::Unit,
+                    regs: vec![],
+                })
             }
             "puti" => {
                 self.line(format!("call void @lu_print_i64(i64 {})", args[0].regs[0]));
-                Ok(EV { ty: CType::Unit, regs: vec![] })
+                Ok(EV {
+                    ty: CType::Unit,
+                    regs: vec![],
+                })
             }
             "putf" => {
-                self.line(format!("call void @lu_print_f64(double {})", args[0].regs[0]));
-                Ok(EV { ty: CType::Unit, regs: vec![] })
+                self.line(format!(
+                    "call void @lu_print_f64(double {})",
+                    args[0].regs[0]
+                ));
+                Ok(EV {
+                    ty: CType::Unit,
+                    regs: vec![],
+                })
             }
             "putb" => {
                 self.line(format!("call void @lu_print_bool(i64 {})", args[0].regs[0]));
-                Ok(EV { ty: CType::Unit, regs: vec![] })
+                Ok(EV {
+                    ty: CType::Unit,
+                    regs: vec![],
+                })
             }
             "puts" => {
                 self.line(format!(
                     "call void @lu_print_str(ptr {}, i64 {})",
                     args[0].regs[0], args[0].regs[1]
                 ));
-                Ok(EV { ty: CType::Unit, regs: vec![] })
+                Ok(EV {
+                    ty: CType::Unit,
+                    regs: vec![],
+                })
             }
             "putsp" => {
                 self.line("call void @lu_print_sep()".into());
-                Ok(EV { ty: CType::Unit, regs: vec![] })
+                Ok(EV {
+                    ty: CType::Unit,
+                    regs: vec![],
+                })
             }
             "putnl" => {
                 self.line("call void @lu_print_nl()".into());
-                Ok(EV { ty: CType::Unit, regs: vec![] })
+                Ok(EV {
+                    ty: CType::Unit,
+                    regs: vec![],
+                })
             }
             "nargs" => {
                 let t = self.t();
                 self.line(format!("{} = call i64 @lu_nargs()", t));
-                Ok(EV { ty: CType::I64, regs: vec![t] })
+                Ok(EV {
+                    ty: CType::I64,
+                    regs: vec![t],
+                })
             }
             "arg" => {
                 let p = self.t();
                 self.line(format!("{} = call ptr @lu_arg(i64 {})", p, args[0].regs[0]));
                 let l = self.t();
                 self.line(format!("{} = call i64 @lu_last_len()", l));
-                Ok(EV { ty: CType::Str, regs: vec![p, l] })
+                Ok(EV {
+                    ty: CType::Str,
+                    regs: vec![p, l],
+                })
             }
             "read_file" => {
                 let p = self.t();
@@ -1195,21 +1995,30 @@ impl<'a> Emit<'a> {
                 ));
                 let l = self.t();
                 self.line(format!("{} = call i64 @lu_last_len()", l));
-                Ok(EV { ty: CType::Str, regs: vec![p, l] })
+                Ok(EV {
+                    ty: CType::Str,
+                    regs: vec![p, l],
+                })
             }
             "write_file" => {
                 self.line(format!(
                     "call void @lu_write_file(ptr {}, i64 {}, ptr {}, i64 {})",
                     args[0].regs[0], args[0].regs[1], args[1].regs[0], args[1].regs[1]
                 ));
-                Ok(EV { ty: CType::Unit, regs: vec![] })
+                Ok(EV {
+                    ty: CType::Unit,
+                    regs: vec![],
+                })
             }
             "chr" => {
                 let p = self.t();
                 self.line(format!("{} = call ptr @lu_chr(i64 {})", p, args[0].regs[0]));
                 let l = self.t();
                 self.line(format!("{} = call i64 @lu_last_len()", l));
-                Ok(EV { ty: CType::Str, regs: vec![p, l] })
+                Ok(EV {
+                    ty: CType::Str,
+                    regs: vec![p, l],
+                })
             }
             "concat" => {
                 let p = self.t();
@@ -1219,7 +2028,10 @@ impl<'a> Emit<'a> {
                 ));
                 let l = self.t();
                 self.line(format!("{} = call i64 @lu_last_len()", l));
-                Ok(EV { ty: CType::Str, regs: vec![p, l] })
+                Ok(EV {
+                    ty: CType::Str,
+                    regs: vec![p, l],
+                })
             }
             "sqrt" | "sin" | "cos" | "abs" | "floor" => {
                 let x = self.to_f64(&args[0])?;
@@ -1232,13 +2044,19 @@ impl<'a> Emit<'a> {
                 };
                 let t = self.t();
                 self.line(format!("{} = call fast double @{}(double {})", t, intr, x));
-                Ok(EV { ty: CType::F64, regs: vec![t] })
+                Ok(EV {
+                    ty: CType::F64,
+                    regs: vec![t],
+                })
             }
             "acos" => {
                 let x = self.to_f64(&args[0])?;
                 let t = self.t();
                 self.line(format!("{} = call fast double @acos(double {})", t, x));
-                Ok(EV { ty: CType::F64, regs: vec![t] })
+                Ok(EV {
+                    ty: CType::F64,
+                    regs: vec![t],
+                })
             }
             "min" | "max" | "pow" | "atan2" => {
                 let a = self.to_f64(&args[0])?;
@@ -1254,25 +2072,38 @@ impl<'a> Emit<'a> {
                     "{} = call fast double @{}(double {}, double {})",
                     t, callee, a, b
                 ));
-                Ok(EV { ty: CType::F64, regs: vec![t] })
+                Ok(EV {
+                    ty: CType::F64,
+                    regs: vec![t],
+                })
             }
             "float" => {
                 let x = self.to_f64(&args[0])?;
-                Ok(EV { ty: CType::F64, regs: vec![x] })
+                Ok(EV {
+                    ty: CType::F64,
+                    regs: vec![x],
+                })
             }
             "int" => {
                 if args[0].ty == CType::F64 {
                     let t = self.t();
                     self.line(format!("{} = fptosi double {} to i64", t, args[0].regs[0]));
-                    Ok(EV { ty: CType::I64, regs: vec![t] })
+                    Ok(EV {
+                        ty: CType::I64,
+                        regs: vec![t],
+                    })
                 } else {
                     // i64, bool, enum tag: already an integer register
-                    Ok(EV { ty: CType::I64, regs: args[0].regs.clone() })
+                    Ok(EV {
+                        ty: CType::I64,
+                        regs: args[0].regs.clone(),
+                    })
                 }
             }
-            "len" if args[0].ty == CType::Str => {
-                Ok(EV { ty: CType::I64, regs: vec![args[0].regs[1].clone()] })
-            }
+            "len" if args[0].ty == CType::Str => Ok(EV {
+                ty: CType::I64,
+                regs: vec![args[0].regs[1].clone()],
+            }),
             "substr" => {
                 let (p0, l0) = (args[0].regs[0].clone(), args[0].regs[1].clone());
                 let (lo, hi) = (args[1].regs[0].clone(), args[2].regs[0].clone());
@@ -1297,7 +2128,10 @@ impl<'a> Emit<'a> {
                 self.line(format!("{} = getelementptr i8, ptr {}, i64 {}", np, p0, lo));
                 let nl = self.t();
                 self.line(format!("{} = sub i64 {}, {}", nl, hi, lo));
-                Ok(EV { ty: CType::Str, regs: vec![np, nl] })
+                Ok(EV {
+                    ty: CType::Str,
+                    regs: vec![np, nl],
+                })
             }
             "len" => {
                 let elem = match &args[0].ty {
@@ -1308,11 +2142,17 @@ impl<'a> Emit<'a> {
                 let n = self.t();
                 self.line(format!("{} = load i64, ptr {}", n, args[0].regs[0]));
                 if stride == 1 {
-                    Ok(EV { ty: CType::I64, regs: vec![n] })
+                    Ok(EV {
+                        ty: CType::I64,
+                        regs: vec![n],
+                    })
                 } else {
                     let d = self.t();
                     self.line(format!("{} = sdiv i64 {}, {}", d, n, stride));
-                    Ok(EV { ty: CType::I64, regs: vec![d] })
+                    Ok(EV {
+                        ty: CType::I64,
+                        regs: vec![d],
+                    })
                 }
             }
             "arr" => {
@@ -1324,14 +2164,20 @@ impl<'a> Emit<'a> {
                             "{} = call ptr @lu_arr_new_f64(i64 {}, double {})",
                             t, n, args[1].regs[0]
                         ));
-                        Ok(EV { ty: CType::Arr(Box::new(CType::F64)), regs: vec![t] })
+                        Ok(EV {
+                            ty: CType::Arr(Box::new(CType::F64)),
+                            regs: vec![t],
+                        })
                     }
                     CType::I64 => {
                         self.line(format!(
                             "{} = call ptr @lu_arr_new_i64(i64 {}, i64 {})",
                             t, n, args[1].regs[0]
                         ));
-                        Ok(EV { ty: CType::Arr(Box::new(CType::I64)), regs: vec![t] })
+                        Ok(EV {
+                            ty: CType::Arr(Box::new(CType::I64)),
+                            regs: vec![t],
+                        })
                     }
                     t @ (CType::Bool | CType::Enum(_)) => {
                         let elem = t.clone();
@@ -1340,11 +2186,14 @@ impl<'a> Emit<'a> {
                             "{} = call ptr @lu_arr_new_i64(i64 {}, i64 {})",
                             r, n, args[1].regs[0]
                         ));
-                        Ok(EV { ty: CType::Arr(Box::new(elem)), regs: vec![r] })
+                        Ok(EV {
+                            ty: CType::Arr(Box::new(elem)),
+                            regs: vec![r],
+                        })
                     }
                     t @ (CType::Rec(_) | CType::Str) => {
                         let elem = t.clone();
-                        let stride = lty(self.p, &elem)? .len() as i64;
+                        let stride = lty(self.p, &elem)?.len() as i64;
                         let base = self.t();
                         self.line(format!(
                             "{} = call ptr @lu_arr_new_raw(i64 {}, i64 {})",
@@ -1368,7 +2217,8 @@ impl<'a> Emit<'a> {
                         self.label(&lb);
                         let addrs = self.elem_addrs(&base, &iv, &elem, Some(n.clone()))?;
                         let comps = lty(self.p, &elem)?;
-                        for ((c, r), ep) in comps.iter().zip(args[1].regs.iter()).zip(addrs.iter()) {
+                        for ((c, r), ep) in comps.iter().zip(args[1].regs.iter()).zip(addrs.iter())
+                        {
                             self.line(format!("store {} {}, ptr {}", c, r, ep));
                         }
                         let ivn = self.t();
@@ -1376,7 +2226,10 @@ impl<'a> Emit<'a> {
                         self.line(format!("store i64 {}, ptr {}", ivn, iptr));
                         self.line(format!("br label %{}", lh));
                         self.label(&lx);
-                        Ok(EV { ty: CType::Arr(Box::new(elem)), regs: vec![base] })
+                        Ok(EV {
+                            ty: CType::Arr(Box::new(elem)),
+                            regs: vec![base],
+                        })
                     }
                     t => Err(format!("arr of {:?} unsupported in AOT", t)),
                 }

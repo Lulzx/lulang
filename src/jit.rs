@@ -8,10 +8,10 @@ use crate::ast::*;
 use crate::backend::layout::{components as layout_components, field_offset, Component};
 use crate::backend::optimization::{licm, scan_trusted, scan_trusted_expr};
 use crate::check::{resolve_type, Type as CType};
-use crate::ir::LoweredProgram;
+use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
 use crate::runtime;
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Value};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Value};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -51,6 +51,7 @@ pub struct Jit<'a> {
     pure_imports: std::collections::HashSet<u32>,
 }
 
+#[allow(dead_code)] // legacy AST emitters are retained only until post-migration cleanup
 impl<'a> Jit<'a> {
     pub fn run(ir: &'a LoweredProgram) -> Result<(), String> {
         let p = ir.source();
@@ -66,7 +67,9 @@ impl<'a> Jit<'a> {
             ))
             .map_err(|e| e.to_string())?;
         let mut opt_flags = cranelift_codegen::settings::builder();
-        opt_flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
+        opt_flags
+            .set("opt_level", "speed")
+            .map_err(|e| e.to_string())?;
         let opt_isa = cranelift_native::builder()
             .map_err(|e| e.to_string())?
             .finish(cranelift_codegen::settings::Flags::new(opt_flags))
@@ -104,11 +107,17 @@ impl<'a> Jit<'a> {
             jb.symbol(*n, *ptr);
         }
         let module = JITModule::new(jb);
-        let soa = std::env::var("LU_LAYOUT").map(|v| v != "aos").unwrap_or(true);
+        let soa = std::env::var("LU_LAYOUT")
+            .map(|v| v != "aos")
+            .unwrap_or(true);
         let simd = std::env::var("LU_SIMD").map(|v| v != "off").unwrap_or(true);
-        let ifconv = std::env::var("LU_IFCONV").map(|v| v != "off").unwrap_or(true);
+        let ifconv = std::env::var("LU_IFCONV")
+            .map(|v| v != "off")
+            .unwrap_or(true);
         let do_licm = std::env::var("LU_LICM").map(|v| v != "off").unwrap_or(true);
-        let inline_math = std::env::var("LU_MATH").map(|v| v != "call").unwrap_or(true);
+        let inline_math = std::env::var("LU_MATH")
+            .map(|v| v != "call")
+            .unwrap_or(true);
         let mut jit = Jit {
             p,
             expr_types: ir.expression_types(),
@@ -125,11 +134,13 @@ impl<'a> Jit<'a> {
         };
         jit.declare_imports()?;
         jit.declare_fns()?;
-        for f in &p.fns {
-            jit.compile_fn(f)?;
+        for (index, f) in p.fns.iter().enumerate() {
+            jit.compile_ir_fn(&ir.functions[index], f)?;
         }
-        let main_id = jit.compile_main()?;
-        jit.module.finalize_definitions().map_err(|e| e.to_string())?;
+        let main_id = jit.compile_ir_main(ir.main.as_ref().ok_or("no `main` block in program")?)?;
+        jit.module
+            .finalize_definitions()
+            .map_err(|e| e.to_string())?;
         let ptr = jit.module.get_finalized_function(main_id);
         let entry: extern "C" fn() = unsafe { std::mem::transmute(ptr) };
         entry();
@@ -147,7 +158,12 @@ impl<'a> Jit<'a> {
             ("lu_arr_new_f64", 1, &[types::I64, types::F64], false),
             ("lu_arr_new_i64", 1, &[types::I64, types::I64], false),
             ("lu_arr_new_raw", 1, &[types::I64, types::I64], false),
-            ("lu_str_eq", 1, &[types::I64, types::I64, types::I64, types::I64], false),
+            (
+                "lu_str_eq",
+                1,
+                &[types::I64, types::I64, types::I64, types::I64],
+                false,
+            ),
             ("lu_oob", 0, &[types::I64, types::I64], false),
             ("lu_i64_div", 1, &[types::I64, types::I64], false),
             ("lu_i64_rem", 1, &[types::I64, types::I64], false),
@@ -160,10 +176,20 @@ impl<'a> Jit<'a> {
             ("lu_nargs", 1, &[], false),
             ("lu_arg", 1, &[types::I64], false),
             ("lu_read_file", 1, &[types::I64, types::I64], false),
-            ("lu_write_file", 0, &[types::I64, types::I64, types::I64, types::I64], false),
+            (
+                "lu_write_file",
+                0,
+                &[types::I64, types::I64, types::I64, types::I64],
+                false,
+            ),
             ("lu_last_len", 1, &[], false),
             ("lu_chr", 1, &[types::I64], false),
-            ("lu_concat", 1, &[types::I64, types::I64, types::I64, types::I64], false),
+            (
+                "lu_concat",
+                1,
+                &[types::I64, types::I64, types::I64, types::I64],
+                false,
+            ),
         ];
         for (name, kind, params, pure) in specs {
             let mut sig = self.module.make_signature();
@@ -189,8 +215,11 @@ impl<'a> Jit<'a> {
 
     fn declare_fns(&mut self) -> Result<(), String> {
         for f in &self.p.fns {
-            let params: Result<Vec<CType>, String> =
-                f.params.iter().map(|(_, t)| resolve_type(self.p, t)).collect();
+            let params: Result<Vec<CType>, String> = f
+                .params
+                .iter()
+                .map(|(_, t)| resolve_type(self.p, t))
+                .collect();
             let params = params?;
             let ret = resolve_type(self.p, &f.ret)?;
             let mut sig = self.module.make_signature();
@@ -217,6 +246,139 @@ impl<'a> Jit<'a> {
             self.fns.insert(f.name.clone(), FnInfo { id, params, ret });
         }
         Ok(())
+    }
+
+    fn compile_ir_fn(&mut self, function: &ir::Function, decl: &FnDecl) -> Result<(), String> {
+        let info_id = self.fns[&decl.name].id;
+        let params = self.fns[&decl.name].params.clone();
+        let ret = self.fns[&decl.name].ret.clone();
+        let mut ctx = self.module.make_context();
+        let mut sig = self.module.make_signature();
+        for ty in &params {
+            for component in comps(self.p, ty)? {
+                sig.params.push(AbiParam::new(component));
+            }
+        }
+        for component in comps(self.p, &ret)? {
+            sig.returns.push(AbiParam::new(component));
+        }
+        for &io in &decl.inouts {
+            if io {
+                sig.params.push(AbiParam::new(types::I64));
+            }
+        }
+        ctx.func.signature = sig;
+        let mut fbc = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
+            let blocks: Vec<_> = (0..function.blocks.len())
+                .map(|_| b.create_block())
+                .collect();
+            b.append_block_params_for_function_params(blocks[0]);
+            b.switch_to_block(blocks[0]);
+            let incoming = b.block_params(blocks[0]).to_vec();
+            let mut g = Gen {
+                p: self.p,
+                expr_types: self.expr_types,
+                b,
+                module: &mut self.module,
+                fns: &self.fns,
+                imports: &self.imports,
+                env: vec![HashMap::new()],
+                refs: HashMap::new(),
+                inline_frames: Vec::new(),
+                inline_stack: Vec::new(),
+                inline_spent: 0,
+                trusted_idx: Vec::new(),
+                soa: self.soa,
+                simd: self.simd,
+                ifconv: self.ifconv,
+                inline_math: self.inline_math,
+                inout_outs: Vec::new(),
+            };
+            g.declare_ir_locals(function)?;
+            let mut cursor = 0;
+            for &local in &function.params {
+                let n = comps(g.p, &function.locals[local as usize].ty)?.len();
+                g.define_ir_local(local, &incoming[cursor..cursor + n])?;
+                cursor += n;
+            }
+            for (&local, &io) in function.params.iter().zip(&function.inouts) {
+                if io {
+                    let ptr = incoming[cursor];
+                    cursor += 1;
+                    let (_, vars) = g.lookup(&Gen::ir_local(local)).unwrap();
+                    g.inout_outs.push((ptr, vars));
+                }
+            }
+            g.gen_ir_body(function, &blocks)?;
+            g.b.seal_all_blocks();
+            g.b.finalize();
+        }
+        ctx.optimize(self.opt_isa.as_ref(), &mut Default::default())
+            .map_err(|e| e.to_string())?;
+        if self.do_licm {
+            licm(&mut ctx.func, &self.pure_imports);
+        }
+        self.module
+            .define_function(info_id, &mut ctx)
+            .map_err(|e| e.to_string())?;
+        self.module.clear_context(&mut ctx);
+        Ok(())
+    }
+
+    fn compile_ir_main(&mut self, function: &ir::Function) -> Result<FuncId, String> {
+        let sig = self.module.make_signature();
+        let id = self
+            .module
+            .declare_function("__lu_main", Linkage::Local, &sig)
+            .map_err(|e| e.to_string())?;
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = self.module.make_signature();
+        let mut fbc = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
+            let blocks: Vec<_> = (0..function.blocks.len())
+                .map(|_| b.create_block())
+                .collect();
+            b.switch_to_block(blocks[0]);
+            let mut g = Gen {
+                p: self.p,
+                expr_types: self.expr_types,
+                b,
+                module: &mut self.module,
+                fns: &self.fns,
+                imports: &self.imports,
+                env: vec![HashMap::new()],
+                refs: HashMap::new(),
+                inline_frames: Vec::new(),
+                inline_stack: Vec::new(),
+                inline_spent: 0,
+                trusted_idx: Vec::new(),
+                soa: self.soa,
+                simd: self.simd,
+                ifconv: self.ifconv,
+                inline_math: self.inline_math,
+                inout_outs: Vec::new(),
+            };
+            g.declare_ir_locals(function)?;
+            g.gen_ir_body(function, &blocks)?;
+            g.b.seal_all_blocks();
+            g.b.finalize();
+        }
+        ctx.optimize(self.opt_isa.as_ref(), &mut Default::default())
+            .map_err(|e| e.to_string())?;
+        if self.do_licm {
+            licm(&mut ctx.func, &self.pure_imports);
+        }
+        if std::env::var("LU_DUMP").is_ok() {
+            eprintln!("{}", ctx.func.display());
+        }
+        self.module
+            .define_function(id, &mut ctx)
+            .map_err(|e| e.to_string())?;
+        self.module.clear_context(&mut ctx);
+        Ok(id)
     }
 
     fn compile_fn(&mut self, f: &FnDecl) -> Result<(), String> {
@@ -308,7 +470,9 @@ impl<'a> Jit<'a> {
         if self.do_licm {
             licm(&mut ctx.func, &self.pure_imports);
         }
-        self.module.define_function(info_id, &mut ctx).map_err(|e| e.to_string())?;
+        self.module
+            .define_function(info_id, &mut ctx)
+            .map_err(|e| e.to_string())?;
         self.module.clear_context(&mut ctx);
         Ok(())
     }
@@ -361,7 +525,9 @@ impl<'a> Jit<'a> {
         if std::env::var("LU_DUMP").is_ok() {
             eprintln!("{}", ctx.func.display());
         }
-        self.module.define_function(id, &mut ctx).map_err(|e| e.to_string())?;
+        self.module
+            .define_function(id, &mut ctx)
+            .map_err(|e| e.to_string())?;
         self.module.clear_context(&mut ctx);
         Ok(id)
     }
@@ -443,9 +609,254 @@ impl<'a, 'b> Gen<'a, 'b> {
         for (ptr, vars) in outs {
             for (k, v) in vars.iter().enumerate() {
                 let val = self.b.use_var(*v);
-                self.b.ins().store(MemFlags::trusted(), val, ptr, (k * 8) as i32);
+                self.b
+                    .ins()
+                    .store(MemFlags::trusted(), val, ptr, (k * 8) as i32);
             }
         }
+    }
+
+    fn ir_local(id: ir::LocalId) -> String {
+        format!("$l{}", id)
+    }
+    fn declare_ir_locals(&mut self, function: &ir::Function) -> Result<(), String> {
+        for (id, local) in function.locals.iter().enumerate() {
+            let vars = comps(self.p, &local.ty)?
+                .into_iter()
+                .map(|ty| self.b.declare_var(ty))
+                .collect();
+            self.env[0].insert(Self::ir_local(id as u32), (local.ty.clone(), vars));
+        }
+        Ok(())
+    }
+    fn define_ir_local(&mut self, id: ir::LocalId, values: &[Value]) -> Result<(), String> {
+        let (_, vars) = self.lookup(&Self::ir_local(id)).ok_or("invalid IR local")?;
+        for (var, value) in vars.iter().zip(values) {
+            self.b.def_var(*var, *value);
+        }
+        Ok(())
+    }
+    fn ir_value(
+        values: &[Option<(CType, Vec<Value>)>],
+        id: ir::ValueId,
+    ) -> Result<(CType, Vec<Value>), String> {
+        values
+            .get(id as usize)
+            .and_then(Clone::clone)
+            .ok_or_else(|| format!("IR value %{} unavailable", id))
+    }
+
+    fn gen_ir_body(
+        &mut self,
+        function: &ir::Function,
+        blocks: &[cranelift_codegen::ir::Block],
+    ) -> Result<(), String> {
+        let mut values = vec![None; function.values.len()];
+        for (index, block) in function.blocks.iter().enumerate() {
+            if index != 0 {
+                self.b.switch_to_block(blocks[index]);
+            }
+            for inst in &block.instructions {
+                let result = self.gen_ir_inst(function, &values, &inst.kind, &inst.ty)?;
+                if let Some(id) = inst.result {
+                    values[id as usize] =
+                        Some(result.ok_or("IR value instruction produced no value")?);
+                }
+            }
+            match block.terminator {
+                Terminator::Jump(target) => {
+                    self.b.ins().jump(blocks[target as usize], &[]);
+                }
+                Terminator::Branch {
+                    condition,
+                    then_block,
+                    else_block,
+                } => {
+                    let (_, value) = Self::ir_value(&values, condition)?;
+                    self.b.ins().brif(
+                        value[0],
+                        blocks[then_block as usize],
+                        &[],
+                        blocks[else_block as usize],
+                        &[],
+                    );
+                }
+                Terminator::Return(id) => {
+                    let (mut ty, mut vals) = Self::ir_value(&values, id)?;
+                    if function.ret == CType::F64 && ty == CType::I64 {
+                        vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
+                        ty = CType::F64;
+                    }
+                    let _ = ty;
+                    self.emit_inout_stores();
+                    self.b.ins().return_(&vals);
+                }
+                Terminator::Unreachable => {
+                    self.b
+                        .ins()
+                        .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn gen_ir_inst(
+        &mut self,
+        function: &ir::Function,
+        values: &[Option<(CType, Vec<Value>)>],
+        kind: &InstKind,
+        ty: &CType,
+    ) -> Result<Option<(CType, Vec<Value>)>, String> {
+        let value = |id| Self::ir_value(values, id);
+        Ok(match kind {
+            InstKind::Constant(c) => Some(match c {
+                Constant::I64(v) => (CType::I64, vec![self.b.ins().iconst(types::I64, *v)]),
+                Constant::F64(v) => (CType::F64, vec![self.b.ins().f64const(*v)]),
+                Constant::Bool(v) => (
+                    CType::Bool,
+                    vec![self.b.ins().iconst(types::I64, *v as i64)],
+                ),
+                Constant::Bytes(bytes) => (
+                    CType::Str,
+                    vec![
+                        self.b.ins().iconst(types::I64, bytes.as_ptr() as i64),
+                        self.b.ins().iconst(types::I64, bytes.len() as i64),
+                    ],
+                ),
+                Constant::Unit => (CType::Unit, vec![]),
+            }),
+            InstKind::Load(local) => {
+                let (ty, vars) = self
+                    .lookup(&Self::ir_local(*local))
+                    .ok_or("invalid IR local")?;
+                Some((ty, vars.iter().map(|v| self.b.use_var(*v)).collect()))
+            }
+            InstKind::Store { local, value: id } => {
+                let (mut got, mut vals) = value(*id)?;
+                let want = &function.locals[*local as usize].ty;
+                if *want == CType::F64 && got == CType::I64 {
+                    vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
+                    got = CType::F64;
+                }
+                let _ = got;
+                self.define_ir_local(*local, &vals)?;
+                None
+            }
+            InstKind::Unary { op, value: id } => {
+                let (_, vals) = value(*id)?;
+                Some((
+                    ty.clone(),
+                    vec![match op {
+                        UnaryOp::Neg if *ty == CType::F64 => self.b.ins().fneg(vals[0]),
+                        UnaryOp::Neg => self.b.ins().ineg(vals[0]),
+                        UnaryOp::Not => self.b.ins().bxor_imm(vals[0], 1),
+                    }],
+                ))
+            }
+            InstKind::Binary { op, lhs, rhs } => {
+                let (lhs_ty, lhs) = value(*lhs)?;
+                let (rhs_ty, rhs) = value(*rhs)?;
+                Some(self.gen_ir_binary(*op, lhs_ty, lhs, rhs_ty, rhs)?)
+            }
+            InstKind::Call {
+                callee,
+                args,
+                inout,
+            } => {
+                let args = args
+                    .iter()
+                    .map(|id| value(*id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(match callee {
+                    Callee::Builtin(name) => {
+                        let (types, vals): (Vec<_>, Vec<_>) = args.into_iter().unzip();
+                        self.gen_call(name, types, vals, &[])?
+                    }
+                    Callee::Function(id) => self.gen_ir_user_call(*id, args, inout)?,
+                })
+            }
+            InstKind::Field {
+                base,
+                record,
+                field,
+            } => {
+                let (_, vals) = value(*base)?;
+                let name = &self.p.types[*record].fields[*field].0;
+                let (off, field_ty) = field_offset(self.p, *record, name)?;
+                let width = comps(self.p, &field_ty)?.len();
+                Some((field_ty, vals[off..off + width].to_vec()))
+            }
+            InstKind::Index { base, index } => {
+                let (base_ty, base) = value(*base)?;
+                let (_, index) = value(*index)?;
+                Some(self.gen_ir_index(base_ty, base, index[0])?)
+            }
+            InstKind::Array(items) => {
+                let items = items
+                    .iter()
+                    .map(|id| value(*id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(self.gen_ir_array(items, ty)?)
+            }
+            InstKind::Record { record, fields } => {
+                let mut out = Vec::new();
+                for (id, (_, type_name)) in fields.iter().zip(&self.p.types[*record].fields) {
+                    let (got, mut vals) = value(*id)?;
+                    let want = resolve_type(self.p, type_name)?;
+                    if want == CType::F64 && got == CType::I64 {
+                        vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
+                    }
+                    out.extend(vals);
+                }
+                Some((ty.clone(), out))
+            }
+            InstKind::Enum { enumeration, tag } => Some((
+                CType::Enum(*enumeration),
+                vec![self.b.ins().iconst(types::I64, *tag)],
+            )),
+            InstKind::SetIndex {
+                base,
+                index,
+                value: stored,
+            } => {
+                let (base_ty, base) = value(*base)?;
+                let (_, index) = value(*index)?;
+                let (_, stored) = value(*stored)?;
+                let CType::Arr(elem) = base_ty else {
+                    return Err("IR set-index on non-array".into());
+                };
+                let addrs = self.elem_addrs(base[0], index[0], &elem, None)?;
+                for (reg, addr) in stored.iter().zip(addrs) {
+                    self.b.ins().store(MemFlags::trusted(), *reg, addr, 0);
+                }
+                None
+            }
+            InstKind::SetField {
+                root,
+                path,
+                value: stored,
+            } => {
+                let (_, stored) = value(*stored)?;
+                let (mut current, vars) = self
+                    .lookup(&Self::ir_local(*root))
+                    .ok_or("invalid field root")?;
+                let mut offset = 0;
+                for &field in path {
+                    let CType::Rec(record) = current else {
+                        return Err("field path on non-record".into());
+                    };
+                    let name = &self.p.types[record].fields[field].0;
+                    let (add, next) = field_offset(self.p, record, name)?;
+                    offset += add;
+                    current = next;
+                }
+                for (var, value) in vars[offset..].iter().zip(stored) {
+                    self.b.def_var(*var, value);
+                }
+                None
+            }
+        })
     }
 
     fn bind(&mut self, name: &str, t: CType, vals: &[Value]) -> Result<(), String> {
@@ -455,7 +866,10 @@ impl<'a, 'b> Gen<'a, 'b> {
             self.b.def_var(v, vals[i]);
             vars.push(v);
         }
-        self.env.last_mut().unwrap().insert(name.to_string(), (t, vars));
+        self.env
+            .last_mut()
+            .unwrap()
+            .insert(name.to_string(), (t, vars));
         Ok(())
     }
 
@@ -484,7 +898,10 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.inst_results(call).to_vec()
     }
 
-    fn gen_block(&mut self, stmts: &[StmtId]) -> Result<(bool, Option<(CType, Vec<Value>)>), String> {
+    fn gen_block(
+        &mut self,
+        stmts: &[StmtId],
+    ) -> Result<(bool, Option<(CType, Vec<Value>)>), String> {
         self.env.push(HashMap::new());
         let mut last = None;
         for &sid in stmts {
@@ -511,7 +928,8 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let (_, vals) = self.gen_expr(*e)?;
                 match self.p.expr(*target) {
                     Expr::Ident(n) => {
-                        let (_, vars) = self.lookup(n).ok_or(format!("unknown variable `{}`", n))?;
+                        let (_, vars) =
+                            self.lookup(n).ok_or(format!("unknown variable `{}`", n))?;
                         for (var, val) in vars.iter().zip(vals.iter()) {
                             self.b.def_var(*var, *val);
                         }
@@ -589,7 +1007,9 @@ impl<'a, 'b> Gen<'a, 'b> {
                 if t_term && e_term {
                     // merge is unreachable but must still be a well-formed block
                     self.b.switch_to_block(merge);
-                    self.b.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                    self.b
+                        .ins()
+                        .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
                     return Ok(StmtOut::Terminated);
                 }
                 self.b.switch_to_block(merge);
@@ -677,7 +1097,13 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// (the default — compiler-owned layout): component c lives in its own
     /// plane of `n` slots at base+8+(c*n+idx)*8. `trusted` carries the
     /// loop-hoisted logical length when the bounds check was already done.
-    fn elem_addrs(&mut self, base: Value, idx: Value, elem: &CType, trusted: Option<Value>) -> Result<Vec<Value>, String> {
+    fn elem_addrs(
+        &mut self,
+        base: Value,
+        idx: Value,
+        elem: &CType,
+        trusted: Option<Value>,
+    ) -> Result<Vec<Value>, String> {
         let stride = comps(self.p, elem)?.len() as i64;
         let logical = match trusted {
             Some(n) => n,
@@ -689,7 +1115,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                     let s = self.b.ins().iconst(types::I64, stride);
                     self.b.ins().sdiv(len, s)
                 };
-                let bad = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, logical);
+                let bad = self
+                    .b
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, logical);
                 let oob = self.b.create_block();
                 let ok = self.b.create_block();
                 self.b.ins().brif(bad, oob, &[], ok, &[]);
@@ -714,13 +1143,18 @@ impl<'a, 'b> Gen<'a, 'b> {
         } else {
             let off = self.b.ins().imul_imm(idx, stride * 8);
             let a0 = self.b.ins().iadd(base8, off);
-            Ok((0..stride).map(|c| self.b.ins().iadd_imm(a0, c * 8)).collect())
+            Ok((0..stride)
+                .map(|c| self.b.ins().iadd_imm(a0, c * 8))
+                .collect())
         }
     }
 
     /// Emit `idx u< len` check, aborting via lu_oob on failure.
     fn check_idx(&mut self, idx: Value, len: Value) {
-        let bad = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let bad = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
         let oob = self.b.create_block();
         let ok = self.b.create_block();
         self.b.ins().brif(bad, oob, &[], ok, &[]);
@@ -748,7 +1182,9 @@ impl<'a, 'b> Gen<'a, 'b> {
     fn hoist_checks(&mut self, arrays: &[String], var: &str, lo: Value, hi: Value) -> usize {
         let mut pushed = 0;
         for name in arrays {
-            let Some((CType::Arr(elem), vars)) = self.lookup(name) else { continue };
+            let Some((CType::Arr(elem), vars)) = self.lookup(name) else {
+                continue;
+            };
             let stride = match comps(self.p, &elem) {
                 Ok(c) => c.len() as i64,
                 Err(_) => continue,
@@ -773,7 +1209,8 @@ impl<'a, 'b> Gen<'a, 'b> {
             self.b.ins().call(r, &[hi, logical]);
             self.b.ins().jump(ok, &[]);
             self.b.switch_to_block(ok);
-            self.trusted_idx.push((name.clone(), var.to_string(), logical));
+            self.trusted_idx
+                .push((name.clone(), var.to_string(), logical));
             pushed += 1;
         }
         pushed
@@ -845,7 +1282,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                 if at == CType::Str {
                     self.check_idx(ivals[0], avals[1]);
                     let addr = self.b.ins().iadd(avals[0], ivals[0]);
-                    let byte = self.b.ins().uload8(types::I64, MemFlags::trusted(), addr, 0);
+                    let byte = self
+                        .b
+                        .ins()
+                        .uload8(types::I64, MemFlags::trusted(), addr, 0);
                     return Ok((CType::I64, vec![byte]));
                 }
                 let elem = match at {
@@ -941,6 +1381,201 @@ impl<'a, 'b> Gen<'a, 'b> {
         }
     }
 
+    fn gen_ir_binary(
+        &mut self,
+        op: BinaryOp,
+        lt: CType,
+        lv: Vec<Value>,
+        rt: CType,
+        rv: Vec<Value>,
+    ) -> Result<(CType, Vec<Value>), String> {
+        use BinaryOp::*;
+        if matches!(op, Add | Sub | Mul | Div | Rem) {
+            if lt == CType::I64 && rt == CType::I64 {
+                let v = match op {
+                    Add => self.b.ins().iadd(lv[0], rv[0]),
+                    Sub => self.b.ins().isub(lv[0], rv[0]),
+                    Mul => self.b.ins().imul(lv[0], rv[0]),
+                    Div => self.checked_int_div(lv[0], rv[0], false),
+                    Rem => self.checked_int_div(lv[0], rv[0], true),
+                    _ => unreachable!(),
+                };
+                return Ok((CType::I64, vec![v]));
+            }
+            let a = self.f64_of(&lt, lv[0]);
+            let b = self.f64_of(&rt, rv[0]);
+            let v = match op {
+                Add => self.b.ins().fadd(a, b),
+                Sub => self.b.ins().fsub(a, b),
+                Mul => self.b.ins().fmul(a, b),
+                Div => self.b.ins().fdiv(a, b),
+                Rem => self.call_import("lu_fmod", &[a, b])[0],
+                _ => unreachable!(),
+            };
+            return Ok((CType::F64, vec![v]));
+        }
+        if matches!(op, Eq | Ne) && lt == CType::Str && rt == CType::Str {
+            let eq = self.call_import("lu_str_eq", &[lv[0], lv[1], rv[0], rv[1]])[0];
+            return Ok((
+                CType::Bool,
+                vec![if op == Ne {
+                    self.b.ins().bxor_imm(eq, 1)
+                } else {
+                    eq
+                }],
+            ));
+        }
+        if op == ApproxEq {
+            let a = self.f64_of(&lt, lv[0]);
+            let b = self.f64_of(&rt, rv[0]);
+            let raw_diff = self.b.ins().fsub(a, b);
+            let diff = self.b.ins().fabs(raw_diff);
+            let abs_a = self.b.ins().fabs(a);
+            let abs_b = self.b.ins().fabs(b);
+            let scale = self.b.ins().fmax(abs_a, abs_b);
+            let rtol = self.b.ins().f64const(RTOL);
+            let atol = self.b.ins().f64const(ATOL);
+            let scaled = self.b.ins().fmul(scale, rtol);
+            let tol = self.b.ins().fadd(scaled, atol);
+            let bit = self.b.ins().fcmp(FloatCC::LessThanOrEqual, diff, tol);
+            return Ok((CType::Bool, vec![self.b.ins().uextend(types::I64, bit)]));
+        }
+        let both_int = matches!(lt, CType::I64 | CType::Bool | CType::Enum(_))
+            && matches!(rt, CType::I64 | CType::Bool | CType::Enum(_));
+        let bit = if both_int {
+            self.b.ins().icmp(
+                match op {
+                    Eq => IntCC::Equal,
+                    Ne => IntCC::NotEqual,
+                    Lt => IntCC::SignedLessThan,
+                    Le => IntCC::SignedLessThanOrEqual,
+                    Gt => IntCC::SignedGreaterThan,
+                    Ge => IntCC::SignedGreaterThanOrEqual,
+                    _ => return Err("invalid comparison".into()),
+                },
+                lv[0],
+                rv[0],
+            )
+        } else {
+            let a = self.f64_of(&lt, lv[0]);
+            let b = self.f64_of(&rt, rv[0]);
+            self.b.ins().fcmp(
+                match op {
+                    Eq => FloatCC::Equal,
+                    Ne => FloatCC::NotEqual,
+                    Lt => FloatCC::LessThan,
+                    Le => FloatCC::LessThanOrEqual,
+                    Gt => FloatCC::GreaterThan,
+                    Ge => FloatCC::GreaterThanOrEqual,
+                    _ => return Err("invalid comparison".into()),
+                },
+                a,
+                b,
+            )
+        };
+        Ok((CType::Bool, vec![self.b.ins().uextend(types::I64, bit)]))
+    }
+
+    fn gen_ir_index(
+        &mut self,
+        base_ty: CType,
+        base: Vec<Value>,
+        index: Value,
+    ) -> Result<(CType, Vec<Value>), String> {
+        if base_ty == CType::Str {
+            self.check_idx(index, base[1]);
+            let addr = self.b.ins().iadd(base[0], index);
+            let byte = self
+                .b
+                .ins()
+                .uload8(types::I64, MemFlags::trusted(), addr, 0);
+            return Ok((CType::I64, vec![byte]));
+        }
+        let CType::Arr(elem) = base_ty else {
+            return Err("IR index on non-array".into());
+        };
+        let addrs = self.elem_addrs(base[0], index, &elem, None)?;
+        let mut out = Vec::new();
+        for (component, addr) in comps(self.p, &elem)?.into_iter().zip(addrs) {
+            out.push(self.b.ins().load(component, MemFlags::trusted(), addr, 0));
+        }
+        Ok((*elem, out))
+    }
+
+    fn gen_ir_array(
+        &mut self,
+        items: Vec<(CType, Vec<Value>)>,
+        ty: &CType,
+    ) -> Result<(CType, Vec<Value>), String> {
+        let CType::Arr(elem) = ty else {
+            return Err("IR array with non-array type".into());
+        };
+        let logical = self.b.ins().iconst(types::I64, items.len() as i64);
+        let stride = self
+            .b
+            .ins()
+            .iconst(types::I64, comps(self.p, elem)?.len() as i64);
+        let base = self.call_import("lu_arr_new_raw", &[logical, stride])[0];
+        for (i, (got, mut vals)) in items.into_iter().enumerate() {
+            if **elem == CType::F64 && got == CType::I64 {
+                vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
+            }
+            let index = self.b.ins().iconst(types::I64, i as i64);
+            let addrs = self.elem_addrs(base, index, elem, Some(logical))?;
+            for (value, addr) in vals.into_iter().zip(addrs) {
+                self.b.ins().store(MemFlags::trusted(), value, addr, 0);
+            }
+        }
+        Ok((ty.clone(), vec![base]))
+    }
+
+    fn gen_ir_user_call(
+        &mut self,
+        id: ir::FunctionId,
+        args: Vec<(CType, Vec<Value>)>,
+        inout: &[Option<ir::LocalId>],
+    ) -> Result<(CType, Vec<Value>), String> {
+        use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+        let decl = &self.p.fns[id as usize];
+        let info = &self.fns[&decl.name];
+        let ret = info.ret.clone();
+        let params = info.params.clone();
+        let mut flat = Vec::new();
+        for ((got, vals), want) in args.into_iter().zip(&params) {
+            if *want == CType::F64 && got == CType::I64 {
+                flat.push(self.b.ins().fcvt_from_sint(types::F64, vals[0]));
+            } else {
+                flat.extend(vals);
+            }
+        }
+        let mut slots = Vec::new();
+        for (i, (&io, ty)) in decl.inouts.iter().zip(&params).enumerate() {
+            if io {
+                let components = comps(self.p, ty)?;
+                let slot = self.b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    (components.len() * 8) as u32,
+                    3,
+                ));
+                flat.push(self.b.ins().stack_addr(types::I64, slot, 0));
+                slots.push((i, slot, components));
+            }
+        }
+        let callee = self.callee(&decl.name);
+        let call = self.b.ins().call(callee, &flat);
+        let result = self.b.inst_results(call).to_vec();
+        for (i, slot, components) in slots {
+            let target = inout[i].ok_or("missing IR inout target")?;
+            let loaded = components
+                .iter()
+                .enumerate()
+                .map(|(k, &ty)| self.b.ins().stack_load(ty, slot, (k * 8) as i32))
+                .collect::<Vec<_>>();
+            self.define_ir_local(target, &loaded)?;
+        }
+        Ok((ret, result))
+    }
+
     fn gen_bin(&mut self, op: String, l: ExprId, r: ExprId) -> Result<(CType, Vec<Value>), String> {
         // `and`/`or` are short-circuit by language semantics: the right side
         // must not evaluate (it may index past a bound the left side guards)
@@ -1005,9 +1640,12 @@ impl<'a, 'b> Gen<'a, 'b> {
                 }
             }
             "==" | "!=" if lt == CType::Str && rt == CType::Str => {
-                let eq =
-                    self.call_import("lu_str_eq", &[lv[0], lv[1], rv[0], rv[1]])[0];
-                let v = if op == "!=" { self.b.ins().bxor_imm(eq, 1) } else { eq };
+                let eq = self.call_import("lu_str_eq", &[lv[0], lv[1], rv[0], rv[1]])[0];
+                let v = if op == "!=" {
+                    self.b.ins().bxor_imm(eq, 1)
+                } else {
+                    eq
+                };
                 Ok((CType::Bool, vec![v]))
             }
             "==" | "!=" | "<" | "<=" | ">" | ">=" => {
@@ -1060,11 +1698,21 @@ impl<'a, 'b> Gen<'a, 'b> {
     }
 
     fn checked_int_div(&mut self, lhs: Value, rhs: Value, remainder: bool) -> Value {
-        let name = if remainder { "lu_i64_rem" } else { "lu_i64_div" };
+        let name = if remainder {
+            "lu_i64_rem"
+        } else {
+            "lu_i64_div"
+        };
         self.call_import(name, &[lhs, rhs])[0]
     }
 
-    fn gen_sum(&mut self, var: String, lo: ExprId, hi: ExprId, body: ExprId) -> Result<(CType, Vec<Value>), String> {
+    fn gen_sum(
+        &mut self,
+        var: String,
+        lo: ExprId,
+        hi: ExprId,
+        body: ExprId,
+    ) -> Result<(CType, Vec<Value>), String> {
         let expected_body_ty = self.expr_types[body as usize]
             .clone()
             .expect("reachable sum body has a checked type");
@@ -1074,7 +1722,11 @@ impl<'a, 'b> Gen<'a, 'b> {
             let mut arrays = Vec::new();
             let mut ok = true;
             scan_trusted_expr(self.p, body, &var, &mut arrays, &mut ok);
-            if ok && !arrays.is_empty() { Some(arrays) } else { None }
+            if ok && !arrays.is_empty() {
+                Some(arrays)
+            } else {
+                None
+            }
         };
         let pushed = match expr_stmt_scan {
             Some(arrays) => self.hoist_checks(&arrays, &var, lov[0], hiv[0]),
@@ -1091,7 +1743,10 @@ impl<'a, 'b> Gen<'a, 'b> {
         let ivar = self.b.declare_var(types::I64);
         self.b.def_var(ivar, lov[0]);
         self.env.push(HashMap::new());
-        self.env.last_mut().unwrap().insert(var, (CType::I64, vec![ivar]));
+        self.env
+            .last_mut()
+            .unwrap()
+            .insert(var, (CType::I64, vec![ivar]));
 
         // `sum` is order-free by language contract: emit 4 independent
         // accumulators (the reassociation C++ needs -ffast-math to allow).
@@ -1200,7 +1855,12 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// Type of `e` if it is safe to speculate (pure, cannot trap or perform
     /// I/O), else None. Rejects: array indexing (bounds check can abort),
     /// integer `/`/`%` (trap on zero), `arr`/`print`, `sum`, loops.
-    fn spec_expr(&self, e: ExprId, locals: &mut Vec<HashMap<String, CType>>, depth: usize) -> Option<CType> {
+    fn spec_expr(
+        &self,
+        e: ExprId,
+        locals: &mut Vec<HashMap<String, CType>>,
+        depth: usize,
+    ) -> Option<CType> {
         match self.p.expr(e) {
             Expr::Int(_) => Some(CType::I64),
             Expr::Float(_) => Some(CType::F64),
@@ -1220,9 +1880,11 @@ impl<'a, 'b> Gen<'a, 'b> {
                     return self.spec_fn(f, depth);
                 }
                 match op.as_str() {
-                    "+" | "-" | "*" => {
-                        Some(if a == CType::F64 || b == CType::F64 { CType::F64 } else { CType::I64 })
-                    }
+                    "+" | "-" | "*" => Some(if a == CType::F64 || b == CType::F64 {
+                        CType::F64
+                    } else {
+                        CType::I64
+                    }),
                     "/" | "%" => {
                         if a == CType::F64 || b == CType::F64 {
                             Some(CType::F64)
@@ -1445,7 +2107,11 @@ impl<'a, 'b> Gen<'a, 'b> {
         } else {
             self.b.ins().select(use_alt, cosp, sinp)
         };
-        let qn = if is_cos { self.b.ins().iadd_imm(q, 1) } else { q };
+        let qn = if is_cos {
+            self.b.ins().iadd_imm(q, 1)
+        } else {
+            q
+        };
         let bit1 = self.b.ins().band_imm(qn, 2);
         let negate = self.b.ins().icmp_imm(IntCC::NotEqual, bit1, 0);
         let nval = self.b.ins().fneg(val);
@@ -1506,9 +2172,7 @@ impl<'a, 'b> Gen<'a, 'b> {
     fn vec_ok(&self, e: ExprId, var: &str) -> bool {
         match self.p.expr(e) {
             Expr::Float(_) => true,
-            Expr::Ident(n) => {
-                n != var && matches!(self.lookup(n), Some((CType::F64, _)))
-            }
+            Expr::Ident(n) => n != var && matches!(self.lookup(n), Some((CType::F64, _))),
             Expr::Index(a, i) => match (self.p.expr(*a), self.p.expr(*i)) {
                 (Expr::Ident(an), Expr::Ident(inm)) => {
                     inm == var
@@ -1534,12 +2198,17 @@ impl<'a, 'b> Gen<'a, 'b> {
                 if !self.soa {
                     return false;
                 }
-                let Expr::Index(a, i) = self.p.expr(*x) else { return false };
+                let Expr::Index(a, i) = self.p.expr(*x) else {
+                    return false;
+                };
                 let (Expr::Ident(an), Expr::Ident(inm)) = (self.p.expr(*a), self.p.expr(*i)) else {
                     return false;
                 };
                 inm == var
-                    && self.trusted_idx.iter().any(|(x2, y, _)| x2 == an && y == var)
+                    && self
+                        .trusted_idx
+                        .iter()
+                        .any(|(x2, y, _)| x2 == an && y == var)
                     && match self.lookup(an) {
                         Some((CType::Arr(e), _)) => match *e {
                             CType::Rec(ti) => {
@@ -1572,7 +2241,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let off = self.b.ins().imul(idx, sbytes);
                 let base8 = self.b.ins().iadd_imm(avals[0], 8);
                 let addr = self.b.ins().iadd(base8, off);
-                Ok(self.b.ins().load(types::F64X2, MemFlags::trusted(), addr, 0))
+                Ok(self
+                    .b
+                    .ins()
+                    .load(types::F64X2, MemFlags::trusted(), addr, 0))
             }
             Expr::Bin(op, l, r) => {
                 let a = self.gen_vec_expr(*l, var, idx)?;
@@ -1629,7 +2301,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let lane = self.b.ins().imul_imm(idx, 8);
                 let pb = self.b.ins().iadd(base8, plane);
                 let addr = self.b.ins().iadd(pb, lane);
-                Ok(self.b.ins().load(types::F64X2, MemFlags::trusted(), addr, 0))
+                Ok(self
+                    .b
+                    .ins()
+                    .load(types::F64X2, MemFlags::trusted(), addr, 0))
             }
             _ => Err("non-vectorizable expression".into()),
         }
@@ -1757,7 +2432,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                 .map(|c| self.b.declare_var(c))
                 .collect();
             let cont = self.b.create_block();
-            self.inline_frames.push(InlineFrame { result: result.clone(), cont });
+            self.inline_frames.push(InlineFrame {
+                result: result.clone(),
+                cont,
+            });
             self.inline_stack.push(fname.to_string());
             let (terminated, last) = self.gen_block(&decl.body)?;
             self.inline_stack.pop();
@@ -1999,7 +2677,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                     _ => return Err("`len` expects array".into()),
                 };
                 let stride = comps(self.p, &elem)?.len() as i64;
-                let n = self.b.ins().load(types::I64, MemFlags::trusted(), avals[0][0], 0);
+                let n = self
+                    .b
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), avals[0][0], 0);
                 let v = if stride == 1 {
                     n
                 } else {
