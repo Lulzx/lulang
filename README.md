@@ -170,6 +170,15 @@ executable conservation laws, native/WASI builds, an exported SoA integration
 kernel with a generated C header, and an optional raylib visualizer. Run
 `lu run` or `lu test --runs 1000` from that directory.
 
+### Autodiff: ludiff
+
+[`lib/ludiff`](lib/ludiff) implements forward-mode automatic differentiation
+as ordinary library code: a two-field `Dual` record, user-defined `⊕`, `⊖`,
+`⊗`, and `⊘` operators, elementary derivative rules, and nine executable laws
+including a finite-difference check. No compiler differentiation pass exists.
+The exported example returns a scalar derivative through the stable C ABI
+without exposing `Dual` record layout.
+
 ### Executable documentation and benchmarks
 
 `lu bench [--runs N] [file.lu]` measures whole-process interpreter, JIT, and

@@ -1,0 +1,6 @@
+main {
+  let result = polynomial(variable(2.0))
+  print("ludiff")
+  print("f(2):", primal(result))
+  print("df/dx:", tangent(result))
+}

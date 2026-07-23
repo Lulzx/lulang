@@ -26,7 +26,7 @@ fn docs_publish_signatures_properties_abi_ir_and_benchmarks() {
     .expect("write manifest");
     std::fs::write(
         source_directory.join("lib.lu"),
-        "/// Returns the square of a scalar.\nexport fn square(x: f64): f64 { return x * x }\n",
+        "type Boxed { value: f64 }\n/// Returns the square of a scalar.\nexport fn square(x: f64): f64 { return x * x }\n/// Adds the values stored in two boxes.\noperator+ (a: Boxed) ⊕ (b: Boxed): Boxed { return Boxed { value: a.value + b.value } }\n",
     )
     .expect("write library");
     let tests_directory = directory.join("tests");
@@ -95,6 +95,9 @@ fn docs_publish_signatures_properties_abi_ir_and_benchmarks() {
     assert!(function.contains("square_nonnegative"));
     assert!(function.contains("double square(double x);"));
     assert!(function.contains("Local benchmark history"));
+    let operator = std::fs::read_to_string(site.join("functions/operator_u2295.html"))
+        .expect("read operator page");
+    assert!(operator.contains("Adds the values stored in two boxes."));
     let observatory =
         std::fs::read_to_string(site.join("observatory.html")).expect("read observatory");
     assert!(observatory.contains("order-free sum; SoA"));

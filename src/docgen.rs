@@ -274,11 +274,17 @@ fn doc_comments(source: &str) -> BTreeMap<String, String> {
             .unwrap_or(trimmed)
             .strip_prefix("fn ")
             .or_else(|| trimmed.strip_prefix("property "));
+        let mut documented_name = None;
         if let Some(declaration) = declaration {
             if let Some(name) = declaration.split('(').next() {
-                if !docs.is_empty() {
-                    result.insert(name.trim().to_string(), docs.join(" "));
-                }
+                documented_name = Some(name.trim().to_string());
+            }
+        } else {
+            documented_name = operator_doc_name(trimmed);
+        }
+        if let Some(name) = documented_name {
+            if !docs.is_empty() {
+                result.insert(name, docs.join(" "));
             }
         }
         if !trimmed.is_empty() {
@@ -286,6 +292,32 @@ fn doc_comments(source: &str) -> BTreeMap<String, String> {
         }
     }
     result
+}
+
+fn operator_doc_name(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("operator")?;
+    let glyphs = if rest.starts_with(char::is_whitespace) {
+        let rest = rest.trim_start();
+        let open = rest.chars().next()?.to_string();
+        let close = rest
+            .split_once(')')?
+            .1
+            .trim_start()
+            .chars()
+            .next()?
+            .to_string();
+        vec![open, close]
+    } else {
+        let after_first_parameter = rest.split_once(')')?.1.trim_start();
+        vec![after_first_parameter.split_whitespace().next()?.to_string()]
+    };
+    let mut name = String::from("operator");
+    for glyph in glyphs {
+        for scalar in glyph.chars() {
+            let _ = write!(name, "_u{:x}", scalar as u32);
+        }
+    }
+    Some(name)
 }
 
 fn c_signatures(header: &str) -> BTreeMap<String, String> {

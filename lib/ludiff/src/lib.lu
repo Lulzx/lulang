@@ -1,0 +1,107 @@
+// ludiff — forward-mode automatic differentiation as ordinary library code.
+
+type Dual {
+  value: f64,
+  derivative: f64,
+}
+
+/// Constructs a dual number with an explicit primal value and tangent.
+fn dual(value: f64, derivative: f64): Dual {
+  return Dual { value: value, derivative: derivative }
+}
+
+/// Seeds an independent scalar variable with derivative one.
+fn variable(value: f64): Dual {
+  return dual(value, 1.0)
+}
+
+/// Lifts a constant scalar into the dual algebra.
+fn constant(value: f64): Dual {
+  return dual(value, 0.0)
+}
+
+/// Extracts the primal value.
+fn primal(value: Dual): f64 {
+  return value.value
+}
+
+/// Extracts the forward derivative.
+fn tangent(value: Dual): f64 {
+  return value.derivative
+}
+
+/// Adds dual values and their tangents.
+operator+ (a: Dual) ⊕ (b: Dual): Dual {
+  return dual(a.value + b.value, a.derivative + b.derivative)
+}
+
+/// Subtracts dual values and their tangents.
+operator- (a: Dual) ⊖ (b: Dual): Dual {
+  return dual(a.value - b.value, a.derivative - b.derivative)
+}
+
+/// Applies the product rule.
+operator* (a: Dual) ⊗ (b: Dual): Dual {
+  return dual(
+    a.value * b.value,
+    a.derivative * b.value + a.value * b.derivative,
+  )
+}
+
+/// Applies the quotient rule.
+operator/ (a: Dual) ⊘ (b: Dual): Dual {
+  return dual(
+    a.value / b.value,
+    (a.derivative * b.value - a.value * b.derivative) / (b.value * b.value),
+  )
+}
+
+/// Negates a dual value.
+fn dual_neg(value: Dual): Dual {
+  return dual(-value.value, -value.derivative)
+}
+
+/// Multiplies a dual value by a scalar constant.
+fn dual_scale(value: Dual, scale: f64): Dual {
+  return dual(value.value * scale, value.derivative * scale)
+}
+
+/// Differentiates the sine function.
+fn dual_sin(value: Dual): Dual {
+  return dual(sin(value.value), cos(value.value) * value.derivative)
+}
+
+/// Differentiates the cosine function.
+fn dual_cos(value: Dual): Dual {
+  return dual(cos(value.value), -sin(value.value) * value.derivative)
+}
+
+/// Differentiates the principal square root on positive inputs.
+fn dual_sqrt(value: Dual): Dual {
+  let root = sqrt(value.value)
+  return dual(root, value.derivative / (2.0 * root))
+}
+
+/// Raises a positive dual value to a constant real exponent.
+fn dual_pow(value: Dual, exponent: f64): Dual {
+  return dual(
+    pow(value.value, exponent),
+    exponent * pow(value.value, exponent - 1.0) * value.derivative,
+  )
+}
+
+/// A small composite function used by the example and finite-difference law.
+fn polynomial(value: Dual): Dual {
+  let square = value ⊗ value
+  return dual_sin(square) ⊕ (square ⊗ value)
+}
+
+/// Evaluates the scalar twin of `polynomial`.
+fn polynomial_scalar(value: f64): f64 {
+  return sin(value * value) + value * value * value
+}
+
+/// Exports a scalar derivative without exposing the compiler-owned Dual layout.
+export fn polynomial_derivative(value: f64): f64 {
+  return tangent(polynomial(variable(value)))
+}

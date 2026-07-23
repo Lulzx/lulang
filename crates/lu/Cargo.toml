@@ -55,6 +55,10 @@ path = "../../tests/luphysics.rs"
 name = "docs"
 path = "../../tests/docs.rs"
 
+[[test]]
+name = "ludiff"
+path = "../../tests/ludiff.rs"
+
 [dependencies]
 lu_syntax.workspace = true
 lu_ir.workspace = true

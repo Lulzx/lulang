@@ -1,0 +1,61 @@
+property constant_rule(seed: i64) {
+  let value = constant(float(seed % 1000) * 0.01)
+  return tangent(value) == 0.0
+}
+
+property variable_seed_rule(seed: i64) {
+  let value = variable(float(seed % 1000) * 0.01)
+  return tangent(value) == 1.0
+}
+
+property sum_rule(seed: i64) {
+  let x = float(seed % 1000) * 0.01
+  let left = dual(x, 2.0)
+  let right = dual(x * x, -3.0)
+  let result = left ⊕ right
+  return tangent(result) ~= -1.0
+}
+
+property product_rule(seed: i64) {
+  let x = float(seed % 1000) * 0.01
+  let left = dual(x, 2.0)
+  let right = dual(x * x + 1.0, -3.0)
+  let result = left ⊗ right
+  let expected = 2.0 * right.value + left.value * -3.0
+  return tangent(result) ~= expected
+}
+
+property quotient_rule(seed: i64) {
+  let x = float(seed % 1000) * 0.01
+  let numerator = dual(x * x + 2.0, 1.5)
+  let denominator = dual(abs(x) + 1.0, -0.25)
+  let result = numerator ⊘ denominator
+  let expected = (numerator.derivative * denominator.value - numerator.value * denominator.derivative) / (denominator.value * denominator.value)
+  return tangent(result) ~= expected
+}
+
+property sine_chain_rule(seed: i64) {
+  let x = float(seed % 1000) * 0.001
+  let input = variable(x)
+  let result = dual_sin(input ⊗ input)
+  return abs(tangent(result) - 2.0 * x * cos(x * x)) < 0.000001
+}
+
+property square_root_rule(seed: i64) {
+  let x = abs(float(seed % 1000) * 0.01) + 0.25
+  let result = dual_sqrt(dual(x, 0.5))
+  return abs(tangent(result) - 0.5 / (2.0 * sqrt(x))) < 0.000001
+}
+
+property power_rule(seed: i64) {
+  let x = abs(float(seed % 1000) * 0.001) + 0.25
+  let result = dual_pow(variable(x), 3.5)
+  return abs(tangent(result) - 3.5 * pow(x, 2.5)) < 0.000001
+}
+
+property agrees_with_central_difference(seed: i64) {
+  let x = float(seed % 1000) * 0.001
+  let epsilon = 0.00001
+  let finite = (polynomial_scalar(x + epsilon) - polynomial_scalar(x - epsilon)) / (2.0 * epsilon)
+  return abs(polynomial_derivative(x) - finite) < 0.00001
+}

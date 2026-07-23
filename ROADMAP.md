@@ -38,7 +38,7 @@ than exposing internals.
 | 9 | Git-based package manager (`lu.toml`) — **foundation shipped** | High once libraries exist | Medium |
 | 10 | Flagship demo (`luphysics`) — **shipped** | High visibility | Medium |
 | 11 | `lu doc` + benchmark observatory — **shipped** | High credibility | Medium |
-| 12 | Autodiff (`ludiff`, forward-mode duals first) | High technical value | High |
+| 12 | Autodiff (`ludiff`, forward-mode duals first) — **shipped** | High technical value | High |
 
 ### 1–2. C ABI: `extern` + `export` (milestone M8)
 
@@ -229,7 +229,16 @@ source-linked artifact.
 
 Forward-mode automatic differentiation as *library code* — dual numbers as
 records with user-defined operators, no compiler support needed. Reverse mode
-later. AD fits the language beautifully but is high-effort; it waits.
+later. AD fits the language beautifully without widening the compiler.
+
+`lib/ludiff` now provides ordinary compiler-owned `Dual` records, seeded
+variables and constants, user-defined sum/difference/product/quotient
+operators, sine, cosine, square-root and constant-power rules, a composed
+example, and a scalar C export that keeps record layout behind the boundary.
+Nine executable laws cover algebraic rules, the chain rule, and agreement with
+a central finite difference. Integration tests run the same library through
+the reference interpreter, JIT, LLVM AOT, self-hosted interpreter, WASI
+production, and a real C caller. Reverse mode remains deliberately later work.
 
 ## Explicit non-goals (for now)
 
