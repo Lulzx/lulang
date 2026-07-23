@@ -35,6 +35,10 @@ path = "../../tests/lsp.rs"
 name = "numerics"
 path = "../../tests/numerics.rs"
 
+[[test]]
+name = "bindgen"
+path = "../../tests/bindgen.rs"
+
 [dependencies]
 lu_syntax.workspace = true
 lu_ir.workspace = true

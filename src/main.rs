@@ -4,12 +4,15 @@ use lu_llvm::llvm;
 use lu_syntax::{fmt, lexer, parser};
 use lu_test::{interp, runtime as test_runtime};
 
+mod bindgen;
+
 use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
         "usage: lu <run|build|check|interp> <file.lu> [program args...]\n\
          \x20      lu build --lib [--shared] [-o name] <file.lu>\n\
+         \x20      lu bindgen [--lib name] [-o file.lu] <header.h>\n\
          \x20      lu test [--runs N] <file.lu>\n\
          \x20      lu fmt [--check] <file.lu>"
     );
@@ -28,6 +31,7 @@ fn main() -> ExitCode {
     let mut build_library = false;
     let mut build_shared = false;
     let mut output_name = None;
+    let mut bindgen_library = None;
     let mut positionals = Vec::new();
     let mut i = if args.len() == 2 { 1 } else { 2 };
     while i < args.len() {
@@ -53,11 +57,19 @@ fn main() -> ExitCode {
                 build_library = true;
                 i += 1;
             }
+            "--lib" if mode == "bindgen" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("error: --lib needs a value");
+                    return ExitCode::FAILURE;
+                };
+                bindgen_library = Some(value.clone());
+                i += 2;
+            }
             "--shared" if mode == "build" => {
                 build_shared = true;
                 i += 1;
             }
-            "-o" if mode == "build" => {
+            "-o" if matches!(mode, "build" | "bindgen") => {
                 let Some(value) = args.get(i + 1) else {
                     eprintln!("error: -o needs a value");
                     return ExitCode::FAILURE;
@@ -65,7 +77,7 @@ fn main() -> ExitCode {
                 output_name = Some(value.clone());
                 i += 2;
             }
-            arg if arg.starts_with('-') && matches!(mode, "test" | "fmt" | "build") => {
+            arg if arg.starts_with('-') && matches!(mode, "test" | "fmt" | "build" | "bindgen") => {
                 eprintln!("error: unknown option `{}`", arg);
                 return ExitCode::FAILURE;
             }
@@ -78,6 +90,12 @@ fn main() -> ExitCode {
     let Some(path) = positionals.first() else {
         return usage();
     };
+    if mode == "bindgen" {
+        if positionals.len() != 1 {
+            return usage();
+        }
+        return run_bindgen(path, output_name.as_deref(), bindgen_library.as_deref());
+    }
     if !matches!(mode, "test" | "fmt") && positionals.len() > 1 {
         let program_args = positionals[1..].to_vec();
         jit_runtime::set_args(program_args.clone());
@@ -149,6 +167,59 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_bindgen(path: &str, output: Option<&str>, library: Option<&str>) -> ExitCode {
+    let header = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("error: cannot read {}: {}", path, error);
+            return ExitCode::FAILURE;
+        }
+    };
+    let input = std::path::Path::new(path);
+    let inferred_library = input
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("c")
+        .strip_prefix("lib")
+        .unwrap_or_else(|| {
+            input
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("c")
+        });
+    let library = library.unwrap_or(inferred_library);
+    let generated = match bindgen::generate(&header, input, library) {
+        Ok(generated) => generated,
+        Err(error) => {
+            eprintln!("error: cannot parse {}: {}", path, error);
+            return ExitCode::FAILURE;
+        }
+    };
+    let default_output = input.with_extension("lu");
+    let output = output
+        .map(std::path::PathBuf::from)
+        .unwrap_or(default_output);
+    if output.as_os_str() == "-" {
+        print!("{}", generated.source);
+    } else if let Err(error) = std::fs::write(&output, &generated.source) {
+        eprintln!("error: cannot write {}: {}", output.display(), error);
+        return ExitCode::FAILURE;
+    }
+    for warning in &generated.warnings {
+        eprintln!("warning: {}", warning);
+    }
+    eprintln!(
+        "generated {} C import(s) in {}",
+        generated.imported_functions,
+        if output.as_os_str() == "-" {
+            "stdout".into()
+        } else {
+            output.display().to_string()
+        }
+    );
+    ExitCode::SUCCESS
 }
 
 fn run_pipeline(
