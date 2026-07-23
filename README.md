@@ -301,6 +301,16 @@ including a finite-difference check. No compiler differentiation pass exists.
 The exported example returns a scalar derivative through the stable C ABI
 without exposing `Dual` record layout.
 
+### Telegram Bot API: lutelegram
+
+[`lib/lutelegram`](lib/lutelegram) is a document-generated Telegram Bot API
+client. Its reproducible pipeline parses the official Bot API page into a
+checked-in JSON schema, then generates all LuLang object wrappers, union
+specifications, field accessors, method parameter records, typed responses,
+and documentation comments. The current Bot API 10.2 snapshot covers 362
+types, 26 unions, and 185 methods. A small libcurl bridge supplies HTTPS while
+the request encoding and response navigation remain LuLang code.
+
 ### Executable documentation and benchmarks
 
 `lu bench [--runs N] [file.lu]` measures whole-process interpreter, JIT, and

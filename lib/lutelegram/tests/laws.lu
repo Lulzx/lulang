@@ -1,0 +1,21 @@
+property json_i64_roundtrip(value: i64) {
+  json_i64(json_from_i64(value)) == value
+}
+
+property json_object_navigation() {
+  json_get("{\"outer\":{\"name\":\"Ada\",\"items\":[1,2,3]},\"ok\":true}", "ok") == "true" and json_get(json_get("{\"outer\":{\"name\":\"Ada\",\"items\":[1,2,3]}}", "outer"), "name") == "\"Ada\""
+}
+
+property generated_user_accessors() {
+  let user = User { json: "{\"id\":42,\"is_bot\":true,\"first_name\":\"Lu\"}" }
+  return user_get_id(user) == 42 and user_get_is_bot(user) and user_get_first_name(user) == "Lu" and not user_has_username(user)
+}
+
+property generated_send_message_parameters() {
+  let params = SendMessageParams {
+    chat_id: "-100123",
+    text: "hello \"Lu\"",
+    optional: "{\"disable_notification\":true}",
+  }
+  return send_message_params_json(params) == "{\"chat_id\":-100123,\"text\":\"hello \\\"Lu\\\"\",\"disable_notification\":true}"
+}

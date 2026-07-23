@@ -1,0 +1,256 @@
+// Handwritten JSON and transport layer used by the generated Bot API surface.
+
+extern "lutelegram_runtime" fn lutelegram_request(token: str, request: str): str
+
+fn json_space(byte: i64): bool {
+  return byte == 32 or byte == 9 or byte == 10 or byte == 13
+}
+
+fn json_skip(source: str, start: i64): i64 {
+  var i = start
+  while i < len(source) and json_space(source[i]) { i = i + 1 }
+  return i
+}
+
+fn json_string_end(source: str, start: i64): i64 {
+  var i = start + 1
+  var escaped = false
+  while i < len(source) {
+    let byte = source[i]
+    if escaped {
+      escaped = false
+    } else {
+      if byte == 92 {
+        escaped = true
+      } else {
+        if byte == 34 { return i + 1 }
+      }
+    }
+    i = i + 1
+  }
+  return len(source)
+}
+
+fn json_value_end(source: str, start: i64): i64 {
+  let first = json_skip(source, start)
+  if first >= len(source) { return first }
+  if source[first] == 34 { return json_string_end(source, first) }
+  if source[first] == 123 or source[first] == 91 {
+    var depth = 0
+    var i = first
+    while i < len(source) {
+      if source[i] == 34 {
+        i = json_string_end(source, i)
+      } else {
+        if source[i] == 123 or source[i] == 91 { depth = depth + 1 }
+        if source[i] == 125 or source[i] == 93 {
+          depth = depth - 1
+          if depth == 0 { return i + 1 }
+        }
+        i = i + 1
+      }
+    }
+    return len(source)
+  }
+  var i = first
+  while i < len(source) and source[i] != 44 and source[i] != 125 and source[i] != 93 {
+    i = i + 1
+  }
+  while i > first and json_space(source[i - 1]) { i = i - 1 }
+  return i
+}
+
+fn json_has(source: str, wanted: str): bool {
+  return len(json_get(source, wanted)) > 0
+}
+
+fn json_get(source: str, wanted: str): str {
+  var i = json_skip(source, 0)
+  if i >= len(source) or source[i] != 123 { return "" }
+  i = i + 1
+  while i < len(source) {
+    i = json_skip(source, i)
+    if i >= len(source) or source[i] == 125 { return "" }
+    if source[i] != 34 { return "" }
+    let key_end = json_string_end(source, i)
+    let key = json_string(substr(source, i, key_end))
+    i = json_skip(source, key_end)
+    if i >= len(source) or source[i] != 58 { return "" }
+    let value_start = json_skip(source, i + 1)
+    let value_end = json_value_end(source, value_start)
+    if key == wanted { return substr(source, value_start, value_end) }
+    i = json_skip(source, value_end)
+    if i < len(source) and source[i] == 44 { i = i + 1 }
+  }
+  return ""
+}
+
+fn json_hex(byte: i64): i64 {
+  if byte >= 48 and byte <= 57 { return byte - 48 }
+  if byte >= 65 and byte <= 70 { return byte - 55 }
+  if byte >= 97 and byte <= 102 { return byte - 87 }
+  return 0
+}
+
+fn json_utf8(code: i64): str {
+  if code < 128 { return chr(code) }
+  if code < 2048 {
+    return concat(chr(192 + code / 64), chr(128 + code % 64))
+  }
+  return concat(concat(chr(224 + code / 4096), chr(128 + code / 64 % 64)), chr(128 + code % 64))
+}
+
+fn json_string(source: str): str {
+  if len(source) < 2 or source[0] != 34 { return "" }
+  var out = ""
+  var i = 1
+  while i < len(source) - 1 {
+    if source[i] != 92 {
+      out = concat(out, chr(source[i]))
+      i = i + 1
+    } else {
+      i = i + 1
+      if i >= len(source) - 1 { return out }
+      let escaped = source[i]
+      if escaped == 110 { out = concat(out, chr(10)) } else {
+        if escaped == 114 { out = concat(out, chr(13)) } else {
+          if escaped == 116 { out = concat(out, chr(9)) } else {
+            if escaped == 98 { out = concat(out, chr(8)) } else {
+              if escaped == 102 { out = concat(out, chr(12)) } else {
+                if escaped == 117 and i + 4 < len(source) {
+                  let code = json_hex(source[i + 1]) * 4096 + json_hex(source[i + 2]) * 256 + json_hex(source[i + 3]) * 16 + json_hex(source[i + 4])
+                  out = concat(out, json_utf8(code))
+                  i = i + 4
+                } else {
+                  out = concat(out, chr(escaped))
+                }
+              }
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return out
+}
+
+fn json_i64(source: str): i64 {
+  var i = json_skip(source, 0)
+  var sign = 1
+  if i < len(source) and source[i] == 45 {
+    sign = -1
+    i = i + 1
+  }
+  var value = 0
+  while i < len(source) and source[i] >= 48 and source[i] <= 57 {
+    value = value * 10 + source[i] - 48
+    i = i + 1
+  }
+  return value * sign
+}
+
+fn json_f64(source: str): f64 {
+  var i = json_skip(source, 0)
+  var sign = 1.0
+  if i < len(source) and source[i] == 45 {
+    sign = -1.0
+    i = i + 1
+  }
+  var value = 0.0
+  while i < len(source) and source[i] >= 48 and source[i] <= 57 {
+    value = value * 10.0 + float(source[i] - 48)
+    i = i + 1
+  }
+  if i < len(source) and source[i] == 46 {
+    i = i + 1
+    var place = 0.1
+    while i < len(source) and source[i] >= 48 and source[i] <= 57 {
+      value = value + float(source[i] - 48) * place
+      place = place / 10.0
+      i = i + 1
+    }
+  }
+  var exponent = 0
+  var exponent_sign = 1
+  if i < len(source) and (source[i] == 101 or source[i] == 69) {
+    i = i + 1
+    if i < len(source) and source[i] == 45 {
+      exponent_sign = -1
+      i = i + 1
+    } else {
+      if i < len(source) and source[i] == 43 { i = i + 1 }
+    }
+    while i < len(source) and source[i] >= 48 and source[i] <= 57 {
+      exponent = exponent * 10 + source[i] - 48
+      i = i + 1
+    }
+  }
+  var scale = 1.0
+  var e = 0
+  while e < exponent {
+    scale = scale * 10.0
+    e = e + 1
+  }
+  if exponent_sign < 0 { scale = 1.0 / scale }
+  return value * sign * scale
+}
+
+fn json_bool(source: str): bool {
+  return source == "true"
+}
+
+fn json_from_bool(value: bool): str {
+  if value { return "true" }
+  return "false"
+}
+
+fn json_from_i64(value: i64): str {
+  if value == 0 { return "0" }
+  var negative = value < 0
+  var remaining = value
+  if not negative { remaining = -remaining }
+  var out = ""
+  while remaining < 0 {
+    let digit = -(remaining % 10)
+    out = concat(chr(48 + digit), out)
+    remaining = remaining / 10
+  }
+  if negative { out = concat("-", out) }
+  return out
+}
+
+fn json_from_f64(value: f64): str {
+  // Telegram's floating-point inputs are conventionally decimal. Six fractional
+  // digits is sufficient for coordinates and prices; callers can use a raw JSON
+  // parameter for APIs that need a different representation.
+  let whole = int(value)
+  var fraction = int(abs(value - float(whole)) * 1000000.0)
+  var tail = json_from_i64(fraction)
+  while len(tail) < 6 { tail = concat("0", tail) }
+  while len(tail) > 1 and tail[len(tail) - 1] == 48 { tail = substr(tail, 0, len(tail) - 1) }
+  return concat(concat(json_from_i64(whole), "."), tail)
+}
+
+fn json_quote(value: str): str {
+  var out = "\""
+  var i = 0
+  while i < len(value) {
+    let byte = value[i]
+    if byte == 34 { out = concat(out, "\\\"") } else {
+      if byte == 92 { out = concat(out, "\\\\") } else {
+        if byte == 10 { out = concat(out, "\\n") } else {
+          if byte == 13 { out = concat(out, "\\r") } else {
+            if byte == 9 { out = concat(out, "\\t") } else { out = concat(out, chr(byte)) }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  return concat(out, "\"")
+}
+
+fn json_request(method: str, params: str): str {
+  return concat(concat(concat("{\"method\":", json_quote(method)), ",\"params\":"), concat(params, "}"))
+}
