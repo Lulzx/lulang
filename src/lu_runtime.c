@@ -222,6 +222,7 @@ const char *lu_concat(const char *ap, long long al, const char *bp, long long bl
 
 /* Compiled programs enter through lu_entry; main runs it on a 512 MiB stack
    so deep recursion (e.g. self-hosted interpreter towers) doesn't overflow. */
+#ifndef LU_LIB
 extern int lu_entry(void);
 
 static void *entry_thunk(void *unused) {
@@ -244,3 +245,4 @@ int main(int argc, char **argv) {
   fflush(stdout);
   return (int)(long)ret;
 }
+#endif

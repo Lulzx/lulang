@@ -947,7 +947,9 @@ fn check_block(p: P, inout c: C, s0: i64, ret: i64): i64 {
 fn check_fn(p: P, inout c: C, f: i64) {
   c.nsym = 0
   for i in 0..p.fnp[f] {
-    define(c, p.pname[p.fpo[f] + i], p.ptype[p.fpo[f] + i], p.pmut[p.fpo[f] + i])
+    var mutable = p.pmut[p.fpo[f] + i]
+    if p.fexported[f] == 1 and p.ptype[p.fpo[f] + i] >= 8 { mutable = 1 }
+    define(c, p.pname[p.fpo[f] + i], p.ptype[p.fpo[f] + i], mutable)
   }
   let ret = p.fret[f]
   let last = check_block(p, c, p.fbody[f], ret)

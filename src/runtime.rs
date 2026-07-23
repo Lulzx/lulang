@@ -231,7 +231,11 @@ fn checked_int_div(lhs: i64, rhs: i64, remainder: bool) -> i64 {
         eprintln!("error: integer division overflow: {} / {}", lhs, rhs);
         std::process::exit(1);
     }
-    if remainder { lhs % rhs } else { lhs / rhs }
+    if remainder {
+        lhs % rhs
+    } else {
+        lhs / rhs
+    }
 }
 
 pub extern "C" fn lu_i64_div(lhs: i64, rhs: i64) -> i64 {

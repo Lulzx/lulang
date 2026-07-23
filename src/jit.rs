@@ -1543,7 +1543,11 @@ impl<'a, 'b> Gen<'a, 'b> {
         let params = info.params.clone();
         let mut flat = Vec::new();
         for ((got, vals), want) in args.into_iter().zip(&params) {
-            flat.extend(self.coerce(want, &got, vals)?);
+            let mut values = self.coerce(want, &got, vals)?;
+            if decl.exported && matches!(want, CType::Arr(_)) {
+                values[0] = self.call_import("lu_arr_clone", &[values[0]])[0];
+            }
+            flat.extend(values);
         }
         let mut slots = Vec::new();
         for (i, (&io, ty)) in decl.inouts.iter().zip(&params).enumerate() {
@@ -1587,10 +1591,10 @@ impl<'a, 'b> Gen<'a, 'b> {
             match want {
                 CType::Arr(element) => {
                     let handle = values[0];
-                    let slots =
-                        self.b
-                            .ins()
-                            .load(types::I64, MemFlags::trusted(), handle, 0);
+                    let slots = self
+                        .b
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), handle, 0);
                     let stride = comps(self.p, element)?.len() as i64;
                     let length = if stride == 1 {
                         slots

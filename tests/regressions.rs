@@ -57,7 +57,10 @@ fn duplicate_record_fields_are_rejected_by_the_checker() {
     let source = "type P { x: i64, y: i64 }\nmain {\n let p = P { x: 1, x: 2 }\n print(p.y)\n}\n";
     for mode in ["interp", "run"] {
         let output = run(mode, source);
-        assert!(!output.status.success(), "{mode} accepted an invalid record");
+        assert!(
+            !output.status.success(),
+            "{mode} accepted an invalid record"
+        );
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("initialized more than once"),
             "unexpected {mode} error: {}",

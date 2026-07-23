@@ -134,15 +134,15 @@ type F64Call = unsafe extern "C" fn(
 pub unsafe fn call_i64(pointer: usize, ints: [i64; 6], floats: [f64; 8]) -> i64 {
     let function: I64Call = std::mem::transmute(pointer);
     function(
-        ints[0], ints[1], ints[2], ints[3], ints[4], ints[5], floats[0], floats[1],
-        floats[2], floats[3], floats[4], floats[5], floats[6], floats[7],
+        ints[0], ints[1], ints[2], ints[3], ints[4], ints[5], floats[0], floats[1], floats[2],
+        floats[3], floats[4], floats[5], floats[6], floats[7],
     )
 }
 
 pub unsafe fn call_f64(pointer: usize, ints: [i64; 6], floats: [f64; 8]) -> f64 {
     let function: F64Call = std::mem::transmute(pointer);
     function(
-        ints[0], ints[1], ints[2], ints[3], ints[4], ints[5], floats[0], floats[1],
-        floats[2], floats[3], floats[4], floats[5], floats[6], floats[7],
+        ints[0], ints[1], ints[2], ints[3], ints[4], ints[5], floats[0], floats[1], floats[2],
+        floats[3], floats[4], floats[5], floats[6], floats[7],
     )
 }

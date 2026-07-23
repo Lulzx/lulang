@@ -130,13 +130,22 @@ impl<'a> Checker<'a> {
         };
         for e in &p.externs {
             if e.name.starts_with("lu_") {
-                return Err(format!("extern name `{}` uses reserved `lu_` prefix", e.name));
+                return Err(format!(
+                    "extern name `{}` uses reserved `lu_` prefix",
+                    e.name
+                ));
             }
             if is_builtin(&e.name) || p.fns.iter().any(|f| f.name == e.name) {
-                return Err(format!("extern name `{}` collides with an existing function", e.name));
+                return Err(format!(
+                    "extern name `{}` collides with an existing function",
+                    e.name
+                ));
             }
             if e.inouts.iter().any(|&inout| inout) {
-                return Err(format!("extern `{}` cannot have `inout` parameters", e.name));
+                return Err(format!(
+                    "extern `{}` cannot have `inout` parameters",
+                    e.name
+                ));
             }
             let params = e
                 .params
@@ -145,8 +154,7 @@ impl<'a> Checker<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             let ret = c.resolve(&e.ret)?;
             c.validate_ffi_signature(&e.name, &params, &ret)?;
-            if c
-                .sigs
+            if c.sigs
                 .insert(e.name.clone(), (params, e.inouts.clone(), ret))
                 .is_some()
             {
@@ -160,12 +168,14 @@ impl<'a> Checker<'a> {
             let ret = c.resolve(&f.ret)?;
             if f.exported {
                 if f.has_inout() {
-                    return Err(format!("export `{}` cannot have `inout` parameters", f.name));
+                    return Err(format!(
+                        "export `{}` cannot have `inout` parameters",
+                        f.name
+                    ));
                 }
                 c.validate_ffi_signature(&f.name, &params, &ret)?;
             }
-            if c
-                .sigs
+            if c.sigs
                 .insert(f.name.clone(), (params, f.inouts.clone(), ret))
                 .is_some()
             {
@@ -174,7 +184,10 @@ impl<'a> Checker<'a> {
         }
         for prop in &p.props {
             if prop.has_inout() {
-                return Err(format!("property `{}` cannot take `inout` parameters", prop.name));
+                return Err(format!(
+                    "property `{}` cannot take `inout` parameters",
+                    prop.name
+                ));
             }
         }
         for f in &p.fns {
@@ -183,7 +196,11 @@ impl<'a> Checker<'a> {
         for prop in &p.props {
             let ret = c.check_fn_body(prop, &Type::Bool)?;
             if ret != Type::Bool {
-                return Err(format!("property `{}` body must be bool, got {}", prop.name, c.name(&ret)));
+                return Err(format!(
+                    "property `{}` body must be bool, got {}",
+                    prop.name,
+                    c.name(&ret)
+                ));
             }
         }
         if let Some(main) = &p.main {
@@ -227,17 +244,21 @@ impl<'a> Checker<'a> {
                 Type::I64 | Type::Bool | Type::Enum(_) => Ok((1, 0)),
                 Type::F64 => Ok((0, 1)),
                 Type::Str => Ok((2, 0)),
-                Type::Arr(element)
-                    if matches!(element.as_ref(), Type::I64 | Type::F64) =>
-                {
+                Type::Arr(element) if matches!(element.as_ref(), Type::I64 | Type::F64) => {
                     Ok((2, 0))
                 }
-                _ => Err("allowed boundary types are i64, f64, bool, enums, str, [i64], and [f64]".into()),
+                _ => Err(
+                    "allowed boundary types are i64, f64, bool, enums, str, [i64], and [f64]"
+                        .into(),
+                ),
             }
         }
         for param in params {
             param_classes(param).map_err(|why| {
-                format!("FFI signature `{}` has unsupported parameter: {}", name, why)
+                format!(
+                    "FFI signature `{}` has unsupported parameter: {}",
+                    name, why
+                )
             })?;
         }
         if !matches!(
@@ -300,14 +321,21 @@ impl<'a> Checker<'a> {
     fn check_fn_body(&self, f: &FnDecl, ret: &Type) -> Result<Type, String> {
         let mut scope = HashMap::new();
         for (i, (n, t)) in f.params.iter().enumerate() {
-            let mutable = f.inouts.get(i).copied().unwrap_or(false);
-            scope.insert(n.clone(), (self.resolve(t)?, mutable));
+            let ty = self.resolve(t)?;
+            let mutable = f.inouts.get(i).copied().unwrap_or(false)
+                || (f.exported && matches!(&ty, Type::Arr(_)));
+            scope.insert(n.clone(), (ty, mutable));
         }
         let mut scopes = vec![scope];
         self.check_block(&f.body, &mut scopes, ret)
     }
 
-    fn check_block(&self, stmts: &[StmtId], scopes: &mut Vec<Scope>, ret: &Type) -> Result<Type, String> {
+    fn check_block(
+        &self,
+        stmts: &[StmtId],
+        scopes: &mut Vec<Scope>,
+        ret: &Type,
+    ) -> Result<Type, String> {
         scopes.push(HashMap::new());
         let mut last = Type::Unit;
         for &sid in stmts {
@@ -336,10 +364,14 @@ impl<'a> Checker<'a> {
                 let vt = self.check_expr(*e, scopes)?;
                 match self.p.expr(*target) {
                     Expr::Ident(n) => {
-                        let (t, mutable) =
-                            self.lookup(scopes, n).ok_or(format!("unknown variable `{}`", n))?;
+                        let (t, mutable) = self
+                            .lookup(scopes, n)
+                            .ok_or(format!("unknown variable `{}`", n))?;
                         if !mutable {
-                            return Err(format!("cannot assign to immutable binding `{}` (use `var`)", n));
+                            return Err(format!(
+                                "cannot assign to immutable binding `{}` (use `var`)",
+                                n
+                            ));
                         }
                         if !Self::compat(&t, &vt) {
                             return Err(format!(
@@ -367,23 +399,25 @@ impl<'a> Checker<'a> {
                             t => return Err(format!("cannot index into {}", self.name(&t))),
                         }
                         let mut current = *a;
-                        let root = loop {
-                            match self.p.expr(current) {
-                                Expr::Ident(name) => break name,
-                                Expr::Field(base, _) => current = *base,
-                                _ => {
-                                    return Err(
+                        let root =
+                            loop {
+                                match self.p.expr(current) {
+                                    Expr::Ident(name) => break name,
+                                    Expr::Field(base, _) => current = *base,
+                                    _ => return Err(
                                         "indexed assignment root must be a variable or its field"
                                             .into(),
-                                    )
+                                    ),
                                 }
-                            }
-                        };
+                            };
                         let (_, mutable) = self
                             .lookup(scopes, root)
                             .ok_or(format!("unknown variable `{}`", root))?;
                         if !mutable {
-                            return Err(format!("cannot write through immutable binding `{}`", root));
+                            return Err(format!(
+                                "cannot write through immutable binding `{}`",
+                                root
+                            ));
                         }
                     }
                     Expr::Field(_, _) => {
@@ -405,7 +439,10 @@ impl<'a> Checker<'a> {
                             .lookup(scopes, &root)
                             .ok_or(format!("unknown variable `{}`", root))?;
                         if !mutable {
-                            return Err(format!("cannot assign through immutable binding `{}`", root));
+                            return Err(format!(
+                                "cannot assign through immutable binding `{}`",
+                                root
+                            ));
                         }
                         for f in &path {
                             t = match t {
@@ -462,7 +499,10 @@ impl<'a> Checker<'a> {
                     return Err("`for` bounds must be i64".into());
                 }
                 scopes.push(HashMap::new());
-                scopes.last_mut().unwrap().insert(v.clone(), (Type::I64, false));
+                scopes
+                    .last_mut()
+                    .unwrap()
+                    .insert(v.clone(), (Type::I64, false));
                 self.check_block(body, scopes, ret)?;
                 scopes.pop();
                 Ok(Type::Unit)
@@ -511,7 +551,8 @@ impl<'a> Checker<'a> {
                 let lt = self.check_expr(*l, scopes)?;
                 let rt = self.check_expr(*r, scopes)?;
                 if let Some(fname) = self.p.infix_ops.get(op) {
-                    let (params, _, ret) = self.sigs.get(fname).ok_or(format!("unknown op `{}`", op))?;
+                    let (params, _, ret) =
+                        self.sigs.get(fname).ok_or(format!("unknown op `{}`", op))?;
                     if !Self::compat(&params[0], &lt) || !Self::compat(&params[1], &rt) {
                         return Err(format!(
                             "operator `{}` expects ({}, {}), got ({}, {})",
@@ -555,14 +596,22 @@ impl<'a> Checker<'a> {
                         if lt == rt || (self.numeric(&lt) && self.numeric(&rt)) {
                             Ok(Type::Bool)
                         } else {
-                            Err(format!("cannot compare {} with {}", self.name(&lt), self.name(&rt)))
+                            Err(format!(
+                                "cannot compare {} with {}",
+                                self.name(&lt),
+                                self.name(&rt)
+                            ))
                         }
                     }
                     "<" | "<=" | ">" | ">=" | "~=" | "\u{2248}" => {
                         if self.numeric(&lt) && self.numeric(&rt) {
                             Ok(Type::Bool)
                         } else {
-                            Err(format!("cannot compare {} with {}", self.name(&lt), self.name(&rt)))
+                            Err(format!(
+                                "cannot compare {} with {}",
+                                self.name(&lt),
+                                self.name(&rt)
+                            ))
                         }
                     }
                     op => Err(format!("unknown operator `{}`", op)),
@@ -571,7 +620,10 @@ impl<'a> Checker<'a> {
             Expr::Circum(open, e) => {
                 let t = self.check_expr(*e, scopes)?;
                 let (close, fname) = &self.p.circum_ops[open];
-                let (params, _, ret) = self.sigs.get(fname).ok_or(format!("unknown op `{}…{}`", open, close))?;
+                let (params, _, ret) = self
+                    .sigs
+                    .get(fname)
+                    .ok_or(format!("unknown op `{}…{}`", open, close))?;
                 if !Self::compat(&params[0], &t) {
                     return Err(format!(
                         "operator `{}…{}` expects {}, got {}",
@@ -590,7 +642,10 @@ impl<'a> Checker<'a> {
                     .find(|(n, _)| n == f)
                     .map(|(_, t)| self.resolve(t))
                     .transpose()?
-                    .ok_or(format!("type `{}` has no field `{}`", self.p.types[ti].name, f)),
+                    .ok_or(format!(
+                        "type `{}` has no field `{}`",
+                        self.p.types[ti].name, f
+                    )),
                 t => Err(format!("cannot access field `{}` on {}", f, self.name(&t))),
             },
             Expr::Index(a, i) => {
@@ -622,7 +677,10 @@ impl<'a> Checker<'a> {
                 Ok(Type::Arr(Box::new(first)))
             }
             Expr::Record(name, inits) => {
-                let ti = *self.type_ids.get(name).ok_or(format!("unknown type `{}`", name))?;
+                let ti = *self
+                    .type_ids
+                    .get(name)
+                    .ok_or(format!("unknown type `{}`", name))?;
                 let decl = &self.p.types[ti];
                 if inits.len() != decl.fields.len() {
                     return Err(format!(
@@ -683,7 +741,10 @@ impl<'a> Checker<'a> {
                     return Err("`sum` bounds must be i64".into());
                 }
                 scopes.push(HashMap::new());
-                scopes.last_mut().unwrap().insert(var.clone(), (Type::I64, false));
+                scopes
+                    .last_mut()
+                    .unwrap()
+                    .insert(var.clone(), (Type::I64, false));
                 let t = self.check_expr(*body, scopes)?;
                 scopes.pop();
                 if !self.numeric(&t) {
@@ -780,7 +841,11 @@ impl<'a> Checker<'a> {
                         if !self.numeric(&ats[0]) {
                             return Err(format!("`{}` needs a numeric arg", name));
                         }
-                        Ok(if ats[0] == Type::F32 { Type::F32 } else { Type::F64 })
+                        Ok(if ats[0] == Type::F32 {
+                            Type::F32
+                        } else {
+                            Type::F64
+                        })
                     }
                     "min" | "max" | "pow" | "atan2" => {
                         need(2)?;
@@ -812,7 +877,10 @@ impl<'a> Checker<'a> {
                         need(1)?;
                         match &ats[0] {
                             Type::Arr(_) | Type::Str => Ok(Type::I64),
-                            t => Err(format!("`len` expects an array or str, got {}", self.name(t))),
+                            t => Err(format!(
+                                "`len` expects an array or str, got {}",
+                                self.name(t)
+                            )),
                         }
                     }
                     "substr" => {
@@ -830,11 +898,15 @@ impl<'a> Checker<'a> {
                         Ok(Type::Arr(Box::new(ats[1].clone())))
                     }
                     _ => {
-                        let (params, inouts, ret) =
-                            self.sigs.get(name).ok_or(format!("unknown function `{}`", name))?;
-                        let extern_decl = self.p.externs.iter().find(|declaration| {
-                            declaration.name == *name
-                        });
+                        let (params, inouts, ret) = self
+                            .sigs
+                            .get(name)
+                            .ok_or(format!("unknown function `{}`", name))?;
+                        let extern_decl = self
+                            .p
+                            .externs
+                            .iter()
+                            .find(|declaration| declaration.name == *name);
                         if params.len() != ats.len() {
                             return Err(format!(
                                 "`{}` expects {} args, got {}",
@@ -861,7 +933,10 @@ impl<'a> Checker<'a> {
                                         if t != *p {
                                             return Err(format!(
                                                 "inout arg {} of `{}` must be exactly {}, got {}",
-                                                i + 1, name, self.name(p), self.name(&t)
+                                                i + 1,
+                                                name,
+                                                self.name(p),
+                                                self.name(&t)
                                             ));
                                         }
                                         // no aliasing: no other argument may pass or
@@ -876,7 +951,10 @@ impl<'a> Checker<'a> {
                                             if dup || writes_var(self.p, aj, n) {
                                                 return Err(format!(
                                                     "inout arg {} of `{}` aliases `{}` in arg {}",
-                                                    i + 1, name, n, j + 1
+                                                    i + 1,
+                                                    name,
+                                                    n,
+                                                    j + 1
                                                 ));
                                             }
                                         }
@@ -884,7 +962,8 @@ impl<'a> Checker<'a> {
                                     _ => {
                                         return Err(format!(
                                             "inout arg {} of `{}` must be a variable",
-                                            i + 1, name
+                                            i + 1,
+                                            name
                                         ))
                                     }
                                 }

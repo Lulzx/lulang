@@ -147,14 +147,14 @@ region and byte-copy it into codegen.lu (don't hardcode line numbers).
 
 ## Slices (each independently landable)
 
-- **A — import, host tiers**: front end + IR + ffi.rs + all three Rust tiers
+- **A — import, host tiers (complete)**: front end + IR + ffi.rs + all three Rust tiers
   + selfhost front-end parsing + codegen.lu declares; selfhost interp gives a
   clean "not yet supported" error; conformance runs with a temporary
   `skip_selfhost` mask on extern-executing cases.
-- **B — export**: `--lib` CLI, wrappers, header + manifest, `-DLU_LIB`
+- **B — export (complete)**: `--lib` CLI, wrappers, header + manifest, `-DLU_LIB`
   runtime guard, C and ctypes integration tests, codegen.lu wrapper
   byte-diff.
-- **C — close the gap**: interp.lu extern execution, delete the skip mask,
+- **C — close the gap (in progress)**: interp.lu extern execution, delete the skip mask,
   full four-tier FFI conformance.
 
 ## Test plan

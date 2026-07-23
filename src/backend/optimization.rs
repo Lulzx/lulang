@@ -460,7 +460,7 @@ fn inline_calls_unordered(function: &Function, callees: &[Function], budget: usi
                     continue;
                 };
                 let id = id as usize;
-                if id >= callees.len() || recursive.contains(&(id as u32)) {
+                if id >= callees.len() || callees[id].exported || recursive.contains(&(id as u32)) {
                     continue;
                 }
                 let size: usize = callees[id]
@@ -801,7 +801,9 @@ pub fn if_convert(function: &mut Function) {
                 .get(local)
                 .into_iter()
                 .chain(else_stores.get(local))
-                .any(|value| function.values[*value as usize] != function.locals[*local as usize].ty)
+                .any(|value| {
+                    function.values[*value as usize] != function.locals[*local as usize].ty
+                })
         }) {
             continue;
         }
@@ -1006,11 +1008,9 @@ mod cfg_tests {
 
     #[test]
     fn finds_reduction_and_trusted_array_accesses_from_cfg() {
-        let function = lower(
-            "main { let a = arr(8, 1.0) print(sum(i in 0..len(a)) a[i] * 2.0) }",
-        )
-        .main
-        .unwrap();
+        let function = lower("main { let a = arr(8, 1.0) print(sum(i in 0..len(a)) a[i] * 2.0) }")
+            .main
+            .unwrap();
         let analysis = analyze_cfg(&function);
         assert_eq!(analysis.loops.len(), 1, "{analysis:#?}");
         assert!(analysis.loops[0].reduction.is_some(), "{analysis:#?}");
@@ -1020,11 +1020,10 @@ mod cfg_tests {
 
     #[test]
     fn cfg_if_conversion_uses_selects_only_for_safe_diamonds() {
-        let mut function = lower(
-            "main { var x = 1.0 if true { x = -x } else { x = x + 2.0 } print(x) }",
-        )
-        .main
-        .unwrap();
+        let mut function =
+            lower("main { var x = 1.0 if true { x = -x } else { x = x + 2.0 } print(x) }")
+                .main
+                .unwrap();
         if_convert(&mut function);
         assert!(function
             .blocks

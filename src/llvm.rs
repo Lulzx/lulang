@@ -53,6 +53,131 @@ fn comps_ty(c: &[&str]) -> String {
     }
 }
 
+fn internal_symbol(decl: &FnDecl) -> String {
+    if decl.exported {
+        format!("__lu_internal_{}", decl.name)
+    } else {
+        decl.name.clone()
+    }
+}
+
+fn emit_export_wrapper(
+    program: &Program,
+    function: &ir::Function,
+    decl: &FnDecl,
+) -> Result<String, String> {
+    let mut params = Vec::new();
+    let mut internal_args = Vec::new();
+    let mut arrays = Vec::new();
+    let mut argument = 0usize;
+    for &local_id in &function.params {
+        let local = &function.locals[local_id as usize];
+        match &local.ty {
+            CType::Arr(element) => {
+                let element_components = lty(program, element)?;
+                if element_components.len() != 1 {
+                    return Err(format!(
+                        "export `{}` array elements must have one ABI component",
+                        decl.name
+                    ));
+                }
+                params.push(format!("ptr %c{}", argument));
+                let data = format!("%c{}", argument);
+                argument += 1;
+                params.push(format!("i64 %c{}", argument));
+                let len = format!("%c{}", argument);
+                argument += 1;
+                let handle = format!("%wa{}_handle", arrays.len());
+                internal_args.push(format!("ptr {}", handle));
+                arrays.push((data, len, handle, element_components[0]));
+            }
+            ty => {
+                for component in lty(program, ty)? {
+                    params.push(format!("{} %c{}", component, argument));
+                    internal_args.push(format!("{} %c{}", component, argument));
+                    argument += 1;
+                }
+            }
+        }
+    }
+
+    let ret_components = lty(program, &function.ret)?;
+    let ret_type = comps_ty(&ret_components);
+    let mut out = format!(
+        "define dso_local {} @\"{}\"({}) {{\nentry:\n",
+        ret_type,
+        decl.name,
+        params.join(", ")
+    );
+    for (index, (source, len, handle, component)) in arrays.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "  {handle} = call ptr @lu_arr_new_raw(i64 {len}, i64 1)\n\
+             \x20 %wa{index}_data = getelementptr i8, ptr {handle}, i64 8\n\
+             \x20 %wa{index}_in_idx = alloca i64\n\
+             \x20 store i64 0, ptr %wa{index}_in_idx\n\
+             \x20 br label %wa{index}_in_cond\n\
+             wa{index}_in_cond:\n\
+             \x20 %wa{index}_in_i = load i64, ptr %wa{index}_in_idx\n\
+             \x20 %wa{index}_in_more = icmp slt i64 %wa{index}_in_i, {len}\n\
+             \x20 br i1 %wa{index}_in_more, label %wa{index}_in_body, label %wa{index}_in_done\n\
+             wa{index}_in_body:\n\
+             \x20 %wa{index}_src = getelementptr {component}, ptr {source}, i64 %wa{index}_in_i\n\
+             \x20 %wa{index}_value = load {component}, ptr %wa{index}_src\n\
+             \x20 %wa{index}_dst = getelementptr {component}, ptr %wa{index}_data, i64 %wa{index}_in_i\n\
+             \x20 store {component} %wa{index}_value, ptr %wa{index}_dst\n\
+             \x20 %wa{index}_in_next = add i64 %wa{index}_in_i, 1\n\
+             \x20 store i64 %wa{index}_in_next, ptr %wa{index}_in_idx\n\
+             \x20 br label %wa{index}_in_cond\n\
+             wa{index}_in_done:"
+        );
+    }
+    if ret_components.is_empty() {
+        let _ = writeln!(
+            out,
+            "  call void @\"{}\"({})",
+            internal_symbol(decl),
+            internal_args.join(", ")
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  %wrapper_result = call {} @\"{}\"({})",
+            ret_type,
+            internal_symbol(decl),
+            internal_args.join(", ")
+        );
+    }
+    for (index, (destination, len, handle, component)) in arrays.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "  %wa{index}_out_data = getelementptr i8, ptr {handle}, i64 8\n\
+             \x20 %wa{index}_out_idx = alloca i64\n\
+             \x20 store i64 0, ptr %wa{index}_out_idx\n\
+             \x20 br label %wa{index}_out_cond\n\
+             wa{index}_out_cond:\n\
+             \x20 %wa{index}_out_i = load i64, ptr %wa{index}_out_idx\n\
+             \x20 %wa{index}_out_more = icmp slt i64 %wa{index}_out_i, {len}\n\
+             \x20 br i1 %wa{index}_out_more, label %wa{index}_out_body, label %wa{index}_out_done\n\
+             wa{index}_out_body:\n\
+             \x20 %wa{index}_out_src = getelementptr {component}, ptr %wa{index}_out_data, i64 %wa{index}_out_i\n\
+             \x20 %wa{index}_out_value = load {component}, ptr %wa{index}_out_src\n\
+             \x20 %wa{index}_out_dst = getelementptr {component}, ptr {destination}, i64 %wa{index}_out_i\n\
+             \x20 store {component} %wa{index}_out_value, ptr %wa{index}_out_dst\n\
+             \x20 %wa{index}_out_next = add i64 %wa{index}_out_i, 1\n\
+             \x20 store i64 %wa{index}_out_next, ptr %wa{index}_out_idx\n\
+             \x20 br label %wa{index}_out_cond\n\
+             wa{index}_out_done:"
+        );
+    }
+    if ret_components.is_empty() {
+        out.push_str("  ret void\n}\n\n");
+    } else {
+        let _ = writeln!(out, "  ret {} %wrapper_result\n}}\n", ret_type);
+    }
+    Ok(out)
+}
+
 fn llvm_array_local_for_value(function: &ir::Function, value: ir::ValueId) -> Option<ir::LocalId> {
     function
         .blocks
@@ -97,6 +222,53 @@ pub fn build(
     ir: &LoweredProgram,
     src_path: &str,
     out_path: Option<&str>,
+) -> Result<String, String> {
+    build_output(ir, src_path, out_path, false, false)
+}
+
+pub fn build_library(
+    ir: &LoweredProgram,
+    src_path: &str,
+    out_name: Option<&str>,
+    shared: bool,
+) -> Result<Vec<String>, String> {
+    if !ir.functions.iter().any(|function| function.exported) {
+        return Err("library has no `export fn` declarations".into());
+    }
+    let stem = std::path::Path::new(src_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("out");
+    let requested = std::path::Path::new(out_name.unwrap_or(stem));
+    let parent = requested
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let name = requested
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("invalid library output name")?;
+    let base = parent.join(name);
+    let base_string = base.to_string_lossy().into_owned();
+    let artifact = build_output(ir, src_path, Some(&base_string), true, shared)?;
+    let header_path = parent.join(format!("{}.h", name));
+    let manifest_path = parent.join(format!("{}.json", name));
+    std::fs::write(&header_path, crate::cheader::emit_header(ir, name)?)
+        .map_err(|error| error.to_string())?;
+    std::fs::write(&manifest_path, crate::cheader::emit_manifest(ir, name))
+        .map_err(|error| error.to_string())?;
+    Ok(vec![
+        artifact,
+        header_path.to_string_lossy().into_owned(),
+        manifest_path.to_string_lossy().into_owned(),
+    ])
+}
+
+fn build_output(
+    ir: &LoweredProgram,
+    src_path: &str,
+    out_path: Option<&str>,
+    library: bool,
+    shared: bool,
 ) -> Result<String, String> {
     let p = ir.source();
     let mut e = Emit {
@@ -189,9 +361,17 @@ pub fn build(
     }
     for (index, f) in p.fns.iter().enumerate() {
         module.push_str(&e.emit_ir_fn(&ir.functions[index], f)?);
+        if f.exported {
+            module.push_str(&emit_export_wrapper(p, &ir.functions[index], f)?);
+        }
     }
-    let main = ir.main.as_ref().ok_or("no `main` block in program")?;
-    module.push_str(&e.emit_ir_main(main)?);
+    if let Some(main) = &ir.main {
+        if !library {
+            module.push_str(&e.emit_ir_main(main)?);
+        }
+    } else if !library {
+        return Err("no `main` block in program".into());
+    }
     for (i, s) in e.strings.iter().enumerate() {
         let bytes: String = s.bytes().map(|b| format!("\\{:02X}", b)).collect();
         let _ = writeln!(
@@ -208,25 +388,57 @@ pub fn build(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("out");
-    let out_bin = out_path
-        .map(String::from)
-        .unwrap_or_else(|| stem.to_string());
+    let out_bin = if library {
+        let requested = std::path::Path::new(out_path.unwrap_or(stem));
+        let parent = requested
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""));
+        let name = requested
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or("invalid library output name")?;
+        let extension = if shared {
+            if cfg!(target_os = "macos") {
+                "dylib"
+            } else {
+                "so"
+            }
+        } else {
+            "a"
+        };
+        parent
+            .join(format!("lib{}.{}", name, extension))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        out_path
+            .map(String::from)
+            .unwrap_or_else(|| stem.to_string())
+    };
     let pid = std::process::id();
     let ll_path = std::env::temp_dir().join(format!("lu_{}_{}.ll", stem, pid));
     std::fs::write(&ll_path, &module).map_err(|e| e.to_string())?;
     // compile the runtime once per source revision, then just link the object
     let rt_src = include_str!("lu_runtime.c");
-    let rt_hash: u64 = rt_src.bytes().fold(1469598103934665603u64, |h, b| {
+    let mut rt_hash: u64 = rt_src.bytes().fold(1469598103934665603u64, |h, b| {
         (h ^ b as u64).wrapping_mul(1099511628211)
     });
+    if library {
+        rt_hash ^= 0x4c55_5f4c_4942;
+    }
     let runtime_o = std::env::temp_dir().join(format!("lu_runtime_{:016x}.o", rt_hash));
     if !runtime_o.exists() {
         let runtime_c = std::env::temp_dir().join(format!("lu_runtime_{}.c", pid));
         let runtime_tmp_o =
             std::env::temp_dir().join(format!("lu_runtime_{:016x}_{}.o", rt_hash, pid));
         std::fs::write(&runtime_c, rt_src).map_err(|e| e.to_string())?;
-        let st = std::process::Command::new("clang")
-            .args(["-O3", "-mcpu=native", "-c", "-o"])
+        let mut runtime_clang = std::process::Command::new("clang");
+        runtime_clang.args(["-O3", "-mcpu=native", "-c"]);
+        if library {
+            runtime_clang.args(["-DLU_LIB", "-fPIC"]);
+        }
+        let st = runtime_clang
+            .arg("-o")
             .arg(&runtime_tmp_o)
             .arg(&runtime_c)
             .status()
@@ -242,13 +454,72 @@ pub fn build(
         }
         let _ = std::fs::remove_file(&runtime_c);
     }
+    if library {
+        let module_o = std::env::temp_dir().join(format!("lu_{}_{}.o", stem, pid));
+        let status = std::process::Command::new("clang")
+            .args(["-O3", "-mcpu=native", "-fPIC", "-c", "-o"])
+            .arg(&module_o)
+            .arg(&ll_path)
+            .status()
+            .map_err(|e| format!("failed to invoke clang: {}", e))?;
+        if !status.success() {
+            return Err(format!("clang failed on {}", ll_path.display()));
+        }
+        let status = if shared {
+            let mut clang = std::process::Command::new("clang");
+            if cfg!(target_os = "macos") {
+                clang.arg("-dynamiclib");
+            } else {
+                clang.arg("-shared");
+            }
+            clang.arg("-o").arg(&out_bin).arg(&module_o).arg(&runtime_o);
+            let mut linked = std::collections::HashSet::new();
+            for lib in ir
+                .externs
+                .iter()
+                .filter_map(|declaration| declaration.lib.as_deref())
+            {
+                if !linked.insert(lib) {
+                    continue;
+                }
+                if lib.contains('/') || lib.ends_with(".so") || lib.ends_with(".dylib") {
+                    clang.arg(lib);
+                } else {
+                    clang.arg(format!("-l{}", lib));
+                }
+            }
+            if let Ok(flags) = std::env::var("LU_LINK_FLAGS") {
+                clang.args(flags.split_whitespace());
+            }
+            clang.status()
+        } else {
+            std::process::Command::new("ar")
+                .arg("rcs")
+                .arg(&out_bin)
+                .arg(&module_o)
+                .arg(&runtime_o)
+                .status()
+        }
+        .map_err(|e| format!("failed to build library: {}", e))?;
+        let _ = std::fs::remove_file(&module_o);
+        let _ = std::fs::remove_file(&ll_path);
+        if !status.success() {
+            return Err("library linker failed".into());
+        }
+        return Ok(out_bin);
+    }
+
     let mut clang = std::process::Command::new("clang");
     clang
         .args(["-O3", "-mcpu=native", "-o", &out_bin])
         .arg(&ll_path)
         .arg(&runtime_o);
     let mut linked = std::collections::HashSet::new();
-    for lib in ir.externs.iter().filter_map(|declaration| declaration.lib.as_deref()) {
+    for lib in ir
+        .externs
+        .iter()
+        .filter_map(|declaration| declaration.lib.as_deref())
+    {
         if !linked.insert(lib) {
             continue;
         }
@@ -343,7 +614,7 @@ impl<'a> Emit<'a> {
         let header = format!(
             "define internal {} @\"{}\"({}) {{\n",
             comps_ty(&abi_ret_comps(self.p, decl)?),
-            decl.name,
+            internal_symbol(decl),
             params.join(", ")
         );
         self.label("entry");
@@ -355,13 +626,15 @@ impl<'a> Emit<'a> {
                 ty: function.locals[local as usize].ty.clone(),
                 regs,
             };
-            for offset in array_component_offsets(self.p, &value.ty)? {
-                let copy = self.t();
-                self.line(format!(
-                    "{} = call ptr @lu_arr_clone(ptr {})",
-                    copy, value.regs[offset]
-                ));
-                value.regs[offset] = copy;
+            if !(decl.exported && matches!(&value.ty, CType::Arr(_))) {
+                for offset in array_component_offsets(self.p, &value.ty)? {
+                    let copy = self.t();
+                    self.line(format!(
+                        "{} = call ptr @lu_arr_clone(ptr {})",
+                        copy, value.regs[offset]
+                    ));
+                    value.regs[offset] = copy;
+                }
             }
             self.store_var(&Self::ir_local(local), &value)?;
         }
@@ -769,7 +1042,11 @@ impl<'a> Emit<'a> {
                 Rem => "frem",
                 _ => unreachable!(),
             };
-            let llvm_ty = if result_ty == CType::F32 { "float" } else { "double" };
+            let llvm_ty = if result_ty == CType::F32 {
+                "float"
+            } else {
+                "double"
+            };
             self.line(format!(
                 "{} = {} fast {} {}, {}",
                 out, opcode, llvm_ty, lhs.regs[0], rhs.regs[0]
@@ -962,6 +1239,14 @@ impl<'a> Emit<'a> {
         for ((_, tstr), mut value) in decl.params.iter().zip(args) {
             let want = resolve_type(self.p, tstr)?;
             value = self.coerce_ev(value, &want)?;
+            if decl.exported && matches!(&want, CType::Arr(_)) {
+                let copy = self.t();
+                self.line(format!(
+                    "{} = call ptr @lu_arr_clone(ptr {})",
+                    copy, value.regs[0]
+                ));
+                value.regs[0] = copy;
+            }
             for (component, reg) in lty(self.p, &want)?.iter().zip(&value.regs) {
                 parts.push(format!("{} {}", component, reg));
             }
@@ -971,7 +1256,7 @@ impl<'a> Emit<'a> {
         if abi.is_empty() {
             self.line(format!(
                 "call void @\"{}\"({})",
-                decl.name,
+                internal_symbol(decl),
                 parts.join(", ")
             ));
             return Ok(EV {
@@ -984,7 +1269,7 @@ impl<'a> Emit<'a> {
             "{} = call {} @\"{}\"({})",
             call,
             rt,
-            decl.name,
+            internal_symbol(decl),
             parts.join(", ")
         ));
         let mut all = Vec::new();
@@ -1018,11 +1303,7 @@ impl<'a> Emit<'a> {
         Ok(EV { ty: ret, regs })
     }
 
-    fn emit_ir_extern_call(
-        &mut self,
-        id: ir::ExternId,
-        args: Vec<EV>,
-    ) -> Result<EV, String> {
+    fn emit_ir_extern_call(&mut self, id: ir::ExternId, args: Vec<EV>) -> Result<EV, String> {
         let declaration = &self.externs[id as usize];
         let mut parts = Vec::new();
         for ((_, want), value) in declaration.params.iter().zip(args) {
@@ -1168,11 +1449,19 @@ impl<'a> Emit<'a> {
             (CType::F64, CType::I64) => self.to_f64(&value)?,
             (CType::F32, CType::F64) => {
                 let out = self.t();
-                self.line(format!("{} = fptrunc double {} to float", out, value.regs[0]));
+                self.line(format!(
+                    "{} = fptrunc double {} to float",
+                    out, value.regs[0]
+                ));
                 out
             }
             (CType::F64, CType::F32) => self.to_f64(&value)?,
-            _ => return Err(format!("cannot coerce LLVM value {:?} to {:?}", value.ty, want)),
+            _ => {
+                return Err(format!(
+                    "cannot coerce LLVM value {:?} to {:?}",
+                    value.ty, want
+                ))
+            }
         };
         Ok(EV {
             ty: want.clone(),
@@ -1312,10 +1601,7 @@ impl<'a> Emit<'a> {
             }
             "putf" => {
                 let value = self.to_f64(&args[0])?;
-                self.line(format!(
-                    "call void @lu_print_f64(double {})",
-                    value
-                ));
+                self.line(format!("call void @lu_print_f64(double {})", value));
                 Ok(EV {
                     ty: CType::Unit,
                     regs: vec![],
@@ -1428,9 +1714,18 @@ impl<'a> Emit<'a> {
                 let t = self.t();
                 self.line(format!("{} = call fast double @{}(double {})", t, intr, x));
                 if args[0].ty == CType::F32 {
-                    self.coerce_ev(EV { ty: CType::F64, regs: vec![t] }, &CType::F32)
+                    self.coerce_ev(
+                        EV {
+                            ty: CType::F64,
+                            regs: vec![t],
+                        },
+                        &CType::F32,
+                    )
                 } else {
-                    Ok(EV { ty: CType::F64, regs: vec![t] })
+                    Ok(EV {
+                        ty: CType::F64,
+                        regs: vec![t],
+                    })
                 }
             }
             "acos" => {
@@ -1438,9 +1733,18 @@ impl<'a> Emit<'a> {
                 let t = self.t();
                 self.line(format!("{} = call fast double @acos(double {})", t, x));
                 if args[0].ty == CType::F32 {
-                    self.coerce_ev(EV { ty: CType::F64, regs: vec![t] }, &CType::F32)
+                    self.coerce_ev(
+                        EV {
+                            ty: CType::F64,
+                            regs: vec![t],
+                        },
+                        &CType::F32,
+                    )
                 } else {
-                    Ok(EV { ty: CType::F64, regs: vec![t] })
+                    Ok(EV {
+                        ty: CType::F64,
+                        regs: vec![t],
+                    })
                 }
             }
             "min" | "max" | "pow" | "atan2" => {
@@ -1458,9 +1762,18 @@ impl<'a> Emit<'a> {
                     t, callee, a, b
                 ));
                 if args.iter().all(|value| value.ty == CType::F32) {
-                    self.coerce_ev(EV { ty: CType::F64, regs: vec![t] }, &CType::F32)
+                    self.coerce_ev(
+                        EV {
+                            ty: CType::F64,
+                            regs: vec![t],
+                        },
+                        &CType::F32,
+                    )
                 } else {
-                    Ok(EV { ty: CType::F64, regs: vec![t] })
+                    Ok(EV {
+                        ty: CType::F64,
+                        regs: vec![t],
+                    })
                 }
             }
             "float" => {
@@ -1474,7 +1787,11 @@ impl<'a> Emit<'a> {
             "int" => {
                 if matches!(args[0].ty, CType::F32 | CType::F64) {
                     let t = self.t();
-                    let source = if args[0].ty == CType::F32 { "float" } else { "double" };
+                    let source = if args[0].ty == CType::F32 {
+                        "float"
+                    } else {
+                        "double"
+                    };
                     self.line(format!(
                         "{} = fptosi {} {} to i64",
                         t, source, args[0].regs[0]

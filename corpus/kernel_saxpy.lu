@@ -1,0 +1,20 @@
+export fn saxpy(a: f64, x: [f64], y: [f64], n: i64): f64 {
+  var total = 0.0
+  for i in 0..n {
+    y[i] = a * x[i] + y[i]
+    total = total + y[i]
+  }
+  return total
+}
+
+main {
+  var x = arr(3, 0.0)
+  var y = arr(3, 0.0)
+  x[0] = 1.0
+  x[1] = 2.0
+  x[2] = 3.0
+  y[0] = 10.0
+  y[1] = 20.0
+  y[2] = 30.0
+  print(saxpy(2.0, x, y, 3))
+}

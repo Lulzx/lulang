@@ -36,6 +36,14 @@ testing.
 | [M8-PLAN.md](M8-PLAN.md) | Implementation plan for the C ABI milestone (extern/export, per-tier, slices, test plan) |
 | [KNOWN-ISSUES.md](KNOWN-ISSUES.md) | Fixed JIT correctness and bootstrap-memory regressions |
 
+## Milestone status
+
+| Milestone | Status |
+|---|---|
+| M8 C imports (`extern`) | Host interpreter, JIT, AOT, and self-hosted code generation complete |
+| M8 C exports (`export fn`) | Static/shared libraries, C headers, JSON manifests, and array copy-in/out complete |
+| M8 self-hosted extern execution | Next: close the final interpreter gap using the runtime trampoline |
+
 ## Usage
 
 ```
@@ -43,6 +51,8 @@ cargo build --release
 ./target/release/lu run  corpus/slerp.lu   # execute main
 ./target/release/lu test --runs 1000 corpus/slerp.lu # property tests, configurable runs
 ./target/release/lu build corpus/slerp.lu  # AOT-compile via LLVM
+./target/release/lu build --lib -o kernel corpus/kernel_saxpy.lu
+./target/release/lu build --lib --shared -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu fmt corpus/slerp.lu    # canonical Unicode operators + layout
 ./target/release/lu fmt --check corpus/slerp.lu
 ./target/release/lu run selfhost/lexer.lu  # the lulang lexer, written in lulang

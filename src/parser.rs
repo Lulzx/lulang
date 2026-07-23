@@ -274,7 +274,12 @@ impl Parser {
         // circumfix: `operator <open>(v: T)<close>: R { .. }`.
         let first = match self.next() {
             Tok::Sym(s) => s,
-            t => return Err(format!("expected operator glyph after `operator`, found {:?}", t)),
+            t => {
+                return Err(format!(
+                    "expected operator glyph after `operator`, found {:?}",
+                    t
+                ))
+            }
         };
         if self.prec.contains_key(&first) && matches!(self.peek(), Tok::Sym(s) if s == "(") {
             let anchor_prec = self.prec[&first];
@@ -368,7 +373,11 @@ impl Parser {
                 let name = self.ident()?;
                 self.eat_sym("=")?;
                 let e = self.parse_expr(0)?;
-                out.push(self.alloc_stmt(if k == "let" { Stmt::Let(name, e) } else { Stmt::Var(name, e) }));
+                out.push(self.alloc_stmt(if k == "let" {
+                    Stmt::Let(name, e)
+                } else {
+                    Stmt::Var(name, e)
+                }));
                 Ok(())
             }
             Tok::Ident(k) if k == "if" => {
@@ -618,18 +627,19 @@ impl Parser {
                         self.skip_nl();
                         let mut inits = Vec::new();
                         while !self.is_sym("}") {
-                            let field = if let (Tok::Ident(f), Tok::Sym(c)) = (self.peek(), self.peek2()) {
-                                if c == ":" {
-                                    let f = f.clone();
-                                    self.next();
-                                    self.next();
-                                    Some(f)
+                            let field =
+                                if let (Tok::Ident(f), Tok::Sym(c)) = (self.peek(), self.peek2()) {
+                                    if c == ":" {
+                                        let f = f.clone();
+                                        self.next();
+                                        self.next();
+                                        Some(f)
+                                    } else {
+                                        None
+                                    }
                                 } else {
                                     None
-                                }
-                            } else {
-                                None
-                            };
+                                };
                             let e = self.parse_expr(0)?;
                             inits.push((field, e));
                             if self.is_sym(",") {

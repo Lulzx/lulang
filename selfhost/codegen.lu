@@ -1669,7 +1669,9 @@ fn check_block(p: P, inout c: C, s0: i64, ret: i64): i64 {
 fn check_fn(p: P, inout c: C, f: i64) {
   c.nsym = 0
   for i in 0..p.fnp[f] {
-    define(c, p.pname[p.fpo[f] + i], p.ptype[p.fpo[f] + i], p.pmut[p.fpo[f] + i])
+    var mutable = p.pmut[p.fpo[f] + i]
+    if p.fexported[f] == 1 and is_arrt(p.ptype[p.fpo[f] + i]) { mutable = 1 }
+    define(c, p.pname[p.fpo[f] + i], p.ptype[p.fpo[f] + i], mutable)
   }
   let ret = p.fret[f]
   let last = check_block(p, c, p.fbody[f], ret)
@@ -2562,12 +2564,22 @@ fn emit_bin(p: P, inout g: G, op: str, l: i64, r: i64): R {
 
 // ---------- calls ----------
 
+fn emitted_name(p: P, fi: i64): str {
+  if p.fexported[fi] == 1 { return c2str("__lu_internal_", p.fname[fi]) }
+  return p.fname[fi]
+}
+
 fn emit_user_call(p: P, inout g: G, fi: i64, at: [i64], ao: [i64], argv: [i64]): R {
   var parts = ""
   for j in 0..p.fnp[fi] {
     let want = p.ptype[p.fpo[fi] + j]
     var v = R { t: at[j], o: ao[j], n: wcount(p, at[j]) }
     v = gcoerce(p, g, v, want)
+    if p.fexported[fi] == 1 and is_arrt(want) {
+      let copy = newt(g)
+      eline(c5(copy, " = call ptr @lu_arr_clone(ptr ", g.rs[v.o], ")", ""))
+      g.rs[v.o] = copy
+    }
     if p.fextern[fi] == 1 and is_arrt(want) {
       let data = newt(g)
       eline(c4(data, " = getelementptr i8, ptr ", g.rs[v.o], ", i64 8"))
@@ -2595,11 +2607,11 @@ fn emit_user_call(p: P, inout g: G, fi: i64, at: [i64], ao: [i64], argv: [i64]):
     if nc == 1 { rt = compty(p, p.fret[fi], 0) }
   }
   if nc == 0 {
-    eline(c5("call void @\"", p.fname[fi], "\"(", parts, ")"))
+    eline(c5("call void @\"", emitted_name(p, fi), "\"(", parts, ")"))
     return runit()
   }
   let cr = newt(g)
-  eline(c8(cr, " = call ", rt, " @\"", p.fname[fi], "\"(", parts, ")"))
+  eline(c8(cr, " = call ", rt, " @\"", emitted_name(p, fi), "\"(", parts, ")"))
   var all = arr(128, "")
   if nc == 1 {
     all[0] = cr
@@ -3063,7 +3075,7 @@ fn emit_fn(p: P, inout g: G, f: i64) {
     }
   }
   let rt = agg_ty(abi_nc(p, f), abi_join(p, f))
-  puts(c8("define internal ", rt, " @\"", p.fname[f], "\"(", parts, ") {", ""))
+  puts(c8("define internal ", rt, " @\"", emitted_name(p, f), "\"(", parts, ") {", ""))
   putnl()
   elabel("entry")
   idx = 0
@@ -3089,6 +3101,110 @@ fn emit_fn(p: P, inout g: G, f: i64) {
         g.gerr = 1
       }
     }
+  }
+  puts("}")
+  putnl()
+  putnl()
+}
+
+fn emit_export_wrapper(p: P, f: i64) {
+  var params = ""
+  var args = ""
+  var adata = arr(16, "")
+  var alen = arr(16, "")
+  var ahandle = arr(16, "")
+  var acomp = arr(16, "")
+  var na = 0
+  var ci = 0
+  for j in 0..p.fnp[f] {
+    let t = p.ptype[p.fpo[f] + j]
+    if is_arrt(t) {
+      let data = c2str("%c", i2s(ci))
+      params = join2(params, c2str("ptr ", data))
+      ci = ci + 1
+      let n = c2str("%c", i2s(ci))
+      params = join2(params, c2str("i64 ", n))
+      ci = ci + 1
+      let h = c3("%wa", i2s(na), "_handle")
+      args = join2(args, c2str("ptr ", h))
+      adata[na] = data
+      alen[na] = n
+      ahandle[na] = h
+      acomp[na] = compty(p, elem_of(t), 0)
+      na = na + 1
+    } else {
+      for k in 0..wcount(p, t) {
+        let reg = c2str("%c", i2s(ci))
+        params = join2(params, c3(compty(p, t, k), " ", reg))
+        args = join2(args, c3(compty(p, t, k), " ", reg))
+        ci = ci + 1
+      }
+    }
+  }
+  var rt = "void"
+  if p.fret[f] != 4 { rt = compty(p, p.fret[f], 0) }
+  puts(c8("define dso_local ", rt, " @\"", p.fname[f], "\"(", params, ") {", ""))
+  putnl()
+  puts("entry:")
+  putnl()
+  for i in 0..na {
+    let lq = c2str("wa", i2s(i))
+    let q = c2str("%", lq)
+    eline(c6(ahandle[i], " = call ptr @lu_arr_new_raw(i64 ", alen[i], ", i64 1)", "", ""))
+    eline(c4(q, "_data = getelementptr i8, ptr ", ahandle[i], ", i64 8"))
+    eline(c2str(q, "_in_idx = alloca i64"))
+    eline(c3("store i64 0, ptr ", q, "_in_idx"))
+    eline(c3("br label %", c2str(lq, "_in_cond"), ""))
+    puts(c2str(lq, "_in_cond:"))
+    putnl()
+    eline(c4(q, "_in_i = load i64, ptr ", q, "_in_idx"))
+    eline(c6(q, "_in_more = icmp slt i64 ", c2str(q, "_in_i"), ", ", alen[i], ""))
+    eline(c6("br i1 ", c2str(q, "_in_more"), ", label %", c2str(lq, "_in_body"), ", label %", c2str(lq, "_in_done")))
+    puts(c2str(lq, "_in_body:"))
+    putnl()
+    eline(c7(q, "_src = getelementptr ", acomp[i], ", ptr ", adata[i], ", i64 ", c2str(q, "_in_i")))
+    eline(c6(q, "_value = load ", acomp[i], ", ptr ", c2str(q, "_src"), ""))
+    eline(c7(q, "_dst = getelementptr ", acomp[i], ", ptr ", c2str(q, "_data"), ", i64 ", c2str(q, "_in_i")))
+    eline(c6("store ", acomp[i], " ", c2str(q, "_value"), ", ptr ", c2str(q, "_dst")))
+    eline(c6(q, "_in_next = add i64 ", c2str(q, "_in_i"), ", 1", "", ""))
+    eline(c4("store i64 ", c2str(q, "_in_next"), ", ptr ", c2str(q, "_in_idx")))
+    eline(c3("br label %", c2str(lq, "_in_cond"), ""))
+    puts(c2str(lq, "_in_done:"))
+    putnl()
+  }
+  if rt == "void" {
+    eline(c5("call void @\"", emitted_name(p, f), "\"(", args, ")"))
+  } else {
+    eline(c8("%wrapper_result = call ", rt, " @\"", emitted_name(p, f), "\"(", args, ")", ""))
+  }
+  for i in 0..na {
+    let lq = c2str("wa", i2s(i))
+    let q = c2str("%", lq)
+    eline(c4(q, "_out_data = getelementptr i8, ptr ", ahandle[i], ", i64 8"))
+    eline(c2str(q, "_out_idx = alloca i64"))
+    eline(c3("store i64 0, ptr ", q, "_out_idx"))
+    eline(c3("br label %", c2str(lq, "_out_cond"), ""))
+    puts(c2str(lq, "_out_cond:"))
+    putnl()
+    eline(c4(q, "_out_i = load i64, ptr ", q, "_out_idx"))
+    eline(c6(q, "_out_more = icmp slt i64 ", c2str(q, "_out_i"), ", ", alen[i], ""))
+    eline(c6("br i1 ", c2str(q, "_out_more"), ", label %", c2str(lq, "_out_body"), ", label %", c2str(lq, "_out_done")))
+    puts(c2str(lq, "_out_body:"))
+    putnl()
+    eline(c7(q, "_out_src = getelementptr ", acomp[i], ", ptr ", c2str(q, "_out_data"), ", i64 ", c2str(q, "_out_i")))
+    eline(c6(q, "_out_value = load ", acomp[i], ", ptr ", c2str(q, "_out_src"), ""))
+    eline(c7(q, "_out_dst = getelementptr ", acomp[i], ", ptr ", adata[i], ", i64 ", c2str(q, "_out_i")))
+    eline(c6("store ", acomp[i], " ", c2str(q, "_out_value"), ", ptr ", c2str(q, "_out_dst")))
+    eline(c6(q, "_out_next = add i64 ", c2str(q, "_out_i"), ", 1", "", ""))
+    eline(c4("store i64 ", c2str(q, "_out_next"), ", ptr ", c2str(q, "_out_idx")))
+    eline(c3("br label %", c2str(lq, "_out_cond"), ""))
+    puts(c2str(lq, "_out_done:"))
+    putnl()
+  }
+  if rt == "void" {
+    eline("ret void")
+  } else {
+    eline(c3("ret ", rt, " %wrapper_result"))
   }
   puts("}")
   putnl()
@@ -3182,6 +3298,8 @@ fn emit_module(p: P, inout g: G, triple: str) {
   putnl()
   puts("declare ptr @lu_arr_new_raw(i64, i64)")
   putnl()
+  puts("declare ptr @lu_arr_clone(ptr)")
+  putnl()
   puts("declare i64 @lu_str_eq(ptr, i64, ptr, i64) #0")
   putnl()
   puts("declare ptr @lu_arr_new_f64(i64, double)")
@@ -3219,7 +3337,10 @@ fn emit_module(p: P, inout g: G, triple: str) {
   if p.nf > 0 { putnl() }
   var f = 0
   while f < p.nf and g.gerr == 0 {
-    if p.fisprop[f] == 0 and p.fextern[f] == 0 { emit_fn(p, g, f) }
+    if p.fisprop[f] == 0 and p.fextern[f] == 0 {
+      emit_fn(p, g, f)
+      if p.fexported[f] == 1 { emit_export_wrapper(p, f) }
+    }
     f = f + 1
   }
   if g.gerr == 0 { emit_main(p, g) }

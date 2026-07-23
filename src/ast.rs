@@ -17,8 +17,13 @@ pub enum Expr {
     Index(ExprId, ExprId),
     Record(String, Vec<(Option<String>, ExprId)>),
     Array(Vec<ExprId>),
-    Sum { var: String, lo: ExprId, hi: ExprId, body: ExprId },
-    Circum(String, ExprId), // key = open glyph, operand
+    Sum {
+        var: String,
+        lo: ExprId,
+        hi: ExprId,
+        body: ExprId,
+    },
+    Circum(String, ExprId),  // key = open glyph, operand
     EnumVal(String, String), // EnumName.Variant
 }
 

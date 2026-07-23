@@ -9,5 +9,7 @@ pub mod ir {
 
 #[path = "../../../src/backend/mod.rs"]
 pub mod backend;
+#[path = "../../../src/cheader.rs"]
+pub mod cheader;
 #[path = "../../../src/llvm.rs"]
 pub mod llvm;

@@ -58,7 +58,9 @@ fn set_field(slot: &mut Value, path: &[usize], v: Value) -> Result<(), String> {
     match slot {
         Value::Rec(_, fields) => {
             let fields = Rc::make_mut(fields);
-            let slot = fields.get_mut(field).ok_or_else(|| format!("invalid field {}", field))?;
+            let slot = fields
+                .get_mut(field)
+                .ok_or_else(|| format!("invalid field {}", field))?;
             set_field(slot, &path[1..], v)
         }
         v => Err(format!("cannot assign field {} on {:?}", field, v)),
@@ -108,17 +110,27 @@ impl<'a> Interp<'a> {
             let function_id = prop.function;
             let mut failed = None;
             for _ in 0..runs {
-                let args: Result<Vec<Value>, String> =
-                    prop.params.iter().map(|(_, t)| self.gen_value(t, &mut rng)).collect();
+                let args: Result<Vec<Value>, String> = prop
+                    .params
+                    .iter()
+                    .map(|(_, t)| self.gen_value(t, &mut rng))
+                    .collect();
                 let args = args?;
-                let v = self.execute(&self.ir.functions[function_id as usize], args.clone())?.0;
+                let v = self
+                    .execute(&self.ir.functions[function_id as usize], args.clone())?
+                    .0;
                 match v {
                     Value::Bool(true) => {}
                     Value::Bool(false) => {
                         failed = Some(args);
                         break;
                     }
-                    v => return Err(format!("property `{}` returned non-bool {:?}", prop.name, v)),
+                    v => {
+                        return Err(format!(
+                            "property `{}` returned non-bool {:?}",
+                            prop.name, v
+                        ))
+                    }
                 }
             }
             match failed {
@@ -141,7 +153,11 @@ impl<'a> Interp<'a> {
 
     /// Greedy shrink: repeatedly try simpler variants of each argument, keeping
     /// any that still falsify the property. Returns the final args + step count.
-    fn shrink(&self, function_id: ir::FunctionId, mut args: Vec<Value>) -> Result<(Vec<Value>, u32), String> {
+    fn shrink(
+        &self,
+        function_id: ir::FunctionId,
+        mut args: Vec<Value>,
+    ) -> Result<(Vec<Value>, u32), String> {
         let mut steps = 0u32;
         let mut budget = 500u32; // max property evaluations while shrinking
         'outer: loop {
@@ -153,7 +169,11 @@ impl<'a> Interp<'a> {
                     budget -= 1;
                     let mut trial = args.clone();
                     trial[i] = cand;
-                    if matches!(self.execute(&self.ir.functions[function_id as usize], trial.clone())?.0, Value::Bool(false)) {
+                    if matches!(
+                        self.execute(&self.ir.functions[function_id as usize], trial.clone())?
+                            .0,
+                        Value::Bool(false)
+                    ) {
                         args = trial;
                         steps += 1;
                         continue 'outer;
@@ -180,7 +200,8 @@ impl<'a> Interp<'a> {
             Value::Float(f) => {
                 let mut out = Vec::new();
                 for c in [0.0, 1.0, -1.0, f.trunc(), f / 2.0] {
-                    let simpler_mag = c == 0.0 || c.abs() < f.abs() || (c == c.trunc() && *f != f.trunc());
+                    let simpler_mag =
+                        c == 0.0 || c.abs() < f.abs() || (c == c.trunc() && *f != f.trunc());
                     if c != *f && c.is_finite() && simpler_mag {
                         out.push(Value::Float(c));
                     }
@@ -236,22 +257,47 @@ impl<'a> Interp<'a> {
                 Ok(Value::Enum(*ei, (next(rng) % n) as i64))
             }
             crate::check::Type::Rec(ti) => {
-                let fields: Result<Vec<Value>, String> =
-                    self.ir.records[*ti].fields.iter().map(|(_, ft)| self.gen_value(ft, rng)).collect();
+                let fields: Result<Vec<Value>, String> = self.ir.records[*ti]
+                    .fields
+                    .iter()
+                    .map(|(_, ft)| self.gen_value(ft, rng))
+                    .collect();
                 Ok(Value::Rec(*ti, Rc::new(fields?)))
             }
-            t => Err(format!("cannot generate values of type `{}`", self.type_name(t))),
+            t => Err(format!(
+                "cannot generate values of type `{}`",
+                self.type_name(t)
+            )),
         }
     }
 
     fn type_name(&self, ty: &crate::check::Type) -> String {
         use crate::check::Type::*;
-        match ty { I64=>"i64".into(),F32=>"f32".into(),F64=>"f64".into(),Bool=>"bool".into(),Str=>"str".into(),Unit=>"()".into(),Arr(t)=>format!("[{}]",self.type_name(t)),Rec(i)=>self.ir.records[*i].name.clone(),Enum(i)=>self.ir.enums[*i].name.clone() }
+        match ty {
+            I64 => "i64".into(),
+            F32 => "f32".into(),
+            F64 => "f64".into(),
+            Bool => "bool".into(),
+            Str => "str".into(),
+            Unit => "()".into(),
+            Arr(t) => format!("[{}]", self.type_name(t)),
+            Rec(i) => self.ir.records[*i].name.clone(),
+            Enum(i) => self.ir.enums[*i].name.clone(),
+        }
     }
 
-    fn execute(&self, function: &ir::Function, args: Vec<Value>) -> Result<(Value, Vec<Value>), String> {
+    fn execute(
+        &self,
+        function: &ir::Function,
+        args: Vec<Value>,
+    ) -> Result<(Value, Vec<Value>), String> {
         if args.len() != function.params.len() {
-            return Err(format!("`{}` expects {} args, got {}", function.name, function.params.len(), args.len()));
+            return Err(format!(
+                "`{}` expects {} args, got {}",
+                function.name,
+                function.params.len(),
+                args.len()
+            ));
         }
         let mut locals = vec![Value::Unit; function.locals.len()];
         for (&local, value) in function.params.iter().zip(args) {
@@ -264,38 +310,63 @@ impl<'a> Interp<'a> {
             for inst in &block.instructions {
                 let result = match &inst.kind {
                     InstKind::Constant(c) => Some(match c {
-                        Constant::I64(v) => Value::Int(*v), Constant::F32(v) => Value::Float32(*v), Constant::F64(v) => Value::Float(*v),
-                        Constant::Bool(v) => Value::Bool(*v), Constant::Bytes(v) => Value::Str(Rc::new(v.clone())), Constant::Unit => Value::Unit,
+                        Constant::I64(v) => Value::Int(*v),
+                        Constant::F32(v) => Value::Float32(*v),
+                        Constant::F64(v) => Value::Float(*v),
+                        Constant::Bool(v) => Value::Bool(*v),
+                        Constant::Bytes(v) => Value::Str(Rc::new(v.clone())),
+                        Constant::Unit => Value::Unit,
                     }),
                     InstKind::Load(local) => Some(locals[*local as usize].clone()),
                     InstKind::Store { local, value, .. } => {
-                        locals[*local as usize] = coerce(values[*value as usize].clone(), &function.locals[*local as usize].ty)?;
+                        locals[*local as usize] = coerce(
+                            values[*value as usize].clone(),
+                            &function.locals[*local as usize].ty,
+                        )?;
                         None
                     }
-                    InstKind::Unary { op, value } => Some(self.unary(*op, values[*value as usize].clone())?),
-                    InstKind::Binary { op, lhs, rhs } => Some(self.binary(*op, &values[*lhs as usize], &values[*rhs as usize])?),
-                    InstKind::Select { condition, then_value, else_value } => {
+                    InstKind::Unary { op, value } => {
+                        Some(self.unary(*op, values[*value as usize].clone())?)
+                    }
+                    InstKind::Binary { op, lhs, rhs } => {
+                        Some(self.binary(*op, &values[*lhs as usize], &values[*rhs as usize])?)
+                    }
+                    InstKind::Select {
+                        condition,
+                        then_value,
+                        else_value,
+                    } => {
                         let Value::Bool(condition) = values[*condition as usize] else {
                             return Err("IR select condition is not bool".into());
                         };
-                        Some(values[if condition { *then_value } else { *else_value } as usize].clone())
+                        Some(
+                            values[if condition { *then_value } else { *else_value } as usize]
+                                .clone(),
+                        )
                     }
-                    InstKind::Call { callee, args, inout } => {
-                        let call_args = args.iter().map(|v| values[*v as usize].clone()).collect::<Vec<_>>();
+                    InstKind::Call {
+                        callee,
+                        args,
+                        inout,
+                    } => {
+                        let call_args = args
+                            .iter()
+                            .map(|v| values[*v as usize].clone())
+                            .collect::<Vec<_>>();
                         let result = match callee {
                             Callee::Function(id) => {
                                 let callee = &self.ir.functions[*id as usize];
                                 let (result, callee_frame) = self.execute(callee, call_args)?;
                                 for (i, target) in inout.iter().enumerate() {
                                     if let Some(target) = target {
-                                        locals[*target as usize] = callee_frame[callee.params[i] as usize].clone();
+                                        locals[*target as usize] =
+                                            callee_frame[callee.params[i] as usize].clone();
                                     }
                                 }
                                 result
                             }
                             Callee::Extern(id) => {
-                                let (result, copyouts) =
-                                    self.call_extern(*id, call_args)?;
+                                let (result, copyouts) = self.call_extern(*id, call_args)?;
                                 for (target, copyout) in inout.iter().zip(copyouts) {
                                     if let (Some(target), Some(copyout)) = (target, copyout) {
                                         locals[*target as usize] = copyout;
@@ -307,22 +378,50 @@ impl<'a> Interp<'a> {
                         };
                         Some(result)
                     }
-                    InstKind::Field { base, record, field } => match &values[*base as usize] {
-                        Value::Rec(actual, fields) if actual == record => Some(fields.get(*field).cloned().ok_or("invalid field index")?),
+                    InstKind::Field {
+                        base,
+                        record,
+                        field,
+                    } => match &values[*base as usize] {
+                        Value::Rec(actual, fields) if actual == record => {
+                            Some(fields.get(*field).cloned().ok_or("invalid field index")?)
+                        }
                         value => return Err(format!("cannot access field on {:?}", value)),
                     },
                     InstKind::Index { base, index } => {
                         let index = as_i64(&values[*index as usize])?;
                         Some(match &values[*base as usize] {
-                            Value::Arr(cells) => cells.get(index as usize).cloned().ok_or_else(|| format!("index {} out of bounds", index))?,
-                            Value::Str(bytes) => Value::Int(*bytes.get(index as usize).ok_or_else(|| format!("index {} out of bounds (length {})", index, bytes.len()))? as i64),
+                            Value::Arr(cells) => cells
+                                .get(index as usize)
+                                .cloned()
+                                .ok_or_else(|| format!("index {} out of bounds", index))?,
+                            Value::Str(bytes) => {
+                                Value::Int(*bytes.get(index as usize).ok_or_else(|| {
+                                    format!(
+                                        "index {} out of bounds (length {})",
+                                        index,
+                                        bytes.len()
+                                    )
+                                })? as i64)
+                            }
                             value => return Err(format!("cannot index into {:?}", value)),
                         })
                     }
-                    InstKind::Array(items) => Some(Value::Arr(Rc::new(items.iter().map(|v| values[*v as usize].clone()).collect()))),
-                    InstKind::Record { record, fields } => Some(Value::Rec(*record, Rc::new(fields.iter().map(|v| values[*v as usize].clone()).collect()))),
+                    InstKind::Array(items) => Some(Value::Arr(Rc::new(
+                        items.iter().map(|v| values[*v as usize].clone()).collect(),
+                    ))),
+                    InstKind::Record { record, fields } => Some(Value::Rec(
+                        *record,
+                        Rc::new(fields.iter().map(|v| values[*v as usize].clone()).collect()),
+                    )),
                     InstKind::Enum { enumeration, tag } => Some(Value::Enum(*enumeration, *tag)),
-                    InstKind::SetIndex { root, path, index, value, .. } => {
+                    InstKind::SetIndex {
+                        root,
+                        path,
+                        index,
+                        value,
+                        ..
+                    } => {
                         let index = as_i64(&values[*index as usize])?;
                         set_index(
                             &mut locals[*root as usize],
@@ -332,7 +431,14 @@ impl<'a> Interp<'a> {
                         )?;
                         None
                     }
-                    InstKind::SetField { root, path, value } => { set_field(&mut locals[*root as usize], path, values[*value as usize].clone())?; None }
+                    InstKind::SetField { root, path, value } => {
+                        set_field(
+                            &mut locals[*root as usize],
+                            path,
+                            values[*value as usize].clone(),
+                        )?;
+                        None
+                    }
                 };
                 if let (Some(id), Some(result)) = (inst.result, result) {
                     values[id as usize] = coerce(result, &inst.ty)?;
@@ -340,9 +446,29 @@ impl<'a> Interp<'a> {
             }
             match block.terminator {
                 Terminator::Jump(next) => block_id = next,
-                Terminator::Branch { condition, then_block, else_block } => block_id = if matches!(values[condition as usize], Value::Bool(true)) { then_block } else { else_block },
-                Terminator::Return(value) => return Ok((coerce(values[value as usize].clone(), &function.ret)?, locals)),
-                Terminator::Unreachable => return Err(format!("reached unterminated IR block in `{}`", function.name)),
+                Terminator::Branch {
+                    condition,
+                    then_block,
+                    else_block,
+                } => {
+                    block_id = if matches!(values[condition as usize], Value::Bool(true)) {
+                        then_block
+                    } else {
+                        else_block
+                    }
+                }
+                Terminator::Return(value) => {
+                    return Ok((
+                        coerce(values[value as usize].clone(), &function.ret)?,
+                        locals,
+                    ))
+                }
+                Terminator::Unreachable => {
+                    return Err(format!(
+                        "reached unterminated IR block in `{}`",
+                        function.name
+                    ))
+                }
             }
         }
     }
@@ -362,18 +488,73 @@ impl<'a> Interp<'a> {
         match op {
             Add | Sub | Mul | Div | Rem => match (lhs, rhs) {
                 (Value::Int(a), Value::Int(b)) => {
-                    let value = match op { Add=>a.wrapping_add(*b),Sub=>a.wrapping_sub(*b),Mul=>a.wrapping_mul(*b),Div|Rem => {
-                        if *b==0 { return Err(if op==Div{"integer division by zero"}else{"integer modulo by zero"}.into()); }
-                        if *a==i64::MIN && *b == -1 { return Err("integer division overflow".into()); }
-                        if op==Div {a/b} else {a%b}
-                    }, _=>unreachable!() }; Ok(Value::Int(value))
+                    let value = match op {
+                        Add => a.wrapping_add(*b),
+                        Sub => a.wrapping_sub(*b),
+                        Mul => a.wrapping_mul(*b),
+                        Div | Rem => {
+                            if *b == 0 {
+                                return Err(if op == Div {
+                                    "integer division by zero"
+                                } else {
+                                    "integer modulo by zero"
+                                }
+                                .into());
+                            }
+                            if *a == i64::MIN && *b == -1 {
+                                return Err("integer division overflow".into());
+                            }
+                            if op == Div {
+                                a / b
+                            } else {
+                                a % b
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    Ok(Value::Int(value))
                 }
-                (Value::Float32(a), Value::Float32(b)) => Ok(Value::Float32(match op {Add=>a+b,Sub=>a-b,Mul=>a*b,Div=>a/b,Rem=>a%b,_=>unreachable!()})),
-                _ => { let (a,b)=(as_f64(lhs)?,as_f64(rhs)?); Ok(Value::Float(match op {Add=>a+b,Sub=>a-b,Mul=>a*b,Div=>a/b,Rem=>a%b,_=>unreachable!()})) }
+                (Value::Float32(a), Value::Float32(b)) => Ok(Value::Float32(match op {
+                    Add => a + b,
+                    Sub => a - b,
+                    Mul => a * b,
+                    Div => a / b,
+                    Rem => a % b,
+                    _ => unreachable!(),
+                })),
+                _ => {
+                    let (a, b) = (as_f64(lhs)?, as_f64(rhs)?);
+                    Ok(Value::Float(match op {
+                        Add => a + b,
+                        Sub => a - b,
+                        Mul => a * b,
+                        Div => a / b,
+                        Rem => a % b,
+                        _ => unreachable!(),
+                    }))
+                }
             },
-            Eq | Ne => { let eq=match(lhs,rhs){(Value::Int(a),Value::Int(b))=>a==b,(Value::Bool(a),Value::Bool(b))=>a==b,(Value::Str(a),Value::Str(b))=>a==b,(Value::Enum(ae,a),Value::Enum(be,b))=>ae==be&&a==b,_=>as_f64(lhs)?==as_f64(rhs)?};Ok(Value::Bool(if op==Eq{eq}else{!eq})) }
-            Lt|Le|Gt|Ge => {let(a,b)=(as_f64(lhs)?,as_f64(rhs)?);Ok(Value::Bool(match op{Lt=>a<b,Le=>a<=b,Gt=>a>b,Ge=>a>=b,_=>unreachable!()}))}
-            ApproxEq => Ok(Value::Bool(approx_eq(as_f64(lhs)?,as_f64(rhs)?))),
+            Eq | Ne => {
+                let eq = match (lhs, rhs) {
+                    (Value::Int(a), Value::Int(b)) => a == b,
+                    (Value::Bool(a), Value::Bool(b)) => a == b,
+                    (Value::Str(a), Value::Str(b)) => a == b,
+                    (Value::Enum(ae, a), Value::Enum(be, b)) => ae == be && a == b,
+                    _ => as_f64(lhs)? == as_f64(rhs)?,
+                };
+                Ok(Value::Bool(if op == Eq { eq } else { !eq }))
+            }
+            Lt | Le | Gt | Ge => {
+                let (a, b) = (as_f64(lhs)?, as_f64(rhs)?);
+                Ok(Value::Bool(match op {
+                    Lt => a < b,
+                    Le => a <= b,
+                    Gt => a > b,
+                    Ge => a >= b,
+                    _ => unreachable!(),
+                }))
+            }
+            ApproxEq => Ok(Value::Bool(approx_eq(as_f64(lhs)?, as_f64(rhs)?))),
         }
     }
 
@@ -403,7 +584,10 @@ impl<'a> Interp<'a> {
                 Ok(Value::Unit)
             }
             "puti" | "putf" | "putb" => {
-                print!("{}", self.display(args.first().ok_or(format!("`{}` needs 1 arg", name))?));
+                print!(
+                    "{}",
+                    self.display(args.first().ok_or(format!("`{}` needs 1 arg", name))?)
+                );
                 Ok(Value::Unit)
             }
             "putsp" => {
@@ -417,24 +601,25 @@ impl<'a> Interp<'a> {
             "nargs" => Ok(Value::Int(crate::runtime::args().len() as i64)),
             "arg" => {
                 let i = as_i64(args.first().ok_or("`arg` needs 1 arg".to_string())?)?;
-                let s = crate::runtime::args().get(i as usize).cloned().unwrap_or_default();
+                let s = crate::runtime::args()
+                    .get(i as usize)
+                    .cloned()
+                    .unwrap_or_default();
                 Ok(Value::Str(Rc::new(s.into_bytes())))
             }
             "chr" => {
                 let c = as_i64(args.first().ok_or("`chr` needs 1 arg".to_string())?)?;
                 Ok(Value::Str(Rc::new(vec![c as u8])))
             }
-            "concat" => {
-                match (&args[0], &args[1]) {
-                    (Value::Str(a), Value::Str(b)) => {
-                        let mut bytes = Vec::with_capacity(a.len() + b.len());
-                        bytes.extend_from_slice(a);
-                        bytes.extend_from_slice(b);
-                        Ok(Value::Str(Rc::new(bytes)))
-                    }
-                    _ => Err("`concat` expects two strs".into()),
+            "concat" => match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => {
+                    let mut bytes = Vec::with_capacity(a.len() + b.len());
+                    bytes.extend_from_slice(a);
+                    bytes.extend_from_slice(b);
+                    Ok(Value::Str(Rc::new(bytes)))
                 }
-            }
+                _ => Err("`concat` expects two strs".into()),
+            },
             "read_file" => {
                 let p = match args.first() {
                     Some(Value::Str(s)) => String::from_utf8_lossy(s).into_owned(),
@@ -448,19 +633,17 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            "write_file" => {
-                match (&args[0], &args[1]) {
-                    (Value::Str(p), Value::Str(c)) => {
-                        let path = String::from_utf8_lossy(p);
-                        if let Err(e) = std::fs::write(path.as_ref(), c.as_slice()) {
-                            eprintln!("error: cannot write {}: {}", path, e);
-                            std::process::exit(1);
-                        }
-                        Ok(Value::Unit)
+            "write_file" => match (&args[0], &args[1]) {
+                (Value::Str(p), Value::Str(c)) => {
+                    let path = String::from_utf8_lossy(p);
+                    if let Err(e) = std::fs::write(path.as_ref(), c.as_slice()) {
+                        eprintln!("error: cannot write {}: {}", path, e);
+                        std::process::exit(1);
                     }
-                    _ => Err("`write_file` expects (str, str)".into()),
+                    Ok(Value::Unit)
                 }
-            }
+                _ => Err("`write_file` expects (str, str)".into()),
+            },
             "sqrt" | "sin" | "cos" | "acos" | "abs" | "floor" => {
                 let x = as_f64(args.first().ok_or(format!("`{}` needs 1 arg", name))?)?;
                 Ok(Value::Float(match name {
@@ -498,7 +681,12 @@ impl<'a> Interp<'a> {
             "substr" => match (&args[0], as_i64(&args[1])?, as_i64(&args[2])?) {
                 (Value::Str(s), lo, hi) => {
                     if lo < 0 || hi < lo || hi as usize > s.len() {
-                        return Err(format!("substr {}..{} out of bounds (length {})", lo, hi, s.len()));
+                        return Err(format!(
+                            "substr {}..{} out of bounds (length {})",
+                            lo,
+                            hi,
+                            s.len()
+                        ));
                     }
                     Ok(Value::Str(Rc::new(s[lo as usize..hi as usize].to_vec())))
                 }
@@ -518,9 +706,7 @@ impl<'a> Interp<'a> {
                 cells.resize(n, init);
                 Ok(Value::Arr(Rc::new(cells)))
             }
-            _ => {
-                Err(format!("unknown builtin `{}`", name))
-            }
+            _ => Err(format!("unknown builtin `{}`", name)),
         }
     }
 
@@ -598,16 +784,10 @@ impl<'a> Interp<'a> {
                 (Type::Arr(element), Value::Arr(cells)) => {
                     let native = match element.as_ref() {
                         Type::I64 => NativeArray::I64(
-                            cells
-                                .iter()
-                                .map(as_i64)
-                                .collect::<Result<Vec<_>, _>>()?,
+                            cells.iter().map(as_i64).collect::<Result<Vec<_>, _>>()?,
                         ),
                         Type::F64 => NativeArray::F64(
-                            cells
-                                .iter()
-                                .map(as_f64)
-                                .collect::<Result<Vec<_>, _>>()?,
+                            cells.iter().map(as_f64).collect::<Result<Vec<_>, _>>()?,
                         ),
                         _ => return Err("unsupported FFI array element type".into()),
                     };
@@ -642,10 +822,9 @@ impl<'a> Interp<'a> {
                 }
                 Type::I64 => Value::Int(crate::ffi::call_i64(pointer, ints, floats)),
                 Type::Bool => Value::Bool(crate::ffi::call_i64(pointer, ints, floats) != 0),
-                Type::Enum(enumeration) => Value::Enum(
-                    *enumeration,
-                    crate::ffi::call_i64(pointer, ints, floats),
-                ),
+                Type::Enum(enumeration) => {
+                    Value::Enum(*enumeration, crate::ffi::call_i64(pointer, ints, floats))
+                }
                 ty => return Err(format!("cannot return FFI type {:?}", ty)),
             }
         };

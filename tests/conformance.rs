@@ -263,12 +263,10 @@ fn ffi_array_copyout_matches_across_host_tiers() {
          }\n",
     )
     .expect("write FFI fixture");
-    let compiled = run(
-        Command::new("clang")
-            .args(["-shared", "-o"])
-            .arg(&library)
-            .arg(&fixture),
-    );
+    let compiled = run(Command::new("clang")
+        .args(["-shared", "-o"])
+        .arg(&library)
+        .arg(&fixture));
     assert!(
         compiled.status.success(),
         "compile FFI fixture: {}",
@@ -299,4 +297,20 @@ fn ffi_array_copyout_matches_across_host_tiers() {
         );
         assert_eq!(output.stdout, b"11 13\n", "FFI array mismatch in {backend}");
     }
+}
+
+#[test]
+fn exported_array_body_is_mutable_without_changing_lulang_value_semantics() {
+    assert_success(
+        "exported_array_value_semantics",
+        "export fn touch(data: [i64]) {\n\
+           data[0] = 9\n\
+         }\n\
+         main {\n\
+           var data = arr(1, 0)\n\
+           touch(data)\n\
+           print(data[0])\n\
+         }\n",
+        b"0\n",
+    );
 }
