@@ -2,11 +2,11 @@
 //
 // Records are scalarized: a Quat is four F64 SSA values, never memory — value
 // semantics means aliasing is impossible, so nothing forces records into RAM.
-// `sum` is emitted with 4 independent accumulators: the language defines
-// reductions as order-free, so the reassociation is legal by construction.
-use crate::ast::*;
+// CFG reduction analysis emits vector accumulators when possible: the language
+// defines `sum` as order-free, so reassociation is legal by construction.
+use crate::ast::{FnDecl, Program};
 use crate::backend::layout::{components as layout_components, field_offset, Component};
-use crate::backend::optimization::{licm, scan_trusted, scan_trusted_expr};
+use crate::backend::optimization::{analyze_cfg, if_convert, inline_calls, licm, CfgAnalysis};
 use crate::check::{resolve_type, Type as CType};
 use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
 use crate::runtime;
@@ -30,6 +30,42 @@ fn comps(p: &Program, t: &CType) -> Result<Vec<cranelift_codegen::ir::Type>, Str
         .collect())
 }
 
+fn array_local_for_value(function: &ir::Function, value: ir::ValueId) -> Option<ir::LocalId> {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|inst| {
+            (inst.result == Some(value)).then(|| match inst.kind {
+                InstKind::Load(local) => Some(local),
+                _ => None,
+            })?
+        })
+}
+
+fn cfg_value_definition(
+    function: &ir::Function,
+    value: ir::ValueId,
+) -> Option<(ir::BlockId, usize, &ir::Inst)> {
+    function
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(block, contents)| {
+            contents
+                .instructions
+                .iter()
+                .enumerate()
+                .find(|(_, inst)| inst.result == Some(value))
+                .map(|(instruction, inst)| (block as ir::BlockId, instruction, inst))
+        })
+}
+
+fn cfg_value_is_load(function: &ir::Function, value: ir::ValueId, local: ir::LocalId) -> bool {
+    cfg_value_definition(function, value)
+        .is_some_and(|(_, _, inst)| matches!(inst.kind, InstKind::Load(id) if id == local))
+}
+
 struct FnInfo {
     id: FuncId,
     params: Vec<CType>,
@@ -38,7 +74,6 @@ struct FnInfo {
 
 pub struct Jit<'a> {
     p: &'a Program,
-    expr_types: &'a [Option<CType>],
     module: JITModule,
     opt_isa: cranelift_codegen::isa::OwnedTargetIsa,
     soa: bool,
@@ -51,7 +86,6 @@ pub struct Jit<'a> {
     pure_imports: std::collections::HashSet<u32>,
 }
 
-#[allow(dead_code)] // legacy AST emitters are retained only until post-migration cleanup
 impl<'a> Jit<'a> {
     pub fn run(ir: &'a LoweredProgram) -> Result<(), String> {
         let p = ir.source();
@@ -120,7 +154,6 @@ impl<'a> Jit<'a> {
             .unwrap_or(true);
         let mut jit = Jit {
             p,
-            expr_types: ir.expression_types(),
             module,
             opt_isa,
             soa,
@@ -135,9 +168,21 @@ impl<'a> Jit<'a> {
         jit.declare_imports()?;
         jit.declare_fns()?;
         for (index, f) in p.fns.iter().enumerate() {
-            jit.compile_ir_fn(&ir.functions[index], f)?;
+            let mut function = inline_calls(&ir.functions[index], &ir.functions, 3000);
+            if jit.ifconv {
+                if_convert(&mut function);
+            }
+            jit.compile_ir_fn(&function, f)?;
         }
-        let main_id = jit.compile_ir_main(ir.main.as_ref().ok_or("no `main` block in program")?)?;
+        let mut main = inline_calls(
+            ir.main.as_ref().ok_or("no `main` block in program")?,
+            &ir.functions,
+            3000,
+        );
+        if jit.ifconv {
+            if_convert(&mut main);
+        }
+        let main_id = jit.compile_ir_main(&main)?;
         jit.module
             .finalize_definitions()
             .map_err(|e| e.to_string())?;
@@ -249,6 +294,7 @@ impl<'a> Jit<'a> {
     }
 
     fn compile_ir_fn(&mut self, function: &ir::Function, decl: &FnDecl) -> Result<(), String> {
+        let analysis = analyze_cfg(function);
         let info_id = self.fns[&decl.name].id;
         let params = self.fns[&decl.name].params.clone();
         let ret = self.fns[&decl.name].ret.clone();
@@ -279,22 +325,20 @@ impl<'a> Jit<'a> {
             let incoming = b.block_params(blocks[0]).to_vec();
             let mut g = Gen {
                 p: self.p,
-                expr_types: self.expr_types,
                 b,
                 module: &mut self.module,
                 fns: &self.fns,
                 imports: &self.imports,
                 env: vec![HashMap::new()],
                 refs: HashMap::new(),
-                inline_frames: Vec::new(),
-                inline_stack: Vec::new(),
-                inline_spent: 0,
-                trusted_idx: Vec::new(),
                 soa: self.soa,
                 simd: self.simd,
-                ifconv: self.ifconv,
                 inline_math: self.inline_math,
                 inout_outs: Vec::new(),
+                cfg: &analysis,
+                cfg_trusted: HashMap::new(),
+                location: (0, 0),
+                skipped_cfg_blocks: std::collections::HashSet::new(),
             };
             g.declare_ir_locals(function)?;
             let mut cursor = 0;
@@ -328,6 +372,7 @@ impl<'a> Jit<'a> {
     }
 
     fn compile_ir_main(&mut self, function: &ir::Function) -> Result<FuncId, String> {
+        let analysis = analyze_cfg(function);
         let sig = self.module.make_signature();
         let id = self
             .module
@@ -344,22 +389,20 @@ impl<'a> Jit<'a> {
             b.switch_to_block(blocks[0]);
             let mut g = Gen {
                 p: self.p,
-                expr_types: self.expr_types,
                 b,
                 module: &mut self.module,
                 fns: &self.fns,
                 imports: &self.imports,
                 env: vec![HashMap::new()],
                 refs: HashMap::new(),
-                inline_frames: Vec::new(),
-                inline_stack: Vec::new(),
-                inline_spent: 0,
-                trusted_idx: Vec::new(),
                 soa: self.soa,
                 simd: self.simd,
-                ifconv: self.ifconv,
                 inline_math: self.inline_math,
                 inout_outs: Vec::new(),
+                cfg: &analysis,
+                cfg_trusted: HashMap::new(),
+                location: (0, 0),
+                skipped_cfg_blocks: std::collections::HashSet::new(),
             };
             g.declare_ir_locals(function)?;
             g.gen_ir_body(function, &blocks)?;
@@ -380,225 +423,28 @@ impl<'a> Jit<'a> {
         self.module.clear_context(&mut ctx);
         Ok(id)
     }
-
-    fn compile_fn(&mut self, f: &FnDecl) -> Result<(), String> {
-        let info_id = self.fns[&f.name].id;
-        let params = self.fns[&f.name].params.clone();
-        let ret = self.fns[&f.name].ret.clone();
-        let mut ctx = self.module.make_context();
-        let mut sig = self.module.make_signature();
-        for t in &params {
-            for c in comps(self.p, t)? {
-                sig.params.push(AbiParam::new(c));
-            }
-        }
-        for c in comps(self.p, &ret)? {
-            sig.returns.push(AbiParam::new(c));
-        }
-        for &io in f.inouts.iter() {
-            if io {
-                sig.params.push(AbiParam::new(types::I64));
-            }
-        }
-        ctx.func.signature = sig;
-        let mut fbc = FunctionBuilderContext::new();
-        {
-            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
-            let entry = b.create_block();
-            b.append_block_params_for_function_params(entry);
-            b.switch_to_block(entry);
-            let entry_params: Vec<Value> = b.block_params(entry).to_vec();
-            let mut g = Gen {
-                p: self.p,
-                expr_types: self.expr_types,
-                b,
-                module: &mut self.module,
-                fns: &self.fns,
-                imports: &self.imports,
-                env: vec![HashMap::new()],
-                refs: HashMap::new(),
-                inline_frames: Vec::new(),
-                inline_stack: Vec::new(),
-                inline_spent: 0,
-                trusted_idx: Vec::new(),
-                soa: self.soa,
-                simd: self.simd,
-                ifconv: self.ifconv,
-                inline_math: self.inline_math,
-                inout_outs: Vec::new(),
-            };
-            let mut cursor = 0;
-            for ((name, _), t) in f.params.iter().zip(params.iter()) {
-                let n = comps(g.p, t)?.len();
-                let vals = entry_params[cursor..cursor + n].to_vec();
-                cursor += n;
-                g.bind(name, t.clone(), &vals)?;
-            }
-            for ((name, _), &io) in f.params.iter().zip(f.inouts.iter()) {
-                if io {
-                    let ptr = entry_params[cursor];
-                    cursor += 1;
-                    let (_, vars) = g.lookup(name).unwrap();
-                    g.inout_outs.push((ptr, vars));
-                }
-            }
-            let (terminated, last) = g.gen_block(&f.body)?;
-            if !terminated {
-                if ret == CType::Unit {
-                    g.emit_inout_stores();
-                    g.b.ins().return_(&[]);
-                } else {
-                    match last {
-                        Some((t, vals)) if t == ret => {
-                            g.emit_inout_stores();
-                            g.b.ins().return_(&vals);
-                        }
-                        _ => {
-                            return Err(format!(
-                                "function `{}` may end without returning a value",
-                                f.name
-                            ))
-                        }
-                    }
-                }
-            }
-            g.b.seal_all_blocks();
-            g.b.finalize();
-        }
-        ctx.optimize(self.opt_isa.as_ref(), &mut Default::default())
-            .map_err(|e| e.to_string())?;
-        if self.do_licm {
-            licm(&mut ctx.func, &self.pure_imports);
-        }
-        self.module
-            .define_function(info_id, &mut ctx)
-            .map_err(|e| e.to_string())?;
-        self.module.clear_context(&mut ctx);
-        Ok(())
-    }
-
-    fn compile_main(&mut self) -> Result<FuncId, String> {
-        let body = self.p.main.as_ref().ok_or("no `main` block in program")?;
-        let sig = self.module.make_signature();
-        let id = self
-            .module
-            .declare_function("__lu_main", Linkage::Local, &sig)
-            .map_err(|e| e.to_string())?;
-        let mut ctx = self.module.make_context();
-        ctx.func.signature = self.module.make_signature();
-        let mut fbc = FunctionBuilderContext::new();
-        {
-            let b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
-            let mut g = Gen {
-                p: self.p,
-                expr_types: self.expr_types,
-                b,
-                module: &mut self.module,
-                fns: &self.fns,
-                imports: &self.imports,
-                env: vec![HashMap::new()],
-                refs: HashMap::new(),
-                inline_frames: Vec::new(),
-                inline_stack: Vec::new(),
-                inline_spent: 0,
-                trusted_idx: Vec::new(),
-                soa: self.soa,
-                simd: self.simd,
-                ifconv: self.ifconv,
-                inline_math: self.inline_math,
-                inout_outs: Vec::new(),
-            };
-            let entry = g.b.create_block();
-            g.b.switch_to_block(entry);
-            let (terminated, _) = g.gen_block(body)?;
-            if !terminated {
-                g.b.ins().return_(&[]);
-            }
-            g.b.seal_all_blocks();
-            g.b.finalize();
-        }
-        ctx.optimize(self.opt_isa.as_ref(), &mut Default::default())
-            .map_err(|e| e.to_string())?;
-        if self.do_licm {
-            licm(&mut ctx.func, &self.pure_imports);
-        }
-        if std::env::var("LU_DUMP").is_ok() {
-            eprintln!("{}", ctx.func.display());
-        }
-        self.module
-            .define_function(id, &mut ctx)
-            .map_err(|e| e.to_string())?;
-        self.module.clear_context(&mut ctx);
-        Ok(id)
-    }
-}
-
-/// Statement count of a body including nested blocks — the unit of the
-/// per-function inlining budget.
-fn body_size(p: &Program, stmts: &[StmtId]) -> usize {
-    let mut n = 0;
-    for &sid in stmts {
-        n += 1;
-        match p.stmt(sid) {
-            Stmt::If(_, t, e) => n += body_size(p, t) + body_size(p, e),
-            Stmt::For(_, _, _, b) | Stmt::While(_, b) => n += body_size(p, b),
-            _ => {}
-        }
-    }
-    n
-}
-
-struct InlineFrame {
-    result: Vec<Variable>,
-    cont: cranelift_codegen::ir::Block,
 }
 
 struct Gen<'a, 'b> {
     p: &'a Program,
-    expr_types: &'a [Option<CType>],
     b: FunctionBuilder<'b>,
     module: &'a mut JITModule,
     fns: &'a HashMap<String, FnInfo>,
     imports: &'a HashMap<&'static str, FuncId>,
     env: Vec<HashMap<String, (CType, Vec<Variable>)>>,
     refs: HashMap<String, cranelift_codegen::ir::FuncRef>,
-    inline_frames: Vec<InlineFrame>,
-    inline_stack: Vec<String>,
-    // statements of inlined bodies emitted into the current function; the
-    // budget stops exponential blowup on large mutually-calling functions
-    inline_spent: usize,
-    // (array ident, loop var, logical length) triples whose whole index range
-    // was checked at loop entry — accesses through them skip the per-element
-    // bounds check and reuse the hoisted length for SoA plane addressing.
-    trusted_idx: Vec<(String, String, Value)>,
     // SoA record-array layout (the default; LU_LAYOUT=aos flips it)
     soa: bool,
     // `sum` vectorization (the default; LU_SIMD=off flips it)
     simd: bool,
-    ifconv: bool,
     inline_math: bool,
     // (out-pointer, component variables) of the current fn's inout params —
     // stored through the pointer at every outlined return
     inout_outs: Vec<(Value, Vec<Variable>)>,
-}
-
-fn collect_assigned(p: &Program, stmts: &[StmtId], out: &mut Vec<String>) {
-    for &sid in stmts {
-        match p.stmt(sid) {
-            Stmt::Assign(target, _) => {
-                if let Expr::Ident(n) = p.expr(*target) {
-                    if !out.contains(n) {
-                        out.push(n.clone());
-                    }
-                }
-            }
-            Stmt::If(_, a, b) => {
-                collect_assigned(p, a, out);
-                collect_assigned(p, b, out);
-            }
-            _ => {}
-        }
-    }
+    cfg: &'a CfgAnalysis,
+    cfg_trusted: HashMap<(usize, ir::LocalId), Value>,
+    location: (ir::BlockId, usize),
+    skipped_cfg_blocks: std::collections::HashSet<ir::BlockId>,
 }
 
 impl<'a, 'b> Gen<'a, 'b> {
@@ -653,15 +499,35 @@ impl<'a, 'b> Gen<'a, 'b> {
     ) -> Result<(), String> {
         let mut values = vec![None; function.values.len()];
         for (index, block) in function.blocks.iter().enumerate() {
+            self.location.0 = index as ir::BlockId;
             if index != 0 {
                 self.b.switch_to_block(blocks[index]);
             }
-            for inst in &block.instructions {
+            if self.skipped_cfg_blocks.contains(&(index as ir::BlockId)) {
+                self.b
+                    .ins()
+                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                continue;
+            }
+            for (instruction, inst) in block.instructions.iter().enumerate() {
+                self.location.1 = instruction;
                 let result = self.gen_ir_inst(function, &values, &inst.kind, &inst.ty)?;
                 if let Some(id) = inst.result {
                     values[id as usize] =
                         Some(result.ok_or("IR value instruction produced no value")?);
                 }
+            }
+            let mut replaced_terminator = false;
+            for loop_index in 0..self.cfg.loops.len() {
+                if self.cfg.loops[loop_index].preheader == index as ir::BlockId {
+                    self.hoist_cfg_checks(function, &values, loop_index)?;
+                    if self.simd && self.emit_cfg_simd(function, &values, blocks, loop_index)? {
+                        replaced_terminator = true;
+                    }
+                }
+            }
+            if replaced_terminator {
+                continue;
             }
             match block.terminator {
                 Terminator::Jump(target) => {
@@ -699,6 +565,405 @@ impl<'a, 'b> Gen<'a, 'b> {
             }
         }
         Ok(())
+    }
+
+    fn hoist_cfg_checks(
+        &mut self,
+        function: &ir::Function,
+        values: &[Option<(CType, Vec<Value>)>],
+        loop_index: usize,
+    ) -> Result<(), String> {
+        let loop_info = &self.cfg.loops[loop_index];
+        let (_, lower) = Self::ir_value(values, loop_info.lower)?;
+        let (_, upper) = Self::ir_value(values, loop_info.upper)?;
+        for &array in &loop_info.arrays {
+            let (ty, vars) = self
+                .lookup(&Self::ir_local(array))
+                .ok_or("invalid trusted array local")?;
+            let CType::Arr(element) = ty else { continue };
+            let base = self.b.use_var(vars[0]);
+            let stored = self.b.ins().load(types::I64, MemFlags::trusted(), base, 0);
+            let stride = comps(self.p, &element)?.len() as i64;
+            let logical = if stride == 1 {
+                stored
+            } else {
+                self.b.ins().sdiv_imm(stored, stride)
+            };
+            let zero = self.b.ins().iconst(types::I64, 0);
+            let negative = self.b.ins().icmp(IntCC::SignedLessThan, lower[0], zero);
+            let over = self
+                .b
+                .ins()
+                .icmp(IntCC::SignedGreaterThan, upper[0], logical);
+            let bad = self.b.ins().bor(negative, over);
+            let oob = self.b.create_block();
+            let ok = self.b.create_block();
+            self.b.ins().brif(bad, oob, &[], ok, &[]);
+            self.b.switch_to_block(oob);
+            let r = self.callee("lu_oob");
+            self.b.ins().call(r, &[upper[0], logical]);
+            self.b.ins().jump(ok, &[]);
+            self.b.switch_to_block(ok);
+            self.cfg_trusted.insert((loop_index, array), logical);
+        }
+        let _ = function;
+        Ok(())
+    }
+
+    fn emit_cfg_simd(
+        &mut self,
+        function: &ir::Function,
+        values: &[Option<(CType, Vec<Value>)>],
+        blocks: &[cranelift_codegen::ir::Block],
+        loop_index: usize,
+    ) -> Result<bool, String> {
+        let loop_info = &self.cfg.loops[loop_index];
+        let Some(reduction) = &loop_info.reduction else {
+            return Ok(false);
+        };
+        if function.locals[reduction.accumulator as usize].ty != CType::F64
+            || !self.cfg_vector_value(function, loop_index, reduction.value)
+        {
+            return Ok(false);
+        }
+        let (_, lower) = Self::ir_value(values, loop_info.lower)?;
+        let (_, upper) = Self::ir_value(values, loop_info.upper)?;
+        let index_var = self.b.declare_var(types::I64);
+        self.b.def_var(index_var, lower[0]);
+        let vector_accs: Vec<_> = (0..4).map(|_| self.b.declare_var(types::F64X2)).collect();
+        let scalar_acc = self.b.declare_var(types::F64);
+        let zero = self.b.ins().f64const(0.0);
+        let vector_zero = self.b.ins().splat(types::F64X2, zero);
+        for accumulator in &vector_accs {
+            self.b.def_var(*accumulator, vector_zero);
+        }
+        self.b.def_var(scalar_acc, zero);
+
+        let vector_head = self.b.create_block();
+        let vector_body = self.b.create_block();
+        let scalar_head = self.b.create_block();
+        let scalar_body = self.b.create_block();
+        let finish = self.b.create_block();
+        self.b.ins().jump(vector_head, &[]);
+
+        self.b.switch_to_block(vector_head);
+        let index = self.b.use_var(index_var);
+        let after_batch = self.b.ins().iadd_imm(index, 8);
+        let fits = self
+            .b
+            .ins()
+            .icmp(IntCC::SignedLessThanOrEqual, after_batch, upper[0]);
+        self.b.ins().brif(fits, vector_body, &[], scalar_head, &[]);
+
+        self.b.switch_to_block(vector_body);
+        let batch = self.b.use_var(index_var);
+        for (lane, accumulator) in vector_accs.iter().enumerate() {
+            let at = self.b.ins().iadd_imm(batch, (lane * 2) as i64);
+            let item = self.gen_cfg_vector_value(function, loop_index, reduction.value, at)?;
+            let current = self.b.use_var(*accumulator);
+            let next = self.b.ins().fadd(current, item);
+            self.b.def_var(*accumulator, next);
+        }
+        let next_batch = self.b.ins().iadd_imm(batch, 8);
+        self.b.def_var(index_var, next_batch);
+        self.b.ins().jump(vector_head, &[]);
+
+        self.b.switch_to_block(scalar_head);
+        let index = self.b.use_var(index_var);
+        let more = self.b.ins().icmp(IntCC::SignedLessThan, index, upper[0]);
+        self.b.ins().brif(more, scalar_body, &[], finish, &[]);
+
+        self.b.switch_to_block(scalar_body);
+        let at = self.b.use_var(index_var);
+        let item = self.gen_cfg_scalar_value(function, loop_index, reduction.value, at)?;
+        let current = self.b.use_var(scalar_acc);
+        let next = self.b.ins().fadd(current, item);
+        self.b.def_var(scalar_acc, next);
+        let next_index = self.b.ins().iadd_imm(at, 1);
+        self.b.def_var(index_var, next_index);
+        self.b.ins().jump(scalar_head, &[]);
+
+        self.b.switch_to_block(finish);
+        let a0 = self.b.use_var(vector_accs[0]);
+        let a1 = self.b.use_var(vector_accs[1]);
+        let a2 = self.b.use_var(vector_accs[2]);
+        let a3 = self.b.use_var(vector_accs[3]);
+        let pairs0 = self.b.ins().fadd(a0, a1);
+        let pairs1 = self.b.ins().fadd(a2, a3);
+        let vector_total = self.b.ins().fadd(pairs0, pairs1);
+        let lane0 = self.b.ins().extractlane(vector_total, 0);
+        let lane1 = self.b.ins().extractlane(vector_total, 1);
+        let lanes = self.b.ins().fadd(lane0, lane1);
+        let scalar = self.b.use_var(scalar_acc);
+        let total = self.b.ins().fadd(lanes, scalar);
+        self.define_ir_local(reduction.accumulator, &[total])?;
+        self.b.ins().jump(blocks[loop_info.exit as usize], &[]);
+        self.skipped_cfg_blocks
+            .extend(loop_info.blocks.iter().copied());
+        Ok(true)
+    }
+
+    fn cfg_vector_value(
+        &self,
+        function: &ir::Function,
+        loop_index: usize,
+        value: ir::ValueId,
+    ) -> bool {
+        let Some((block, instruction, inst)) = cfg_value_definition(function, value) else {
+            return false;
+        };
+        match &inst.kind {
+            InstKind::Constant(Constant::F64(_) | Constant::I64(_)) => true,
+            InstKind::Load(local) => {
+                *local != self.cfg.loops[loop_index].induction
+                    && function.locals[*local as usize].ty == CType::F64
+            }
+            InstKind::Unary {
+                op: UnaryOp::Neg,
+                value,
+            } => self.cfg_vector_value(function, loop_index, *value),
+            InstKind::Binary { op, lhs, rhs }
+                if matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+                ) =>
+            {
+                self.cfg_vector_value(function, loop_index, *lhs)
+                    && self.cfg_vector_value(function, loop_index, *rhs)
+            }
+            InstKind::Index { base, index } => {
+                function.values[value as usize] == CType::F64
+                    && self.cfg.trusted_accesses.get(&(block, instruction)) == Some(&loop_index)
+                    && array_local_for_value(function, *base).is_some()
+                    && cfg_value_is_load(function, *index, self.cfg.loops[loop_index].induction)
+            }
+            InstKind::Field { base, .. } if self.soa => {
+                let Some((base_block, base_instruction, base_inst)) =
+                    cfg_value_definition(function, *base)
+                else {
+                    return false;
+                };
+                let InstKind::Index { base: array, index } = base_inst.kind else {
+                    return false;
+                };
+                function.values[value as usize] == CType::F64
+                    && self
+                        .cfg
+                        .trusted_accesses
+                        .get(&(base_block, base_instruction))
+                        == Some(&loop_index)
+                    && array_local_for_value(function, array).is_some()
+                    && cfg_value_is_load(function, index, self.cfg.loops[loop_index].induction)
+            }
+            InstKind::Call {
+                callee: Callee::Builtin(name),
+                args,
+                ..
+            } if matches!(name.as_str(), "sqrt" | "abs" | "min" | "max") => args
+                .iter()
+                .all(|value| self.cfg_vector_value(function, loop_index, *value)),
+            _ => false,
+        }
+    }
+
+    fn gen_cfg_vector_value(
+        &mut self,
+        function: &ir::Function,
+        loop_index: usize,
+        value: ir::ValueId,
+        index: Value,
+    ) -> Result<Value, String> {
+        let (_, _, inst) =
+            cfg_value_definition(function, value).ok_or("missing vector value definition")?;
+        Ok(match &inst.kind {
+            InstKind::Constant(Constant::F64(value)) => {
+                let scalar = self.b.ins().f64const(*value);
+                self.b.ins().splat(types::F64X2, scalar)
+            }
+            InstKind::Constant(Constant::I64(value)) => {
+                let scalar = self.b.ins().f64const(*value as f64);
+                self.b.ins().splat(types::F64X2, scalar)
+            }
+            InstKind::Load(local) => {
+                let (_, vars) = self
+                    .lookup(&Self::ir_local(*local))
+                    .ok_or("missing vector invariant")?;
+                let scalar = self.b.use_var(vars[0]);
+                self.b.ins().splat(types::F64X2, scalar)
+            }
+            InstKind::Unary { value, .. } => {
+                let inner = self.gen_cfg_vector_value(function, loop_index, *value, index)?;
+                self.b.ins().fneg(inner)
+            }
+            InstKind::Binary { op, lhs, rhs } => {
+                let lhs = self.gen_cfg_vector_value(function, loop_index, *lhs, index)?;
+                let rhs = self.gen_cfg_vector_value(function, loop_index, *rhs, index)?;
+                match op {
+                    BinaryOp::Add => self.b.ins().fadd(lhs, rhs),
+                    BinaryOp::Sub => self.b.ins().fsub(lhs, rhs),
+                    BinaryOp::Mul => self.b.ins().fmul(lhs, rhs),
+                    BinaryOp::Div => self.b.ins().fdiv(lhs, rhs),
+                    _ => return Err("unsupported vector binary".into()),
+                }
+            }
+            InstKind::Index { base, .. } => {
+                let local =
+                    array_local_for_value(function, *base).ok_or("missing vector array local")?;
+                let (_, vars) = self
+                    .lookup(&Self::ir_local(local))
+                    .ok_or("missing vector array")?;
+                let base = self.b.use_var(vars[0]);
+                let bytes = self.b.ins().imul_imm(index, 8);
+                let data = self.b.ins().iadd_imm(base, 8);
+                let address = self.b.ins().iadd(data, bytes);
+                self.b
+                    .ins()
+                    .load(types::F64X2, MemFlags::trusted(), address, 0)
+            }
+            InstKind::Field {
+                base,
+                record,
+                field,
+            } => {
+                let (_, _, indexed) =
+                    cfg_value_definition(function, *base).ok_or("missing field base")?;
+                let InstKind::Index { base: array, .. } = indexed.kind else {
+                    return Err("vector field base is not an index".into());
+                };
+                let local =
+                    array_local_for_value(function, array).ok_or("missing field array local")?;
+                let (_, vars) = self
+                    .lookup(&Self::ir_local(local))
+                    .ok_or("missing field array")?;
+                let base = self.b.use_var(vars[0]);
+                let field_name = &self.p.types[*record].fields[*field].0;
+                let (component, _) = field_offset(self.p, *record, field_name)?;
+                let logical = self.cfg_trusted[&(loop_index, local)];
+                let data = self.b.ins().iadd_imm(base, 8);
+                let plane = self.b.ins().imul_imm(logical, (component * 8) as i64);
+                let lane = self.b.ins().imul_imm(index, 8);
+                let start = self.b.ins().iadd(data, plane);
+                let address = self.b.ins().iadd(start, lane);
+                self.b
+                    .ins()
+                    .load(types::F64X2, MemFlags::trusted(), address, 0)
+            }
+            InstKind::Call {
+                callee: Callee::Builtin(name),
+                args,
+                ..
+            } => {
+                let args = args
+                    .iter()
+                    .map(|value| self.gen_cfg_vector_value(function, loop_index, *value, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                match name.as_str() {
+                    "sqrt" => self.b.ins().sqrt(args[0]),
+                    "abs" => self.b.ins().fabs(args[0]),
+                    "min" => self.b.ins().fmin(args[0], args[1]),
+                    "max" => self.b.ins().fmax(args[0], args[1]),
+                    _ => return Err("unsupported vector builtin".into()),
+                }
+            }
+            _ => return Err("unsupported vector value".into()),
+        })
+    }
+
+    fn gen_cfg_scalar_value(
+        &mut self,
+        function: &ir::Function,
+        loop_index: usize,
+        value: ir::ValueId,
+        index: Value,
+    ) -> Result<Value, String> {
+        let (_, _, inst) =
+            cfg_value_definition(function, value).ok_or("missing scalar value definition")?;
+        Ok(match &inst.kind {
+            InstKind::Constant(Constant::F64(value)) => self.b.ins().f64const(*value),
+            InstKind::Constant(Constant::I64(value)) => self.b.ins().f64const(*value as f64),
+            InstKind::Load(local) if *local == self.cfg.loops[loop_index].induction => index,
+            InstKind::Load(local) => {
+                let (_, vars) = self
+                    .lookup(&Self::ir_local(*local))
+                    .ok_or("missing scalar invariant")?;
+                self.b.use_var(vars[0])
+            }
+            InstKind::Unary { value, .. } => {
+                let inner = self.gen_cfg_scalar_value(function, loop_index, *value, index)?;
+                self.b.ins().fneg(inner)
+            }
+            InstKind::Binary { op, lhs, rhs } => {
+                let lhs = self.gen_cfg_scalar_value(function, loop_index, *lhs, index)?;
+                let rhs = self.gen_cfg_scalar_value(function, loop_index, *rhs, index)?;
+                match op {
+                    BinaryOp::Add => self.b.ins().fadd(lhs, rhs),
+                    BinaryOp::Sub => self.b.ins().fsub(lhs, rhs),
+                    BinaryOp::Mul => self.b.ins().fmul(lhs, rhs),
+                    BinaryOp::Div => self.b.ins().fdiv(lhs, rhs),
+                    _ => return Err("unsupported scalar binary".into()),
+                }
+            }
+            InstKind::Index { base, .. } => {
+                let local =
+                    array_local_for_value(function, *base).ok_or("missing scalar array local")?;
+                let (_, vars) = self
+                    .lookup(&Self::ir_local(local))
+                    .ok_or("missing scalar array")?;
+                let base = self.b.use_var(vars[0]);
+                let address = self.b.ins().imul_imm(index, 8);
+                let data = self.b.ins().iadd_imm(base, 8);
+                let address = self.b.ins().iadd(data, address);
+                self.b
+                    .ins()
+                    .load(types::F64, MemFlags::trusted(), address, 0)
+            }
+            InstKind::Field {
+                base,
+                record,
+                field,
+            } => {
+                let (_, _, indexed) =
+                    cfg_value_definition(function, *base).ok_or("missing scalar field base")?;
+                let InstKind::Index { base: array, .. } = indexed.kind else {
+                    return Err("scalar field base is not an index".into());
+                };
+                let local =
+                    array_local_for_value(function, array).ok_or("missing scalar field local")?;
+                let (_, vars) = self
+                    .lookup(&Self::ir_local(local))
+                    .ok_or("missing scalar field array")?;
+                let base = self.b.use_var(vars[0]);
+                let field_name = &self.p.types[*record].fields[*field].0;
+                let (component, _) = field_offset(self.p, *record, field_name)?;
+                let logical = self.cfg_trusted[&(loop_index, local)];
+                let data = self.b.ins().iadd_imm(base, 8);
+                let plane = self.b.ins().imul_imm(logical, (component * 8) as i64);
+                let lane = self.b.ins().imul_imm(index, 8);
+                let start = self.b.ins().iadd(data, plane);
+                let address = self.b.ins().iadd(start, lane);
+                self.b
+                    .ins()
+                    .load(types::F64, MemFlags::trusted(), address, 0)
+            }
+            InstKind::Call {
+                callee: Callee::Builtin(name),
+                args,
+                ..
+            } => {
+                let args = args
+                    .iter()
+                    .map(|value| self.gen_cfg_scalar_value(function, loop_index, *value, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                match name.as_str() {
+                    "sqrt" => self.b.ins().sqrt(args[0]),
+                    "abs" => self.b.ins().fabs(args[0]),
+                    "min" => self.b.ins().fmin(args[0], args[1]),
+                    "max" => self.b.ins().fmax(args[0], args[1]),
+                    _ => return Err("unsupported scalar builtin".into()),
+                }
+            }
+            _ => return Err("unsupported scalar reduction value".into()),
+        })
     }
 
     fn gen_ir_inst(
@@ -759,6 +1024,23 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let (rhs_ty, rhs) = value(*rhs)?;
                 Some(self.gen_ir_binary(*op, lhs_ty, lhs, rhs_ty, rhs)?)
             }
+            InstKind::Select {
+                condition,
+                then_value,
+                else_value,
+            } => {
+                let (_, condition) = value(*condition)?;
+                let (then_ty, then_values) = value(*then_value)?;
+                let (_, else_values) = value(*else_value)?;
+                Some((
+                    then_ty,
+                    then_values
+                        .iter()
+                        .zip(else_values)
+                        .map(|(&yes, no)| self.b.ins().select(condition[0], yes, no))
+                        .collect(),
+                ))
+            }
             InstKind::Call {
                 callee,
                 args,
@@ -771,7 +1053,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 Some(match callee {
                     Callee::Builtin(name) => {
                         let (types, vals): (Vec<_>, Vec<_>) = args.into_iter().unzip();
-                        self.gen_call(name, types, vals, &[])?
+                        self.gen_call(name, types, vals)?
                     }
                     Callee::Function(id) => self.gen_ir_user_call(*id, args, inout)?,
                 })
@@ -788,9 +1070,18 @@ impl<'a, 'b> Gen<'a, 'b> {
                 Some((field_ty, vals[off..off + width].to_vec()))
             }
             InstKind::Index { base, index } => {
+                let base_id = *base;
                 let (base_ty, base) = value(*base)?;
                 let (_, index) = value(*index)?;
-                Some(self.gen_ir_index(base_ty, base, index[0])?)
+                let trusted =
+                    self.cfg
+                        .trusted_accesses
+                        .get(&self.location)
+                        .and_then(|loop_index| {
+                            let array = array_local_for_value(function, base_id)?;
+                            self.cfg_trusted.get(&(*loop_index, array)).copied()
+                        });
+                Some(self.gen_ir_index(base_ty, base, index[0], trusted)?)
             }
             InstKind::Array(items) => {
                 let items = items
@@ -820,13 +1111,22 @@ impl<'a, 'b> Gen<'a, 'b> {
                 index,
                 value: stored,
             } => {
+                let base_id = *base;
                 let (base_ty, base) = value(*base)?;
                 let (_, index) = value(*index)?;
                 let (_, stored) = value(*stored)?;
                 let CType::Arr(elem) = base_ty else {
                     return Err("IR set-index on non-array".into());
                 };
-                let addrs = self.elem_addrs(base[0], index[0], &elem, None)?;
+                let trusted =
+                    self.cfg
+                        .trusted_accesses
+                        .get(&self.location)
+                        .and_then(|loop_index| {
+                            let array = array_local_for_value(function, base_id)?;
+                            self.cfg_trusted.get(&(*loop_index, array)).copied()
+                        });
+                let addrs = self.elem_addrs(base[0], index[0], &elem, trusted)?;
                 for (reg, addr) in stored.iter().zip(addrs) {
                     self.b.ins().store(MemFlags::trusted(), *reg, addr, 0);
                 }
@@ -859,20 +1159,6 @@ impl<'a, 'b> Gen<'a, 'b> {
         })
     }
 
-    fn bind(&mut self, name: &str, t: CType, vals: &[Value]) -> Result<(), String> {
-        let mut vars = Vec::new();
-        for (i, c) in comps(self.p, &t)?.into_iter().enumerate() {
-            let v = self.b.declare_var(c);
-            self.b.def_var(v, vals[i]);
-            vars.push(v);
-        }
-        self.env
-            .last_mut()
-            .unwrap()
-            .insert(name.to_string(), (t, vars));
-        Ok(())
-    }
-
     fn lookup(&self, name: &str) -> Option<(CType, Vec<Variable>)> {
         self.env.iter().rev().find_map(|s| s.get(name).cloned())
     }
@@ -898,205 +1184,6 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.inst_results(call).to_vec()
     }
 
-    fn gen_block(
-        &mut self,
-        stmts: &[StmtId],
-    ) -> Result<(bool, Option<(CType, Vec<Value>)>), String> {
-        self.env.push(HashMap::new());
-        let mut last = None;
-        for &sid in stmts {
-            match self.gen_stmt(sid)? {
-                StmtOut::Value(v) => last = v,
-                StmtOut::Terminated => {
-                    self.env.pop();
-                    return Ok((true, None));
-                }
-            }
-        }
-        self.env.pop();
-        Ok((false, last))
-    }
-
-    fn gen_stmt(&mut self, sid: StmtId) -> Result<StmtOut, String> {
-        match self.p.stmt(sid) {
-            Stmt::Let(n, e) | Stmt::Var(n, e) => {
-                let (t, vals) = self.gen_expr(*e)?;
-                self.bind(n, t, &vals)?;
-                Ok(StmtOut::Value(None))
-            }
-            Stmt::Assign(target, e) => {
-                let (_, vals) = self.gen_expr(*e)?;
-                match self.p.expr(*target) {
-                    Expr::Ident(n) => {
-                        let (_, vars) =
-                            self.lookup(n).ok_or(format!("unknown variable `{}`", n))?;
-                        for (var, val) in vars.iter().zip(vals.iter()) {
-                            self.b.def_var(*var, *val);
-                        }
-                    }
-                    Expr::Index(a, i) => {
-                        let trusted = self.is_trusted(*a, *i);
-                        let (at, avals) = self.gen_expr(*a)?;
-                        let (_, ivals) = self.gen_expr(*i)?;
-                        let elem = match at {
-                            CType::Arr(e) => *e,
-                            _ => return Err("cannot index non-array".into()),
-                        };
-                        let addrs = self.elem_addrs(avals[0], ivals[0], &elem, trusted)?;
-                        for (v, a) in vals.iter().zip(addrs.iter()) {
-                            self.b.ins().store(MemFlags::trusted(), *v, *a, 0);
-                        }
-                    }
-                    Expr::Field(_, _) => {
-                        let mut path = Vec::new();
-                        let mut cur = *target;
-                        let root = loop {
-                            match self.p.expr(cur) {
-                                Expr::Field(b, f) => {
-                                    path.push(f.clone());
-                                    cur = *b;
-                                }
-                                Expr::Ident(n) => break n.clone(),
-                                _ => return Err("field assignment root must be a variable".into()),
-                            }
-                        };
-                        path.reverse();
-                        let (mut t, vars) = self
-                            .lookup(&root)
-                            .ok_or(format!("unknown variable `{}`", root))?;
-                        let mut off = 0;
-                        for f in &path {
-                            match t {
-                                CType::Rec(ti) => {
-                                    let (o, ft) = field_offset(self.p, ti, f)?;
-                                    off += o;
-                                    t = ft;
-                                }
-                                t => return Err(format!("cannot assign field on {:?}", t)),
-                            }
-                        }
-                        for (k, v) in vals.iter().enumerate() {
-                            self.b.def_var(vars[off + k], *v);
-                        }
-                    }
-                    _ => return Err("invalid assignment target".into()),
-                }
-                Ok(StmtOut::Value(None))
-            }
-            Stmt::If(c, then_s, else_s) => {
-                if self.ifconv {
-                    if let Some(assigned) = self.ifconv_candidate(then_s, else_s) {
-                        return self.gen_if_select(*c, then_s, else_s, &assigned);
-                    }
-                }
-                let (_, cv) = self.gen_expr(*c)?;
-                let then_b = self.b.create_block();
-                let else_b = self.b.create_block();
-                let merge = self.b.create_block();
-                self.b.ins().brif(cv[0], then_b, &[], else_b, &[]);
-                self.b.switch_to_block(then_b);
-                let (t_term, _) = self.gen_block(then_s)?;
-                if !t_term {
-                    self.b.ins().jump(merge, &[]);
-                }
-                self.b.switch_to_block(else_b);
-                let (e_term, _) = self.gen_block(else_s)?;
-                if !e_term {
-                    self.b.ins().jump(merge, &[]);
-                }
-                if t_term && e_term {
-                    // merge is unreachable but must still be a well-formed block
-                    self.b.switch_to_block(merge);
-                    self.b
-                        .ins()
-                        .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
-                    return Ok(StmtOut::Terminated);
-                }
-                self.b.switch_to_block(merge);
-                Ok(StmtOut::Value(None))
-            }
-            Stmt::While(c, body) => {
-                let header = self.b.create_block();
-                let body_b = self.b.create_block();
-                let exit = self.b.create_block();
-                self.b.ins().jump(header, &[]);
-                self.b.switch_to_block(header);
-                let (_, cv) = self.gen_expr(*c)?;
-                self.b.ins().brif(cv[0], body_b, &[], exit, &[]);
-                self.b.switch_to_block(body_b);
-                let (term, _) = self.gen_block(body)?;
-                if !term {
-                    self.b.ins().jump(header, &[]);
-                }
-                self.b.switch_to_block(exit);
-                Ok(StmtOut::Value(None))
-            }
-            Stmt::For(v, lo, hi, body) => {
-                let (_, lov) = self.gen_expr(*lo)?;
-                let (_, hiv) = self.gen_expr(*hi)?;
-                let pushed = match scan_trusted(self.p, body, v) {
-                    Some(arrays) => self.hoist_checks(&arrays, v, lov[0], hiv[0]),
-                    None => 0,
-                };
-                let ivar = self.b.declare_var(types::I64);
-                self.b.def_var(ivar, lov[0]);
-                let header = self.b.create_block();
-                let body_b = self.b.create_block();
-                let exit = self.b.create_block();
-                self.b.ins().jump(header, &[]);
-                self.b.switch_to_block(header);
-                let iv = self.b.use_var(ivar);
-                let cond = self.b.ins().icmp(IntCC::SignedLessThan, iv, hiv[0]);
-                self.b.ins().brif(cond, body_b, &[], exit, &[]);
-                self.b.switch_to_block(body_b);
-                self.env.push(HashMap::new());
-                self.env
-                    .last_mut()
-                    .unwrap()
-                    .insert(v.clone(), (CType::I64, vec![ivar]));
-                let (term, _) = self.gen_block(body)?;
-                self.env.pop();
-                if !term {
-                    let iv2 = self.b.use_var(ivar);
-                    let one = self.b.ins().iconst(types::I64, 1);
-                    let next = self.b.ins().iadd(iv2, one);
-                    self.b.def_var(ivar, next);
-                    self.b.ins().jump(header, &[]);
-                }
-                self.b.switch_to_block(exit);
-                self.trusted_idx.truncate(self.trusted_idx.len() - pushed);
-                Ok(StmtOut::Value(None))
-            }
-            Stmt::Return(e) => {
-                let vals = match e {
-                    Some(e) => self.gen_expr(*e)?.1,
-                    None => Vec::new(),
-                };
-                if let Some(frame) = self.inline_frames.last() {
-                    let result = frame.result.clone();
-                    let cont = frame.cont;
-                    for (var, val) in result.iter().zip(vals.iter()) {
-                        self.b.def_var(*var, *val);
-                    }
-                    self.b.ins().jump(cont, &[]);
-                } else {
-                    self.emit_inout_stores();
-                    self.b.ins().return_(&vals);
-                }
-                Ok(StmtOut::Terminated)
-            }
-            Stmt::Expr(e) => {
-                let out = self.gen_expr(*e)?;
-                Ok(StmtOut::Value(Some(out)))
-            }
-        }
-    }
-
-    /// Per-component addresses of element `idx`. Scalar arrays and AoS
-    /// records: components contiguous at base+8+(idx*stride+c)*8. SoA records
-    /// (the default — compiler-owned layout): component c lives in its own
-    /// plane of `n` slots at base+8+(c*n+idx)*8. `trusted` carries the
-    /// loop-hoisted logical length when the bounds check was already done.
     fn elem_addrs(
         &mut self,
         base: Value,
@@ -1163,214 +1250,6 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.ins().call(r, &[idx, len]);
         self.b.ins().jump(ok, &[]);
         self.b.switch_to_block(ok);
-    }
-
-    fn is_trusted(&self, a: ExprId, i: ExprId) -> Option<Value> {
-        if let (Expr::Ident(an), Expr::Ident(inm)) = (self.p.expr(a), self.p.expr(i)) {
-            self.trusted_idx
-                .iter()
-                .find(|(x, y, _)| x == an && y == inm)
-                .map(|(_, _, n)| *n)
-        } else {
-            None
-        }
-    }
-
-    /// Emit one whole-range check per array at loop entry, then mark (array, var)
-    /// trusted so body accesses skip per-element checks. Returns how many pairs
-    /// were pushed (caller truncates trusted_idx back after the loop).
-    fn hoist_checks(&mut self, arrays: &[String], var: &str, lo: Value, hi: Value) -> usize {
-        let mut pushed = 0;
-        for name in arrays {
-            let Some((CType::Arr(elem), vars)) = self.lookup(name) else {
-                continue;
-            };
-            let stride = match comps(self.p, &elem) {
-                Ok(c) => c.len() as i64,
-                Err(_) => continue,
-            };
-            let base = self.b.use_var(vars[0]);
-            let len = self.b.ins().load(types::I64, MemFlags::trusted(), base, 0);
-            let logical = if stride == 1 {
-                len
-            } else {
-                let s = self.b.ins().iconst(types::I64, stride);
-                self.b.ins().sdiv(len, s)
-            };
-            let zero = self.b.ins().iconst(types::I64, 0);
-            let neg = self.b.ins().icmp(IntCC::SignedLessThan, lo, zero);
-            let over = self.b.ins().icmp(IntCC::SignedGreaterThan, hi, logical);
-            let bad = self.b.ins().bor(neg, over);
-            let oob = self.b.create_block();
-            let ok = self.b.create_block();
-            self.b.ins().brif(bad, oob, &[], ok, &[]);
-            self.b.switch_to_block(oob);
-            let r = self.callee("lu_oob");
-            self.b.ins().call(r, &[hi, logical]);
-            self.b.ins().jump(ok, &[]);
-            self.b.switch_to_block(ok);
-            self.trusted_idx
-                .push((name.clone(), var.to_string(), logical));
-            pushed += 1;
-        }
-        pushed
-    }
-
-    fn gen_expr(&mut self, eid: ExprId) -> Result<(CType, Vec<Value>), String> {
-        match self.p.expr(eid) {
-            Expr::Int(v) => {
-                let c = self.b.ins().iconst(types::I64, *v);
-                Ok((CType::I64, vec![c]))
-            }
-            Expr::Float(v) => {
-                let c = self.b.ins().f64const(*v);
-                Ok((CType::F64, vec![c]))
-            }
-            Expr::Bool(v) => {
-                let c = self.b.ins().iconst(types::I64, *v as i64);
-                Ok((CType::Bool, vec![c]))
-            }
-            Expr::Str(s) => {
-                let ptr = self.b.ins().iconst(types::I64, s.as_ptr() as i64);
-                let len = self.b.ins().iconst(types::I64, s.len() as i64);
-                Ok((CType::Str, vec![ptr, len]))
-            }
-            Expr::Ident(n) => {
-                let (t, vars) = self.lookup(n).ok_or(format!("unknown variable `{}`", n))?;
-                let vals: Vec<Value> = vars.iter().map(|&v| self.b.use_var(v)).collect();
-                Ok((t, vals))
-            }
-            Expr::Un(op, e) => {
-                let (t, vals) = self.gen_expr(*e)?;
-                match (op.as_str(), &t) {
-                    ("-", CType::F64) => {
-                        let v = self.b.ins().fneg(vals[0]);
-                        Ok((CType::F64, vec![v]))
-                    }
-                    ("-", CType::I64) => {
-                        let v = self.b.ins().ineg(vals[0]);
-                        Ok((CType::I64, vec![v]))
-                    }
-                    ("not", CType::Bool) => {
-                        let v = self.b.ins().bxor_imm(vals[0], 1);
-                        Ok((CType::Bool, vec![v]))
-                    }
-                    _ => Err(format!("cannot apply `{}` here", op)),
-                }
-            }
-            Expr::Bin(op, l, r) => self.gen_bin(op.clone(), *l, *r),
-            Expr::Circum(open, e) => {
-                let fname = self.p.circum_ops[open].1.clone();
-                let (_, vals) = self.gen_expr(*e)?;
-                self.gen_user_call(&fname, vals, None)
-            }
-            Expr::Field(e, fname) => {
-                let (t, vals) = self.gen_expr(*e)?;
-                match t {
-                    CType::Rec(ti) => {
-                        let (off, ft) = field_offset(self.p, ti, fname)?;
-                        let w = comps(self.p, &ft)?.len();
-                        Ok((ft, vals[off..off + w].to_vec()))
-                    }
-                    _ => Err(format!("cannot access field `{}`", fname)),
-                }
-            }
-            Expr::Index(a, i) => {
-                let trusted = self.is_trusted(*a, *i);
-                let (at, avals) = self.gen_expr(*a)?;
-                let (_, ivals) = self.gen_expr(*i)?;
-                if at == CType::Str {
-                    self.check_idx(ivals[0], avals[1]);
-                    let addr = self.b.ins().iadd(avals[0], ivals[0]);
-                    let byte = self
-                        .b
-                        .ins()
-                        .uload8(types::I64, MemFlags::trusted(), addr, 0);
-                    return Ok((CType::I64, vec![byte]));
-                }
-                let elem = match at {
-                    CType::Arr(e) => *e,
-                    _ => return Err("cannot index non-array".into()),
-                };
-                let addrs = self.elem_addrs(avals[0], ivals[0], &elem, trusted)?;
-                let mut out = Vec::new();
-                for (c, a) in comps(self.p, &elem)?.into_iter().zip(addrs) {
-                    out.push(self.b.ins().load(c, MemFlags::trusted(), a, 0));
-                }
-                Ok((elem, out))
-            }
-            Expr::Array(items) => {
-                let mut generated = Vec::with_capacity(items.len());
-                for &item in items {
-                    generated.push(self.gen_expr(item)?);
-                }
-                let elem = generated
-                    .first()
-                    .map(|(ty, _)| ty.clone())
-                    .ok_or("cannot lower an empty array literal")?;
-                let stride = comps(self.p, &elem)?.len() as i64;
-                let logical = self.b.ins().iconst(types::I64, generated.len() as i64);
-                let stride_val = self.b.ins().iconst(types::I64, stride);
-                let base = self.call_import("lu_arr_new_raw", &[logical, stride_val])[0];
-                for (i, (ty, mut vals)) in generated.into_iter().enumerate() {
-                    if elem == CType::F64 && ty == CType::I64 {
-                        vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
-                    }
-                    let idx = self.b.ins().iconst(types::I64, i as i64);
-                    let addrs = self.elem_addrs(base, idx, &elem, Some(logical))?;
-                    for (v, addr) in vals.into_iter().zip(addrs) {
-                        self.b.ins().store(MemFlags::trusted(), v, addr, 0);
-                    }
-                }
-                Ok((CType::Arr(Box::new(elem)), vec![base]))
-            }
-            Expr::Record(name, inits) => {
-                let ti = self
-                    .p
-                    .types
-                    .iter()
-                    .position(|t| t.name == *name)
-                    .ok_or(format!("unknown type `{}`", name))?;
-                let decl = &self.p.types[ti];
-                let mut slots: Vec<Option<Vec<Value>>> = vec![None; decl.fields.len()];
-                for (pos, (fname, e)) in inits.iter().enumerate() {
-                    let idx = match fname {
-                        Some(f) => decl.fields.iter().position(|(n, _)| n == f).unwrap(),
-                        None => pos,
-                    };
-                    let want = resolve_type(self.p, &decl.fields[idx].1)?;
-                    let (got, mut vals) = self.gen_expr(*e)?;
-                    if want == CType::F64 && got == CType::I64 {
-                        vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
-                    }
-                    slots[idx] = Some(vals);
-                }
-                let mut out = Vec::new();
-                for s in slots {
-                    out.extend(s.expect("checker guarantees all fields initialized"));
-                }
-                Ok((CType::Rec(ti), out))
-            }
-            Expr::EnumVal(en, vn) => {
-                let (ei, tag) = self
-                    .p
-                    .enum_tag(en, vn)
-                    .ok_or(format!("unknown enum value `{}.{}`", en, vn))?;
-                let c = self.b.ins().iconst(types::I64, tag);
-                Ok((CType::Enum(ei), vec![c]))
-            }
-            Expr::Sum { var, lo, hi, body } => self.gen_sum(var.clone(), *lo, *hi, *body),
-            Expr::Call(name, args) => {
-                let mut avals = Vec::new();
-                let mut atys = Vec::new();
-                for &a in args {
-                    let (t, vs) = self.gen_expr(a)?;
-                    atys.push(t);
-                    avals.push(vs);
-                }
-                self.gen_call(name, atys, avals, args)
-            }
-        }
     }
 
     fn f64_of(&mut self, t: &CType, v: Value) -> Value {
@@ -1481,6 +1360,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         base_ty: CType,
         base: Vec<Value>,
         index: Value,
+        trusted: Option<Value>,
     ) -> Result<(CType, Vec<Value>), String> {
         if base_ty == CType::Str {
             self.check_idx(index, base[1]);
@@ -1494,7 +1374,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let CType::Arr(elem) = base_ty else {
             return Err("IR index on non-array".into());
         };
-        let addrs = self.elem_addrs(base[0], index, &elem, None)?;
+        let addrs = self.elem_addrs(base[0], index, &elem, trusted)?;
         let mut out = Vec::new();
         for (component, addr) in comps(self.p, &elem)?.into_iter().zip(addrs) {
             out.push(self.b.ins().load(component, MemFlags::trusted(), addr, 0));
@@ -1576,127 +1456,6 @@ impl<'a, 'b> Gen<'a, 'b> {
         Ok((ret, result))
     }
 
-    fn gen_bin(&mut self, op: String, l: ExprId, r: ExprId) -> Result<(CType, Vec<Value>), String> {
-        // `and`/`or` are short-circuit by language semantics: the right side
-        // must not evaluate (it may index past a bound the left side guards)
-        if op == "and" || op == "or" {
-            let (_, lv) = self.gen_expr(l)?;
-            let res = self.b.declare_var(types::I64);
-            self.b.def_var(res, lv[0]);
-            let rhs_b = self.b.create_block();
-            let merge = self.b.create_block();
-            if op == "and" {
-                self.b.ins().brif(lv[0], rhs_b, &[], merge, &[]);
-            } else {
-                self.b.ins().brif(lv[0], merge, &[], rhs_b, &[]);
-            }
-            self.b.switch_to_block(rhs_b);
-            let (_, rv) = self.gen_expr(r)?;
-            self.b.def_var(res, rv[0]);
-            self.b.ins().jump(merge, &[]);
-            self.b.switch_to_block(merge);
-            let out = self.b.use_var(res);
-            return Ok((CType::Bool, vec![out]));
-        }
-        if let Some(fname) = self.p.infix_ops.get(&op).cloned() {
-            let (lt, lv) = self.gen_expr(l)?;
-            let (rt, rv) = self.gen_expr(r)?;
-            let info = &self.fns[&fname];
-            let mut args = Vec::new();
-            for ((t, vals), want) in [(lt, lv), (rt, rv)].into_iter().zip(info.params.clone()) {
-                if want == CType::F64 && t == CType::I64 {
-                    args.push(self.b.ins().fcvt_from_sint(types::F64, vals[0]));
-                } else {
-                    args.extend(vals);
-                }
-            }
-            return self.gen_user_call(&fname, args, None);
-        }
-        let (lt, lv) = self.gen_expr(l)?;
-        let (rt, rv) = self.gen_expr(r)?;
-        match op.as_str() {
-            // `and`/`or` never reach here — handled short-circuit above
-            "+" | "-" | "*" | "/" | "%" => {
-                if lt == CType::I64 && rt == CType::I64 {
-                    let v = match op.as_str() {
-                        "+" => self.b.ins().iadd(lv[0], rv[0]),
-                        "-" => self.b.ins().isub(lv[0], rv[0]),
-                        "*" => self.b.ins().imul(lv[0], rv[0]),
-                        "/" => self.checked_int_div(lv[0], rv[0], false),
-                        _ => self.checked_int_div(lv[0], rv[0], true),
-                    };
-                    Ok((CType::I64, vec![v]))
-                } else {
-                    let a = self.f64_of(&lt, lv[0]);
-                    let b = self.f64_of(&rt, rv[0]);
-                    let v = match op.as_str() {
-                        "+" => self.b.ins().fadd(a, b),
-                        "-" => self.b.ins().fsub(a, b),
-                        "*" => self.b.ins().fmul(a, b),
-                        "/" => self.b.ins().fdiv(a, b),
-                        _ => self.call_import("lu_fmod", &[a, b])[0],
-                    };
-                    Ok((CType::F64, vec![v]))
-                }
-            }
-            "==" | "!=" if lt == CType::Str && rt == CType::Str => {
-                let eq = self.call_import("lu_str_eq", &[lv[0], lv[1], rv[0], rv[1]])[0];
-                let v = if op == "!=" {
-                    self.b.ins().bxor_imm(eq, 1)
-                } else {
-                    eq
-                };
-                Ok((CType::Bool, vec![v]))
-            }
-            "==" | "!=" | "<" | "<=" | ">" | ">=" => {
-                let both_int = matches!(lt, CType::I64 | CType::Bool | CType::Enum(_))
-                    && matches!(rt, CType::I64 | CType::Bool | CType::Enum(_));
-                let c8 = if both_int {
-                    let cc = match op.as_str() {
-                        "==" => IntCC::Equal,
-                        "!=" => IntCC::NotEqual,
-                        "<" => IntCC::SignedLessThan,
-                        "<=" => IntCC::SignedLessThanOrEqual,
-                        ">" => IntCC::SignedGreaterThan,
-                        _ => IntCC::SignedGreaterThanOrEqual,
-                    };
-                    self.b.ins().icmp(cc, lv[0], rv[0])
-                } else {
-                    let a = self.f64_of(&lt, lv[0]);
-                    let b = self.f64_of(&rt, rv[0]);
-                    let cc = match op.as_str() {
-                        "==" => FloatCC::Equal,
-                        "!=" => FloatCC::NotEqual,
-                        "<" => FloatCC::LessThan,
-                        "<=" => FloatCC::LessThanOrEqual,
-                        ">" => FloatCC::GreaterThan,
-                        _ => FloatCC::GreaterThanOrEqual,
-                    };
-                    self.b.ins().fcmp(cc, a, b)
-                };
-                let v = self.b.ins().uextend(types::I64, c8);
-                Ok((CType::Bool, vec![v]))
-            }
-            "~=" | "\u{2248}" => {
-                let a = self.f64_of(&lt, lv[0]);
-                let bv = self.f64_of(&rt, rv[0]);
-                let diff = self.b.ins().fsub(a, bv);
-                let adiff = self.b.ins().fabs(diff);
-                let aa = self.b.ins().fabs(a);
-                let ab = self.b.ins().fabs(bv);
-                let mx = self.b.ins().fmax(aa, ab);
-                let rtol = self.b.ins().f64const(RTOL);
-                let atol = self.b.ins().f64const(ATOL);
-                let scaled = self.b.ins().fmul(mx, rtol);
-                let tol = self.b.ins().fadd(scaled, atol);
-                let c8 = self.b.ins().fcmp(FloatCC::LessThanOrEqual, adiff, tol);
-                let v = self.b.ins().uextend(types::I64, c8);
-                Ok((CType::Bool, vec![v]))
-            }
-            op => Err(format!("unknown operator `{}`", op)),
-        }
-    }
-
     fn checked_int_div(&mut self, lhs: Value, rhs: Value, remainder: bool) -> Value {
         let name = if remainder {
             "lu_i64_rem"
@@ -1706,349 +1465,6 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.call_import(name, &[lhs, rhs])[0]
     }
 
-    fn gen_sum(
-        &mut self,
-        var: String,
-        lo: ExprId,
-        hi: ExprId,
-        body: ExprId,
-    ) -> Result<(CType, Vec<Value>), String> {
-        let expected_body_ty = self.expr_types[body as usize]
-            .clone()
-            .expect("reachable sum body has a checked type");
-        let (_, lov) = self.gen_expr(lo)?;
-        let (_, hiv) = self.gen_expr(hi)?;
-        let expr_stmt_scan = {
-            let mut arrays = Vec::new();
-            let mut ok = true;
-            scan_trusted_expr(self.p, body, &var, &mut arrays, &mut ok);
-            if ok && !arrays.is_empty() {
-                Some(arrays)
-            } else {
-                None
-            }
-        };
-        let pushed = match expr_stmt_scan {
-            Some(arrays) => self.hoist_checks(&arrays, &var, lov[0], hiv[0]),
-            None => 0,
-        };
-        // M5: vectorize the reduction when the body is pure f64 arithmetic
-        // over check-free unit-stride loads — f64x2 lanes, two vector
-        // accumulators (4 lanes total, same reassociation contract).
-        if self.simd && self.vec_ok(body, &var) {
-            let out = self.gen_sum_simd(&var, lov[0], hiv[0], body);
-            self.trusted_idx.truncate(self.trusted_idx.len() - pushed);
-            return out;
-        }
-        let ivar = self.b.declare_var(types::I64);
-        self.b.def_var(ivar, lov[0]);
-        self.env.push(HashMap::new());
-        self.env
-            .last_mut()
-            .unwrap()
-            .insert(var, (CType::I64, vec![ivar]));
-
-        // `sum` is order-free by language contract: emit 4 independent
-        // accumulators (the reassociation C++ needs -ffast-math to allow).
-        let faccs: Vec<Variable> = (0..4).map(|_| self.b.declare_var(types::F64)).collect();
-        let iaccs: Vec<Variable> = (0..4).map(|_| self.b.declare_var(types::I64)).collect();
-        let fzero = self.b.ins().f64const(0.0);
-        let izero = self.b.ins().iconst(types::I64, 0);
-        for &a in &faccs {
-            self.b.def_var(a, fzero);
-        }
-        for &a in &iaccs {
-            self.b.def_var(a, izero);
-        }
-
-        let head4 = self.b.create_block();
-        let body4 = self.b.create_block();
-        let head1 = self.b.create_block();
-        let body1 = self.b.create_block();
-        let exit = self.b.create_block();
-
-        self.b.ins().jump(head4, &[]);
-        self.b.switch_to_block(head4);
-        let iv = self.b.use_var(ivar);
-        let i3 = self.b.ins().iadd_imm(iv, 4);
-        let fits = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, i3, hiv[0]);
-        self.b.ins().brif(fits, body4, &[], head1, &[]);
-
-        self.b.switch_to_block(body4);
-        for k in 0..4 {
-            let ivk = self.b.use_var(ivar);
-            let ik = self.b.ins().iadd_imm(ivk, k);
-            self.b.def_var(ivar, ik);
-            let (t, vals) = self.gen_expr(body)?;
-            if t == CType::I64 {
-                let cur = self.b.use_var(iaccs[k as usize]);
-                let nxt = self.b.ins().iadd(cur, vals[0]);
-                self.b.def_var(iaccs[k as usize], nxt);
-            } else {
-                let cur = self.b.use_var(faccs[k as usize]);
-                let nxt = self.b.ins().fadd(cur, vals[0]);
-                self.b.def_var(faccs[k as usize], nxt);
-            }
-            // restore i to base before next unroll step
-            let back = self.b.ins().iadd_imm(ik, -k);
-            self.b.def_var(ivar, back);
-        }
-        let ivb = self.b.use_var(ivar);
-        let ivn = self.b.ins().iadd_imm(ivb, 4);
-        self.b.def_var(ivar, ivn);
-        self.b.ins().jump(head4, &[]);
-
-        self.b.switch_to_block(head1);
-        let iv1 = self.b.use_var(ivar);
-        let more = self.b.ins().icmp(IntCC::SignedLessThan, iv1, hiv[0]);
-        self.b.ins().brif(more, body1, &[], exit, &[]);
-
-        self.b.switch_to_block(body1);
-        let (body_ty, vals) = self.gen_expr(body)?;
-        debug_assert_eq!(body_ty, expected_body_ty);
-        if body_ty == CType::I64 {
-            let cur = self.b.use_var(iaccs[0]);
-            let nxt = self.b.ins().iadd(cur, vals[0]);
-            self.b.def_var(iaccs[0], nxt);
-        } else {
-            let cur = self.b.use_var(faccs[0]);
-            let nxt = self.b.ins().fadd(cur, vals[0]);
-            self.b.def_var(faccs[0], nxt);
-        }
-        let ivt = self.b.use_var(ivar);
-        let ivt2 = self.b.ins().iadd_imm(ivt, 1);
-        self.b.def_var(ivar, ivt2);
-        self.b.ins().jump(head1, &[]);
-
-        self.b.switch_to_block(exit);
-        self.trusted_idx.truncate(self.trusted_idx.len() - pushed);
-        self.env.pop();
-        if body_ty == CType::I64 {
-            let a0 = self.b.use_var(iaccs[0]);
-            let a1 = self.b.use_var(iaccs[1]);
-            let a2 = self.b.use_var(iaccs[2]);
-            let a3 = self.b.use_var(iaccs[3]);
-            let s01 = self.b.ins().iadd(a0, a1);
-            let s23 = self.b.ins().iadd(a2, a3);
-            Ok((CType::I64, vec![self.b.ins().iadd(s01, s23)]))
-        } else {
-            let a0 = self.b.use_var(faccs[0]);
-            let a1 = self.b.use_var(faccs[1]);
-            let a2 = self.b.use_var(faccs[2]);
-            let a3 = self.b.use_var(faccs[3]);
-            let s01 = self.b.ins().fadd(a0, a1);
-            let s23 = self.b.ins().fadd(a2, a3);
-            Ok((CType::F64, vec![self.b.ins().fadd(s01, s23)]))
-        }
-    }
-
-    // ---- if-conversion (M5) ----
-    //
-    // A CFG diamond turns every variable assigned inside it into a merge
-    // block-param, which hides loop-invariance from the egraph optimizer (in
-    // slerp, `d = -d` inside an `if` is what keeps `acos(d)` stuck in the
-    // loop). When both arms are speculation-safe — pure and non-trapping, so
-    // executing the untaken arm is unobservable — emit both arms straight-line
-    // and merge each assigned variable with a select. Downstream values stay
-    // pure SSA and Cranelift's LICM/GVN see through them.
-
-    /// Type of `e` if it is safe to speculate (pure, cannot trap or perform
-    /// I/O), else None. Rejects: array indexing (bounds check can abort),
-    /// integer `/`/`%` (trap on zero), `arr`/`print`, `sum`, loops.
-    fn spec_expr(
-        &self,
-        e: ExprId,
-        locals: &mut Vec<HashMap<String, CType>>,
-        depth: usize,
-    ) -> Option<CType> {
-        match self.p.expr(e) {
-            Expr::Int(_) => Some(CType::I64),
-            Expr::Float(_) => Some(CType::F64),
-            Expr::Bool(_) => Some(CType::Bool),
-            Expr::Str(_) => Some(CType::Str),
-            Expr::Ident(n) => locals
-                .iter()
-                .rev()
-                .find_map(|s| s.get(n).cloned())
-                .or_else(|| self.lookup(n).map(|(t, _)| t)),
-            Expr::Un(_, x) => self.spec_expr(*x, locals, depth),
-            Expr::EnumVal(en, vn) => self.p.enum_tag(en, vn).map(|(ei, _)| CType::Enum(ei)),
-            Expr::Bin(op, l, r) => {
-                let a = self.spec_expr(*l, locals, depth)?;
-                let b = self.spec_expr(*r, locals, depth)?;
-                if let Some(f) = self.p.infix_ops.get(op) {
-                    return self.spec_fn(f, depth);
-                }
-                match op.as_str() {
-                    "+" | "-" | "*" => Some(if a == CType::F64 || b == CType::F64 {
-                        CType::F64
-                    } else {
-                        CType::I64
-                    }),
-                    "/" | "%" => {
-                        if a == CType::F64 || b == CType::F64 {
-                            Some(CType::F64)
-                        } else {
-                            None // integer division traps on zero
-                        }
-                    }
-                    "and" | "or" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "~=" | "\u{2248}" => {
-                        Some(CType::Bool)
-                    }
-                    _ => None,
-                }
-            }
-            Expr::Circum(open, x) => {
-                self.spec_expr(*x, locals, depth)?;
-                let fname = self.p.circum_ops[open].1.clone();
-                self.spec_fn(&fname, depth)
-            }
-            Expr::Field(x, fname) => match self.spec_expr(*x, locals, depth)? {
-                CType::Rec(ti) => field_offset(self.p, ti, fname).ok().map(|(_, t)| t),
-                _ => None,
-            },
-            Expr::Record(name, inits) => {
-                for (_, e) in inits {
-                    self.spec_expr(*e, locals, depth)?;
-                }
-                let ti = self.p.types.iter().position(|t| t.name == *name)?;
-                Some(CType::Rec(ti))
-            }
-            Expr::Call(name, args) => {
-                for &a in args {
-                    self.spec_expr(a, locals, depth)?;
-                }
-                match name.as_str() {
-                    "sqrt" | "abs" | "floor" | "sin" | "cos" | "acos" | "min" | "max" | "pow"
-                    | "atan2" | "float" => Some(CType::F64),
-                    "int" | "len" | "nargs" => Some(CType::I64),
-                    "arg" | "read_file" | "chr" | "concat" => Some(CType::Str),
-                    _ => self.spec_fn(name, depth),
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn spec_fn(&self, fname: &str, depth: usize) -> Option<CType> {
-        if depth == 0 {
-            return None;
-        }
-        let decl = self.p.fns.iter().find(|f| f.name == fname)?;
-        if decl.has_inout() {
-            return None; // mutates caller variables — not speculatable
-        }
-        let info = self.fns.get(fname)?;
-        let mut scope = HashMap::new();
-        for ((pname, _), t) in decl.params.iter().zip(info.params.iter()) {
-            scope.insert(pname.clone(), t.clone());
-        }
-        let mut locals = vec![scope];
-        if self.spec_stmts(&decl.body, &mut locals, depth - 1, true) {
-            Some(info.ret.clone())
-        } else {
-            None
-        }
-    }
-
-    fn spec_stmts(
-        &self,
-        stmts: &[StmtId],
-        locals: &mut Vec<HashMap<String, CType>>,
-        depth: usize,
-        allow_return: bool,
-    ) -> bool {
-        locals.push(HashMap::new());
-        let ok = stmts.iter().all(|&sid| match self.p.stmt(sid) {
-            Stmt::Let(n, e) | Stmt::Var(n, e) => match self.spec_expr(*e, locals, depth) {
-                Some(t) => {
-                    locals.last_mut().unwrap().insert(n.clone(), t);
-                    true
-                }
-                None => false,
-            },
-            Stmt::Assign(target, e) => {
-                matches!(self.p.expr(*target), Expr::Ident(_))
-                    && self.spec_expr(*e, locals, depth).is_some()
-            }
-            Stmt::If(c, a, b) => {
-                self.spec_expr(*c, locals, depth).is_some()
-                    && self.spec_stmts(a, locals, depth, allow_return)
-                    && self.spec_stmts(b, locals, depth, allow_return)
-            }
-            Stmt::Return(Some(e)) => allow_return && self.spec_expr(*e, locals, depth).is_some(),
-            Stmt::Return(None) => allow_return,
-            Stmt::Expr(e) => self.spec_expr(*e, locals, depth).is_some(),
-            Stmt::For(..) | Stmt::While(..) => false,
-        });
-        locals.pop();
-        ok
-    }
-
-    /// If both arms are speculation-safe, return the outer variables they
-    /// assign (the ones to merge with selects).
-    fn ifconv_candidate(&self, then_s: &[StmtId], else_s: &[StmtId]) -> Option<Vec<String>> {
-        let mut locals = Vec::new();
-        if !self.spec_stmts(then_s, &mut locals, 8, false)
-            || !self.spec_stmts(else_s, &mut locals, 8, false)
-        {
-            return None;
-        }
-        let mut assigned = Vec::new();
-        collect_assigned(self.p, then_s, &mut assigned);
-        collect_assigned(self.p, else_s, &mut assigned);
-        // only pre-existing variables need merging (arm-local lets die with scope)
-        assigned.retain(|n| self.lookup(n).is_some());
-        Some(assigned)
-    }
-
-    fn gen_if_select(
-        &mut self,
-        c: ExprId,
-        then_s: &[StmtId],
-        else_s: &[StmtId],
-        assigned: &[String],
-    ) -> Result<StmtOut, String> {
-        let (_, cv) = self.gen_expr(c)?;
-        let pre: Vec<(Vec<Variable>, Vec<Value>)> = assigned
-            .iter()
-            .map(|n| {
-                let (_, vars) = self.lookup(n).unwrap();
-                let vals = vars.iter().map(|&v| self.b.use_var(v)).collect();
-                (vars, vals)
-            })
-            .collect();
-        self.gen_block(then_s)?; // spec-checked: cannot terminate
-        let then_vals: Vec<Vec<Value>> = pre
-            .iter()
-            .map(|(vars, _)| vars.iter().map(|&v| self.b.use_var(v)).collect())
-            .collect();
-        for (vars, pv) in &pre {
-            for (var, val) in vars.iter().zip(pv.iter()) {
-                self.b.def_var(*var, *val);
-            }
-        }
-        self.gen_block(else_s)?;
-        for ((vars, _), tv) in pre.iter().zip(then_vals.iter()) {
-            for (i, var) in vars.iter().enumerate() {
-                let ev = self.b.use_var(*var);
-                let sel = self.b.ins().select(cv[0], tv[i], ev);
-                self.b.def_var(*var, sel);
-            }
-        }
-        Ok(StmtOut::Value(None))
-    }
-
-    // ---- inline math kernels (M5) ----
-    //
-    // sin/cos/acos are emitted as branch-free pure IR: Cody-Waite range
-    // reduction + musl minimax polynomials, selects instead of branches. A
-    // libcall is a black box to Cranelift; an inline kernel is ordinary pure
-    // arithmetic, so the egraph optimizer GVNs it and hoists loop-invariant
-    // chains out of loops (the slerp `acos(d)`/`sin(th)` win). Accuracy is a
-    // few ulp — far inside the approximate-FP contract (rtol 2^-40).
-
-    /// Horner evaluation coefs[0] + z*(coefs[1] + z*(...)) via fma.
     fn poly(&mut self, z: Value, coefs: &[f64]) -> Value {
         let mut acc = self.b.ins().f64const(*coefs.last().unwrap());
         for &c in coefs.iter().rev().skip(1) {
@@ -2169,363 +1585,11 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// Can `e` be evaluated as an f64x2 vector over consecutive values of
     /// `var`? Requires every leaf to be a Float literal, an invariant f64
     /// scalar, or a trusted unit-stride `a[var]` load.
-    fn vec_ok(&self, e: ExprId, var: &str) -> bool {
-        match self.p.expr(e) {
-            Expr::Float(_) => true,
-            Expr::Ident(n) => n != var && matches!(self.lookup(n), Some((CType::F64, _))),
-            Expr::Index(a, i) => match (self.p.expr(*a), self.p.expr(*i)) {
-                (Expr::Ident(an), Expr::Ident(inm)) => {
-                    inm == var
-                        && self.trusted_idx.iter().any(|(x, y, _)| x == an && y == var)
-                        && matches!(self.lookup(an), Some((CType::Arr(e), _)) if *e == CType::F64)
-                }
-                _ => false,
-            },
-            Expr::Bin(op, l, r) => {
-                matches!(op.as_str(), "+" | "-" | "*" | "/")
-                    && !self.p.infix_ops.contains_key(op)
-                    && self.vec_ok(*l, var)
-                    && self.vec_ok(*r, var)
-            }
-            Expr::Un(op, x) => op == "-" && self.vec_ok(*x, var),
-            Expr::Call(name, args) => {
-                matches!(name.as_str(), "sqrt" | "abs" | "min" | "max")
-                    && args.iter().all(|&a| self.vec_ok(a, var))
-            }
-            // SoA makes every record field a unit-stride plane, so
-            // qs[i].field is a plain vector load — layout and SIMD compose.
-            Expr::Field(x, fname) => {
-                if !self.soa {
-                    return false;
-                }
-                let Expr::Index(a, i) = self.p.expr(*x) else {
-                    return false;
-                };
-                let (Expr::Ident(an), Expr::Ident(inm)) = (self.p.expr(*a), self.p.expr(*i)) else {
-                    return false;
-                };
-                inm == var
-                    && self
-                        .trusted_idx
-                        .iter()
-                        .any(|(x2, y, _)| x2 == an && y == var)
-                    && match self.lookup(an) {
-                        Some((CType::Arr(e), _)) => match *e {
-                            CType::Rec(ti) => {
-                                matches!(field_offset(self.p, ti, fname), Ok((_, CType::F64)))
-                            }
-                            _ => false,
-                        },
-                        _ => false,
-                    }
-            }
-            _ => false,
-        }
-    }
-
-    /// Evaluate `e` as an f64x2 holding lanes for indices `idx` and `idx+1`.
-    fn gen_vec_expr(&mut self, e: ExprId, var: &str, idx: Value) -> Result<Value, String> {
-        match self.p.expr(e) {
-            Expr::Float(v) => {
-                let c = self.b.ins().f64const(*v);
-                Ok(self.b.ins().splat(types::F64X2, c))
-            }
-            Expr::Ident(n) => {
-                let (_, vars) = self.lookup(n).ok_or(format!("unknown variable `{}`", n))?;
-                let v = self.b.use_var(vars[0]);
-                Ok(self.b.ins().splat(types::F64X2, v))
-            }
-            Expr::Index(a, _) => {
-                let (_, avals) = self.gen_expr(*a)?;
-                let sbytes = self.b.ins().iconst(types::I64, 8);
-                let off = self.b.ins().imul(idx, sbytes);
-                let base8 = self.b.ins().iadd_imm(avals[0], 8);
-                let addr = self.b.ins().iadd(base8, off);
-                Ok(self
-                    .b
-                    .ins()
-                    .load(types::F64X2, MemFlags::trusted(), addr, 0))
-            }
-            Expr::Bin(op, l, r) => {
-                let a = self.gen_vec_expr(*l, var, idx)?;
-                let b = self.gen_vec_expr(*r, var, idx)?;
-                Ok(match op.as_str() {
-                    "+" => self.b.ins().fadd(a, b),
-                    "-" => self.b.ins().fsub(a, b),
-                    "*" => self.b.ins().fmul(a, b),
-                    _ => self.b.ins().fdiv(a, b),
-                })
-            }
-            Expr::Un(_, x) => {
-                let v = self.gen_vec_expr(*x, var, idx)?;
-                Ok(self.b.ins().fneg(v))
-            }
-            Expr::Call(name, args) => {
-                let vs: Result<Vec<Value>, String> = args
-                    .iter()
-                    .map(|&a| self.gen_vec_expr(a, var, idx))
-                    .collect();
-                let vs = vs?;
-                Ok(match name.as_str() {
-                    "sqrt" => self.b.ins().sqrt(vs[0]),
-                    "abs" => self.b.ins().fabs(vs[0]),
-                    "min" => self.b.ins().fmin(vs[0], vs[1]),
-                    _ => self.b.ins().fmax(vs[0], vs[1]),
-                })
-            }
-            Expr::Field(x, fname) => {
-                let Expr::Index(a, _) = self.p.expr(*x) else {
-                    return Err("non-vectorizable field".into());
-                };
-                let an = match self.p.expr(*a) {
-                    Expr::Ident(n) => n.clone(),
-                    _ => return Err("non-vectorizable field base".into()),
-                };
-                let n = self
-                    .trusted_idx
-                    .iter()
-                    .find(|(x2, y, _)| *x2 == an && y == var)
-                    .map(|(_, _, n)| *n)
-                    .ok_or("untrusted array in vector body")?;
-                let (at, avals) = self.gen_expr(*a)?;
-                let ti = match at {
-                    CType::Arr(e) => match *e {
-                        CType::Rec(ti) => ti,
-                        _ => return Err("field of non-record".into()),
-                    },
-                    _ => return Err("index of non-array".into()),
-                };
-                let (c, _) = field_offset(self.p, ti, fname)?;
-                let base8 = self.b.ins().iadd_imm(avals[0], 8);
-                let plane = self.b.ins().imul_imm(n, 8 * c as i64);
-                let lane = self.b.ins().imul_imm(idx, 8);
-                let pb = self.b.ins().iadd(base8, plane);
-                let addr = self.b.ins().iadd(pb, lane);
-                Ok(self
-                    .b
-                    .ins()
-                    .load(types::F64X2, MemFlags::trusted(), addr, 0))
-            }
-            _ => Err("non-vectorizable expression".into()),
-        }
-    }
-
-    fn gen_sum_simd(
-        &mut self,
-        var: &str,
-        lo: Value,
-        hi: Value,
-        body: ExprId,
-    ) -> Result<(CType, Vec<Value>), String> {
-        let ivar = self.b.declare_var(types::I64);
-        self.b.def_var(ivar, lo);
-        self.env.push(HashMap::new());
-        self.env
-            .last_mut()
-            .unwrap()
-            .insert(var.to_string(), (CType::I64, vec![ivar]));
-
-        let accs: Vec<Variable> = (0..4).map(|_| self.b.declare_var(types::F64X2)).collect();
-        let sacc = self.b.declare_var(types::F64);
-        let zs = self.b.ins().f64const(0.0);
-        let zv = self.b.ins().splat(types::F64X2, zs);
-        for &a in &accs {
-            self.b.def_var(a, zv);
-        }
-        self.b.def_var(sacc, zs);
-
-        let head4 = self.b.create_block();
-        let body4 = self.b.create_block();
-        let head1 = self.b.create_block();
-        let body1 = self.b.create_block();
-        let exit = self.b.create_block();
-
-        self.b.ins().jump(head4, &[]);
-        self.b.switch_to_block(head4);
-        let iv = self.b.use_var(ivar);
-        let i7 = self.b.ins().iadd_imm(iv, 8);
-        let fits = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, i7, hi);
-        self.b.ins().brif(fits, body4, &[], head1, &[]);
-
-        self.b.switch_to_block(body4);
-        let ib = self.b.use_var(ivar);
-        for (k, &acc) in accs.iter().enumerate() {
-            let ik = self.b.ins().iadd_imm(ib, 2 * k as i64);
-            let v = self.gen_vec_expr(body, var, ik)?;
-            let a = self.b.use_var(acc);
-            let an = self.b.ins().fadd(a, v);
-            self.b.def_var(acc, an);
-        }
-        let ivn = self.b.ins().iadd_imm(ib, 8);
-        self.b.def_var(ivar, ivn);
-        self.b.ins().jump(head4, &[]);
-
-        self.b.switch_to_block(head1);
-        let iv1 = self.b.use_var(ivar);
-        let more = self.b.ins().icmp(IntCC::SignedLessThan, iv1, hi);
-        self.b.ins().brif(more, body1, &[], exit, &[]);
-
-        self.b.switch_to_block(body1);
-        let (t, vals) = self.gen_expr(body)?;
-        let f = self.f64_of(&t, vals[0]);
-        let cur = self.b.use_var(sacc);
-        let nxt = self.b.ins().fadd(cur, f);
-        self.b.def_var(sacc, nxt);
-        let ivt = self.b.use_var(ivar);
-        let ivt2 = self.b.ins().iadd_imm(ivt, 1);
-        self.b.def_var(ivar, ivt2);
-        self.b.ins().jump(head1, &[]);
-
-        self.b.switch_to_block(exit);
-        let va0 = self.b.use_var(accs[0]);
-        let va1 = self.b.use_var(accs[1]);
-        let va2 = self.b.use_var(accs[2]);
-        let va3 = self.b.use_var(accs[3]);
-        let s01 = self.b.ins().fadd(va0, va1);
-        let s23 = self.b.ins().fadd(va2, va3);
-        let vs = self.b.ins().fadd(s01, s23);
-        let l0 = self.b.ins().extractlane(vs, 0);
-        let l1 = self.b.ins().extractlane(vs, 1);
-        let lv = self.b.ins().fadd(l0, l1);
-        let sv = self.b.use_var(sacc);
-        let total = self.b.ins().fadd(lv, sv);
-        self.env.pop();
-        Ok((CType::F64, vec![total]))
-    }
-
-    fn gen_user_call(
-        &mut self,
-        fname: &str,
-        args: Vec<Value>,
-        arg_exprs: Option<&[ExprId]>,
-    ) -> Result<(CType, Vec<Value>), String> {
-        let ret = self.fns[fname].ret.clone();
-        let decl = self
-            .p
-            .fns
-            .iter()
-            .find(|f| f.name == fname)
-            .expect("declared fn must exist");
-        // Inline every user function up to a depth cap (recursion falls back to a
-        // real call). Args are SSA values bound to fresh variables — evaluated
-        // exactly once, so this is always semantics-preserving. A per-function
-        // size budget keeps large mutually-calling functions (e.g. a
-        // tree-walking evaluator) from exploding exponentially.
-        let recursive = self.inline_stack.iter().any(|n| n == fname);
-        let size = body_size(self.p, &decl.body);
-        if !recursive && self.inline_stack.len() < 8 && self.inline_spent + size <= 3000 {
-            self.inline_spent += size;
-            let params = self.fns[fname].params.clone();
-            let saved_env = std::mem::replace(&mut self.env, vec![HashMap::new()]);
-            let saved_trust = std::mem::take(&mut self.trusted_idx);
-            let mut cursor = 0;
-            let mut param_vars: Vec<Vec<Variable>> = Vec::new();
-            for ((pname, _), t) in decl.params.iter().zip(params.iter()) {
-                let n = comps(self.p, t)?.len();
-                let vals = args[cursor..cursor + n].to_vec();
-                cursor += n;
-                self.bind(pname, t.clone(), &vals)?;
-                param_vars.push(self.lookup(pname).unwrap().1);
-            }
-            let result: Vec<Variable> = comps(self.p, &ret)?
-                .into_iter()
-                .map(|c| self.b.declare_var(c))
-                .collect();
-            let cont = self.b.create_block();
-            self.inline_frames.push(InlineFrame {
-                result: result.clone(),
-                cont,
-            });
-            self.inline_stack.push(fname.to_string());
-            let (terminated, last) = self.gen_block(&decl.body)?;
-            self.inline_stack.pop();
-            self.inline_frames.pop();
-            if !terminated {
-                match last {
-                    Some((t, vals)) if t == ret => {
-                        for (var, val) in result.iter().zip(vals.iter()) {
-                            self.b.def_var(*var, *val);
-                        }
-                    }
-                    _ if ret == CType::Unit => {}
-                    _ => return Err(format!("function `{}` may end without a value", fname)),
-                }
-                self.b.ins().jump(cont, &[]);
-            }
-            self.b.switch_to_block(cont);
-            // inout write-back: the param variables hold the final values here
-            let outs: Vec<(usize, Vec<Value>)> = decl
-                .inouts
-                .iter()
-                .enumerate()
-                .filter(|(_, &io)| io)
-                .map(|(i, _)| {
-                    let vals = param_vars[i].iter().map(|&v| self.b.use_var(v)).collect();
-                    (i, vals)
-                })
-                .collect();
-            self.env = saved_env;
-            self.trusted_idx = saved_trust;
-            for (i, vals) in outs {
-                self.write_back_inout(arg_exprs, i, &vals)?;
-            }
-            let out: Vec<Value> = result.iter().map(|&v| self.b.use_var(v)).collect();
-            return Ok((ret, out));
-        }
-        use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
-        let params = self.fns[fname].params.clone();
-        let mut args = args;
-        let mut slots = Vec::new();
-        for (i, (&io, t)) in decl.inouts.iter().zip(params.iter()).enumerate() {
-            if io {
-                let cs = comps(self.p, t)?;
-                let ss = self.b.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    (cs.len() * 8) as u32,
-                    3,
-                ));
-                let addr = self.b.ins().stack_addr(types::I64, ss, 0);
-                args.push(addr);
-                slots.push((i, ss, cs));
-            }
-        }
-        let r = self.callee(fname);
-        let call = self.b.ins().call(r, &args);
-        let out = self.b.inst_results(call).to_vec();
-        for (i, ss, cs) in slots {
-            let vals: Vec<Value> = cs
-                .iter()
-                .enumerate()
-                .map(|(k, &c)| self.b.ins().stack_load(c, ss, (k * 8) as i32))
-                .collect();
-            self.write_back_inout(arg_exprs, i, &vals)?;
-        }
-        Ok((ret, out))
-    }
-
-    fn write_back_inout(
-        &mut self,
-        arg_exprs: Option<&[ExprId]>,
-        i: usize,
-        vals: &[Value],
-    ) -> Result<(), String> {
-        let arg_exprs = arg_exprs.ok_or("inout functions cannot be used as operators")?;
-        let Expr::Ident(n) = self.p.expr(arg_exprs[i]) else {
-            return Err("inout arg must be a variable".into());
-        };
-        let (_, vars) = self.lookup(n).ok_or(format!("unknown variable `{}`", n))?;
-        for (var, val) in vars.iter().zip(vals.iter()) {
-            self.b.def_var(*var, *val);
-        }
-        Ok(())
-    }
-
     fn gen_call(
         &mut self,
         name: &str,
         atys: Vec<CType>,
         avals: Vec<Vec<Value>>,
-        arg_exprs: &[ExprId],
     ) -> Result<(CType, Vec<Value>), String> {
         match name {
             "print" => {
@@ -2736,27 +1800,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                     t => Err(format!("arr of {:?} is not supported by the JIT yet", t)),
                 }
             }
-            _ => {
-                let info = self
-                    .fns
-                    .get(name)
-                    .ok_or(format!("unknown function `{}`", name))?;
-                let params = info.params.clone();
-                let mut args = Vec::new();
-                for ((t, vals), want) in atys.into_iter().zip(avals).zip(params) {
-                    if want == CType::F64 && t == CType::I64 {
-                        args.push(self.b.ins().fcvt_from_sint(types::F64, vals[0]));
-                    } else {
-                        args.extend(vals);
-                    }
-                }
-                self.gen_user_call(name, args, Some(arg_exprs))
-            }
+            _ => Err(format!("unknown builtin `{}`", name)),
         }
     }
-}
-
-enum StmtOut {
-    Value(Option<(CType, Vec<Value>)>),
-    Terminated,
 }

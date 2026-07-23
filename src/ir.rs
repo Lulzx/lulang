@@ -51,6 +51,7 @@ pub enum InstKind {
     Store { local: LocalId, value: ValueId },
     Unary { op: UnaryOp, value: ValueId },
     Binary { op: BinaryOp, lhs: ValueId, rhs: ValueId },
+    Select { condition: ValueId, then_value: ValueId, else_value: ValueId },
     Call {
         callee: Callee,
         args: Vec<ValueId>,
@@ -126,13 +127,11 @@ pub struct Property {
     pub params: Vec<(String, Type)>,
 }
 
-/// Backend-neutral, checked compiler IR. The source AST is retained only for
-/// source-level diagnostics and will disappear once the specialized optimizer
-/// no longer needs syntax patterns; execution semantics live in `functions`
-/// and `main`.
+/// Backend-neutral, checked compiler IR. Execution semantics and optimization
+/// inputs live in `functions` and `main`; source declarations supply names and
+/// user-defined layout metadata.
 pub struct LoweredProgram {
     source: ast::Program,
-    expr_types: Vec<Option<Type>>,
     pub records: Vec<RecordDef>,
     pub enums: Vec<EnumDef>,
     pub functions: Vec<Function>,
@@ -178,15 +177,14 @@ impl LoweredProgram {
             fields: record.fields.iter().map(|(name, ty)| Ok((name.clone(), crate::check::resolve_type(&source, ty)?))).collect::<Result<_, String>>()?,
         })).collect::<Result<_, String>>()?;
         let enums = source.enums.iter().map(|e| EnumDef { name: e.name.clone(), variants: e.variants.clone() }).collect();
-        let ir = Self { source, expr_types, records, enums, functions, properties, main };
+        let ir = Self { source, records, enums, functions, properties, main };
         ir.validate()?;
         Ok(ir)
     }
 
-    /// Temporary source view for syntax-pattern optimizations. Code generation
-    /// must not use this to recover semantic facts.
+    /// Source declarations remain available for names and user-defined layout;
+    /// executable semantics and optimization facts live in the lowered CFG.
     pub fn source(&self) -> &ast::Program { &self.source }
-    pub fn expression_types(&self) -> &[Option<Type>] { &self.expr_types }
 
     pub fn validate(&self) -> Result<(), String> {
         for f in self.functions.iter().chain(self.main.iter()) {
@@ -218,6 +216,14 @@ impl LoweredProgram {
                         InstKind::Store { local, value } => {
                             let local = f.locals.get(*local as usize).ok_or_else(|| format!("IR `{}` stores invalid local", f.name))?;
                             if !compatible(&local.ty, &f.values[*value as usize]) { return Err(format!("IR `{}` store type mismatch", f.name)); }
+                        }
+                        InstKind::Select { condition, then_value, else_value } => {
+                            if f.values.get(*condition as usize) != Some(&Type::Bool)
+                                || f.values.get(*then_value as usize) != Some(&inst.ty)
+                                || f.values.get(*else_value as usize) != Some(&inst.ty)
+                            {
+                                return Err(format!("IR `{}` select type mismatch", f.name));
+                            }
                         }
                         InstKind::SetField { root, .. } => {
                             if *root as usize >= f.locals.len() { return Err(format!("IR `{}` updates invalid local", f.name)); }
@@ -303,6 +309,7 @@ fn operands(k: &InstKind) -> Vec<ValueId> {
     match k {
         InstKind::Store { value, .. } | InstKind::Unary { value, .. } | InstKind::SetField { value, .. } => vec![*value],
         InstKind::Binary { lhs, rhs, .. } => vec![*lhs, *rhs],
+        InstKind::Select { condition, then_value, else_value } => vec![*condition, *then_value, *else_value],
         InstKind::Call { args, .. } | InstKind::Array(args) | InstKind::Record { fields: args, .. } => args.clone(),
         InstKind::Field { base, .. } => vec![*base],
         InstKind::Index { base, index } => vec![*base, *index],

@@ -222,6 +222,12 @@ impl<'a> Interp<'a> {
                     InstKind::Store { local, value } => { locals[*local as usize] = values[*value as usize].clone(); None }
                     InstKind::Unary { op, value } => Some(self.unary(*op, values[*value as usize].clone())?),
                     InstKind::Binary { op, lhs, rhs } => Some(self.binary(*op, &values[*lhs as usize], &values[*rhs as usize])?),
+                    InstKind::Select { condition, then_value, else_value } => {
+                        let Value::Bool(condition) = values[*condition as usize] else {
+                            return Err("IR select condition is not bool".into());
+                        };
+                        Some(values[if condition { *then_value } else { *else_value } as usize].clone())
+                    }
                     InstKind::Call { callee, args, inout } => {
                         let call_args = args.iter().map(|v| values[*v as usize].clone()).collect::<Vec<_>>();
                         let result = match callee {
