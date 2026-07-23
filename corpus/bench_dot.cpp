@@ -16,6 +16,6 @@ int main() {
     b[i] = i * 0.000002;
   }
   double acc = 0.0;
-  for (int r = 0; r < 200; r++) acc += dot(a, b, n);
+  for (int r = 0; r < 20; r++) acc += dot(a, b, n);
   printf("acc: %.17g\n", acc);
 }

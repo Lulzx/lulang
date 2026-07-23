@@ -223,7 +223,15 @@ pub fn build(
     src_path: &str,
     out_path: Option<&str>,
 ) -> Result<String, String> {
-    build_output(ir, src_path, out_path, false, false, None)
+    build_output(ir, src_path, out_path, false, false, None, false)
+}
+
+pub fn emit_llvm(
+    ir: &LoweredProgram,
+    src_path: &str,
+    out_path: Option<&str>,
+) -> Result<String, String> {
+    build_output(ir, src_path, out_path, false, false, None, true)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,7 +337,7 @@ pub fn build_wasm(
                 .into(),
         );
     }
-    let artifact = build_output(ir, src_path, out_path, false, false, Some(target))?;
+    let artifact = build_output(ir, src_path, out_path, false, false, Some(target), false)?;
     let mut outputs = vec![artifact.clone()];
     if target == WasmTarget::Web {
         let loader = std::path::Path::new(&artifact).with_extension("js");
@@ -362,7 +370,7 @@ pub fn build_library(
         .ok_or("invalid library output name")?;
     let base = parent.join(name);
     let base_string = base.to_string_lossy().into_owned();
-    let artifact = build_output(ir, src_path, Some(&base_string), true, shared, None)?;
+    let artifact = build_output(ir, src_path, Some(&base_string), true, shared, None, false)?;
     let header_path = parent.join(format!("{}.h", name));
     let manifest_path = parent.join(format!("{}.json", name));
     std::fs::write(&header_path, crate::cheader::emit_header(ir, name)?)
@@ -383,6 +391,7 @@ fn build_output(
     library: bool,
     shared: bool,
     wasm: Option<WasmTarget>,
+    emit_only: bool,
 ) -> Result<String, String> {
     let p = ir.source();
     let mut e = Emit {
@@ -506,7 +515,11 @@ fn build_output(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("out");
-    let out_bin = if wasm.is_some() {
+    let out_bin = if emit_only {
+        out_path
+            .map(String::from)
+            .unwrap_or_else(|| format!("{stem}.ll"))
+    } else if wasm.is_some() {
         out_path
             .map(String::from)
             .unwrap_or_else(|| format!("{stem}.wasm"))
@@ -537,6 +550,10 @@ fn build_output(
             .map(String::from)
             .unwrap_or_else(|| stem.to_string())
     };
+    if emit_only {
+        std::fs::write(&out_bin, &module).map_err(|error| error.to_string())?;
+        return Ok(out_bin);
+    }
     let pid = std::process::id();
     let ll_path = std::env::temp_dir().join(format!("lu_{}_{}.ll", stem, pid));
     std::fs::write(&ll_path, &module).map_err(|e| e.to_string())?;

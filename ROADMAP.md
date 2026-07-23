@@ -37,7 +37,7 @@ than exposing internals.
 | 8 | `wasm32-wasi` / `wasm32-web` target — **shipped** | High | Medium |
 | 9 | Git-based package manager (`lu.toml`) — **foundation shipped** | High once libraries exist | Medium |
 | 10 | Flagship demo (`luphysics`) — **shipped** | High visibility | Medium |
-| 11 | `lu doc` + benchmark observatory | High credibility | Medium |
+| 11 | `lu doc` + benchmark observatory — **shipped** | High credibility | Medium |
 | 12 | Autodiff (`ludiff`, forward-mode duals first) | High technical value | High |
 
 ### 1–2. C ABI: `extern` + `export` (milestone M8)
@@ -186,8 +186,8 @@ moving branch does not change a locked build. Dependency `src/lib.lu` files
 are composed in graph order before the root and enter one whole-program
 frontend/optimizer. `use name` is checked against declared dependencies.
 
-`bench` and `doc` become package-aware with the observatory item below. There
-is intentionally no registry until roughly 20–30 meaningful packages exist.
+`bench` and `doc` are package-aware. There is intentionally no registry until
+roughly 20–30 meaningful packages exist.
 
 ### 10. Flagship showcase: `luphysics`
 
@@ -214,6 +214,16 @@ exposes source in every language, generated IR, optimization toggles (the
 ablation flags already exist: `LU_MATH/LU_IFCONV/LU_LICM/LU_SIMD/LU_LAYOUT`),
 chosen layout, and the semantic assumptions responsible for the number. That
 page is the marketing; it's what gets linked.
+
+This now ships as package-aware `lu bench` and `lu doc`. Documentation builds
+execute package laws from `tests/*.lu`, publish their status, source, generated
+LLVM, C header and ABI manifest, and attach local benchmark history. The
+observatory runner builds the host and three-stage selfhost compilers, verifies
+cross-language numerical answers, records median whole-process measurements,
+and links the lulang, C++, Rust, Julia, NumPy, and JavaScript implementations
+with machine/tool provenance and explicit semantic/layout assumptions. Missing
+runtimes remain visibly unmeasured. A scheduled workflow regenerates the same
+source-linked artifact.
 
 ### 12. `ludiff`
 

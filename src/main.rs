@@ -4,7 +4,9 @@ use lu_llvm::llvm;
 use lu_syntax::{fmt, lexer, parser};
 use lu_test::{interp, runtime as test_runtime};
 
+mod benchmark;
 mod bindgen;
+mod docgen;
 mod package;
 
 use std::process::ExitCode;
@@ -15,8 +17,11 @@ fn usage() -> ExitCode {
          \x20      lu init [package-name]\n\
          \x20      lu add <name> --git <url> --rev <revision>\n\
          \x20      lu fetch\n\
+         \x20      lu bench [--runs N] [file.lu]\n\
+         \x20      lu doc [--runs N] [-o directory] [file.lu]\n\
          \x20      lu build --lib [--shared] [-o name] <file.lu>\n\
          \x20      lu build --target <wasm32-wasi|wasm32-web> [-o file.wasm] <file.lu>\n\
+         \x20      lu build --emit-llvm [-o file.ll] <file.lu>\n\
          \x20      lu bindgen [--lib name] [--no-shims] [-o file.lu] <header.h>\n\
          \x20      lu test [--runs N] <file.lu>\n\
          \x20      lu fmt [--check] <file.lu>"
@@ -39,6 +44,8 @@ fn main() -> ExitCode {
                 | "init"
                 | "add"
                 | "fetch"
+                | "bench"
+                | "doc"
         )
     });
     let mode = match args.get(1) {
@@ -58,11 +65,15 @@ fn main() -> ExitCode {
         }
         return package_result(package::fetch());
     }
+    if mode == "bench" {
+        return package_result(benchmark::run(&args[2..]));
+    }
     let mut runs = 100u32;
     let mut check_format = false;
     let mut build_library = false;
     let mut build_shared = false;
     let mut build_target = None;
+    let mut emit_llvm = false;
     let mut output_name = None;
     let mut bindgen_library = None;
     let mut bindgen_shims = true;
@@ -70,7 +81,7 @@ fn main() -> ExitCode {
     let mut i = if explicit_mode { 2 } else { 1 };
     while i < args.len() {
         match args[i].as_str() {
-            "--runs" if mode == "test" => {
+            "--runs" if matches!(mode, "test" | "doc") => {
                 let value = args.get(i + 1).ok_or("--runs needs a value");
                 runs = match value
                     .and_then(|s| s.parse::<u32>().map_err(|_| "invalid --runs value"))
@@ -115,7 +126,11 @@ fn main() -> ExitCode {
                 build_target = Some(value.clone());
                 i += 2;
             }
-            "-o" if matches!(mode, "build" | "bindgen") => {
+            "--emit-llvm" if mode == "build" => {
+                emit_llvm = true;
+                i += 1;
+            }
+            "-o" if matches!(mode, "build" | "bindgen" | "doc") => {
                 let Some(value) = args.get(i + 1) else {
                     eprintln!("error: -o needs a value");
                     return ExitCode::FAILURE;
@@ -123,7 +138,9 @@ fn main() -> ExitCode {
                 output_name = Some(value.clone());
                 i += 2;
             }
-            arg if arg.starts_with('-') && matches!(mode, "test" | "fmt" | "build" | "bindgen") => {
+            arg if arg.starts_with('-')
+                && matches!(mode, "test" | "fmt" | "build" | "bindgen" | "doc") =>
+            {
                 eprintln!("error: unknown option `{}`", arg);
                 return ExitCode::FAILURE;
             }
@@ -148,7 +165,7 @@ fn main() -> ExitCode {
         );
     }
     let package_input = if positionals.is_empty()
-        && matches!(mode, "run" | "build" | "check" | "interp" | "test")
+        && matches!(mode, "run" | "build" | "check" | "interp" | "test" | "doc")
     {
         match package::load_workspace(mode) {
             Ok(program) => Some(program),
@@ -230,6 +247,7 @@ fn main() -> ExitCode {
                 build_library,
                 build_shared,
                 build_target_owned.as_deref(),
+                emit_llvm,
                 output_name_owned.as_deref(),
             )
         })
@@ -399,6 +417,7 @@ fn run_pipeline(
     build_library: bool,
     build_shared: bool,
     build_target: Option<&str>,
+    emit_llvm: bool,
     output_name: Option<&str>,
 ) -> Result<bool, String> {
     (|| -> Result<bool, String> {
@@ -416,13 +435,21 @@ fn run_pipeline(
                 Ok(true)
             }
             "build" => {
+                if emit_llvm && (build_target.is_some() || build_library || build_shared) {
+                    return Err(
+                        "`--emit-llvm` cannot be combined with --target, --lib, or --shared".into(),
+                    );
+                }
                 if build_target.is_some() && (build_library || build_shared) {
                     return Err("`--target` cannot be combined with `--lib` or `--shared`".into());
                 }
                 if build_shared && !build_library {
                     return Err("`--shared` requires `--lib`".into());
                 }
-                if let Some(target) = build_target {
+                if emit_llvm {
+                    let out = llvm::emit_llvm(&ir, path, output_name)?;
+                    eprintln!("built {}", out);
+                } else if let Some(target) = build_target {
                     let target = match target {
                         "wasm32-wasi" => llvm::WasmTarget::Wasi,
                         "wasm32-web" => llvm::WasmTarget::Web,
@@ -441,11 +468,17 @@ fn run_pipeline(
                     }
                 } else {
                     let out = llvm::build(&ir, path, output_name)?;
-                    eprintln!("built ./{}", out);
+                    eprintln!("built {}", out);
                 }
                 Ok(true)
             }
             "test" => interp::Interp::new(&ir).run_properties(property_runs),
+            "doc" => {
+                for out in docgen::build(&ir, src, path, output_name, property_runs)? {
+                    eprintln!("built {}", out);
+                }
+                Ok(true)
+            }
             "check" => Ok(true),
             m => Err(format!("unknown mode `{}`", m)),
         }

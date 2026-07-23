@@ -58,6 +58,9 @@ cargo build --release
 ./target/release/lu build --lib -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu build --lib --shared -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu bindgen --lib m -o math.lu /usr/include/math.h
+./target/release/lu bench --runs 7 corpus/bench_dot.lu
+./target/release/lu doc --runs 100 -o target/doc corpus/kernel_saxpy.lu
+./target/release/lu build --emit-llvm -o kernel.ll corpus/kernel_saxpy.lu
 ./target/release/lu fmt corpus/slerp.lu    # canonical Unicode operators + layout
 ./target/release/lu fmt --check corpus/slerp.lu
 ./target/release/lu run selfhost/lexer.lu  # the lulang lexer, written in lulang
@@ -166,6 +169,25 @@ vectors and bodies, softened N-body integration, rigid-circle impulses,
 executable conservation laws, native/WASI builds, an exported SoA integration
 kernel with a generated C header, and an optional raylib visualizer. Run
 `lu run` or `lu test --runs 1000` from that directory.
+
+### Executable documentation and benchmarks
+
+`lu bench [--runs N] [file.lu]` measures whole-process interpreter, JIT, and
+AOT execution and appends the result to `benchmarks/history.csv`. With no file,
+it resolves the current `lu.toml` package.
+
+`lu doc [--runs N] [-o directory] [file.lu]` generates a static site containing
+one page per function, adjacent `///` prose, example calls, related property
+statuses, local benchmark history, exported C signatures, the ABI manifest,
+source, and generated LLVM. Package docs include laws from `tests/*.lu`, so the
+status shown beside an API is an executed claim rather than copied prose.
+
+The generated benchmark observatory links every measurement to its lulang,
+C++, Rust, Julia, NumPy, and JavaScript source, publishes the selfhost result
+and measurement environment when available, and names semantic/layout
+differences. Regenerate the checked-in matrix with
+`python3 benchmarks/run_observatory.py --runs 7 --bootstrap`; a scheduled
+workflow produces the same source-linked artifact.
 
 ## Architecture
 
