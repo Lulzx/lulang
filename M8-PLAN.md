@@ -40,13 +40,13 @@ export fn saxpy(a: f64, x: [f64], y: [f64], n: i64): f64 { ... }
 | `()` | `void` | — | — | yes | — | yes |
 | `str` | `const char* p, int64_t n` (two params, not NUL-terminated) | Ptr+I64 | yes | no | yes | no |
 | `[f64]`/`[i64]` | `T* data, int64_t n` | Ptr | yes (data ptr = handle+8) | no | yes (copy-in/out wrapper) | no |
-| `f32` | — | — | no | no | no | no |
+| `f32` | `float` | F32 | yes | yes | yes | yes |
 | records, nested arrays | — | — | no | no | no | no |
 
-- `f32` is excluded in M8: the interpreter trampoline assumes all-f64 float
-  registers and per-parameter `float` changes the calling convention. Checker
-  rejects with a clear message; follow-up is typed trampoline variants or
-  libffi.
+- Direct `f32` is a post-M8 compatible extension. The dependency-free
+  interpreter trampoline carries raw F32 bits in the low half of each FP
+  register; JIT and LLVM use native `float` signatures. Selfhost preserves
+  the distinct type and generated headers/manifests spell it as `float`/`f32`.
 - **Register-class cap (language rule):** ≤6 integer-class + ≤8 float-class
   components per FFI signature. This keeps every argument in registers on
   SysV x86-64 (6 GPR/8 XMM) and AArch64 (8/8), which is what makes the
@@ -162,8 +162,8 @@ region and byte-copy it into codegen.lu (don't hardcode line numbers).
 - `tests/conformance.rs` (complete): positive cases with deterministic, portable symbols
   (`extern fn llabs(x: i64): i64`; `extern "m" fn cbrt(x: f64): f64`; an
   array-mutation case against a known `lu_*` runtime symbol declared as a
-  plain extern). Negative cases: record in signature, >6 int-class args,
-  `f32`, inout, unresolvable symbol.
+  plain extern; `cbrtf(float) -> float`). Negative cases: record in signature,
+  >6 int-class args, `[f32]`, inout, unresolvable symbol.
 - `tests/ffi_export.rs` (complete): build a `--lib` fixture, compile a ~20-line C
   harness against the generated header with clang, run, diff stdout; a
   second harness via `python3 -c "import ctypes; ..."` guarded on python3

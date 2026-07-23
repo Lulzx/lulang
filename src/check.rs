@@ -142,7 +142,7 @@ impl<'a> Checker<'a> {
         for e in &p.externs {
             let selfhost_bridge = matches!(
                 e.name.as_str(),
-                "lu_ffi_prepare" | "lu_ffi_call_i" | "lu_ffi_call_f"
+                "lu_ffi_prepare" | "lu_ffi_call_i" | "lu_ffi_call_f" | "lu_ffi_call_f32"
             );
             if e.name.starts_with("lu_") && !selfhost_bridge {
                 return Err(format!(
@@ -269,10 +269,16 @@ impl<'a> Checker<'a> {
         }
         if !matches!(
             ret,
-            Type::Unit | Type::I64 | Type::F64 | Type::Bool | Type::Enum(_) | Type::CPtr(_)
+            Type::Unit
+                | Type::I64
+                | Type::F32
+                | Type::F64
+                | Type::Bool
+                | Type::Enum(_)
+                | Type::CPtr(_)
         ) {
             return Err(format!(
-                "FFI signature `{}` has unsupported return type; returns are limited to (), i64, f64, bool, enums, and c_ptr[T]",
+                "FFI signature `{}` has unsupported return type; returns are limited to (), i64, f32, f64, bool, enums, and c_ptr[T]",
                 name
             ));
         }
@@ -292,11 +298,11 @@ impl<'a> Checker<'a> {
     fn ffi_param_classes(&self, ty: &Type) -> Result<(usize, usize), String> {
         match ty {
             Type::I64 | Type::Bool | Type::Enum(_) | Type::CPtr(_) => Ok((1, 0)),
-            Type::F64 => Ok((0, 1)),
+            Type::F32 | Type::F64 => Ok((0, 1)),
             Type::Str => Ok((2, 0)),
             Type::Arr(element) if matches!(element.as_ref(), Type::I64 | Type::F64) => Ok((2, 0)),
             _ => Err(
-                "allowed boundary types are i64, f64, bool, enums, c_ptr[T], str, [i64], and [f64]; @c_layout by-value calls are not enabled yet"
+                "allowed boundary types are i64, f32, f64, bool, enums, c_ptr[T], str, [i64], and [f64]; @c_layout by-value calls are not enabled yet"
                     .into(),
             ),
         }

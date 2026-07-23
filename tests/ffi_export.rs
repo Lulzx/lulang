@@ -98,6 +98,79 @@ fn exported_library_works_from_c_and_ctypes() {
 }
 
 #[test]
+fn exported_f32_is_exact_in_headers_manifests_and_c_callers() {
+    let directory = std::env::temp_dir().join(format!("lulang_ffi_f32_{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create fixture directory");
+    let source = directory.join("scalar_f32.lu");
+    std::fs::write(
+        &source,
+        "export fn affine32(x: f32, y: f32): f32 {\n\
+           return x * y + f32(0.5)\n\
+         }\n\
+         main { print(0) }\n",
+    )
+    .expect("write source");
+    let base = directory.join("scalar_f32");
+
+    run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .args(["build", "--lib", "-o"])
+        .arg(&base)
+        .arg(&source));
+    let header = std::fs::read_to_string(directory.join("scalar_f32.h")).expect("read header");
+    assert!(header.contains("float affine32(float x, float y);"));
+    let manifest =
+        std::fs::read_to_string(directory.join("scalar_f32.json")).expect("read manifest");
+    assert!(manifest.contains("\"name\": \"x\", \"type\": \"f32\""));
+    assert!(manifest.contains("\"ret\": \"f32\""));
+
+    let c_source = directory.join("scalar_f32.c");
+    std::fs::write(
+        &c_source,
+        "#include <stdio.h>\n\
+         #include \"scalar_f32.h\"\n\
+         int main(void) {\n\
+           printf(\"%.1f\\n\", (double)affine32(2.0f, 4.0f));\n\
+           return 0;\n\
+         }\n",
+    )
+    .expect("write C harness");
+    let c_binary = directory.join("scalar_f32_c");
+    run(Command::new("clang")
+        .arg("-O2")
+        .arg("-I")
+        .arg(&directory)
+        .arg(&c_source)
+        .arg(directory.join("libscalar_f32.a"))
+        .arg("-o")
+        .arg(&c_binary));
+    let output = run(&mut Command::new(&c_binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "8.5\n");
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let selfhost_ir = directory.join("selfhost_scalar_f32.ll");
+    let generated = run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .arg("run")
+        .arg(repository.join("selfhost/codegen.lu"))
+        .arg(&source));
+    std::fs::write(&selfhost_ir, generated.stdout).expect("write self-hosted LLVM IR");
+    let selfhost_binary = directory.join("selfhost_scalar_f32_c");
+    run(Command::new("clang")
+        .arg("-O2")
+        .arg("-DLU_LIB")
+        .arg(&selfhost_ir)
+        .arg(repository.join("src/lu_runtime.c"))
+        .arg(&c_source)
+        .arg("-I")
+        .arg(&directory)
+        .arg("-o")
+        .arg(&selfhost_binary));
+    let output = run(&mut Command::new(&selfhost_binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "8.5\n");
+
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
 fn exported_opaque_pointer_uses_void_pointer_header_abi() {
     let directory = std::env::temp_dir().join(format!("lulang_ffi_pointer_{}", std::process::id()));
     std::fs::create_dir_all(&directory).expect("create fixture directory");

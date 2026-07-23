@@ -440,7 +440,8 @@ fn parse_type(inout p: P): i64 {
     return inner + 32
   }
   if t == "i64" or t == "i32" { return 0 }
-  if t == "f64" or t == "f32" { return 1 }
+  if t == "f64" { return 1 }
+  if t == "f32" { return 5 }
   if t == "bool" { return 2 }
   if t == "str" { return 3 }
   fail(p, "type")
@@ -565,6 +566,7 @@ type C { sname: [str], stype: [i64], smut: [i64], nsym: i64, err: i64 }
 fn tname(t: i64): str {
   if t == 0 { return "i64" }
   if t == 1 { return "f64" }
+  if t == 5 { return "f32" }
   if t == 2 { return "bool" }
   if t == 3 { return "str" }
   if t == 4 { return "()" }
@@ -578,10 +580,10 @@ fn tname(t: i64): str {
 }
 
 fn compat(expect: i64, actual: i64): bool {
-  return expect == actual or (expect == 1 and actual == 0)
+  return expect == actual or ((expect == 1 or expect == 5) and (actual == 0 or actual == 1 or actual == 5))
 }
 
-fn is_num(t: i64): bool { return t == 0 or t == 1 }
+fn is_num(t: i64): bool { return t == 0 or t == 1 or t == 5 }
 
 fn define(inout c: C, name: str, t: i64, m: i64) {
   c.sname[c.nsym] = name
@@ -649,6 +651,14 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
       return 5
     }
     return 1
+  }
+  if name == "f32" {
+    if na != 1 or not is_num(att[0]) {
+      print("type error: f32 expects one numeric arg")
+      c.err = 1
+      return 5
+    }
+    return 5
   }
   if name == "int" {
     if na != 1 {
@@ -778,6 +788,7 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
     if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" {
       if is_num(lt) and is_num(rt) {
         if lt == 1 or rt == 1 { return 1 }
+        if lt == 5 or rt == 5 { return 5 }
         return 0
       }
       print("type error: cannot apply", op, "to", tname(lt), "and", tname(rt))

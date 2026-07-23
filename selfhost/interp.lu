@@ -12,7 +12,7 @@
 // to running the same programs natively under `lu run`.
 //
 // Evaluator model: values are tagged records V (type codes 0=i64 1=f64
-// 2=bool 3=str 4=unit, enums 16+, records 64+, arrays T+1024); arrays and
+// 2=bool 3=str 4=unit 5=f32, enums 16+, records 64+, arrays T+1024); arrays and
 // record blocks live in a bump-allocated heap of value slots; records have
 // value semantics (blocks copy on var-bind, assignment, and array store;
 // immutable bindings and parameters share); variables live on a linear env
@@ -24,6 +24,7 @@
 extern fn lu_ffi_prepare(library: str, symbol: str): i64
 extern fn lu_ffi_call_i(control: [i64], floats: [f64]): i64
 extern fn lu_ffi_call_f(control: [i64], floats: [f64]): f64
+extern fn lu_ffi_call_f32(control: [i64], floats: [f64]): f64
 
 // ---------- lexer (same as selfhost/lexer.lu) ----------
 
@@ -723,7 +724,8 @@ fn parse_type(inout p: P): i64 {
     return inner + 2048
   }
   if t == "i64" or t == "i32" { return 0 }
-  if t == "f64" or t == "f32" { return 1 }
+  if t == "f64" { return 1 }
+  if t == "f32" { return 5 }
   if t == "bool" { return 2 }
   if t == "str" { return 3 }
   let ei = find_enum(p, t)
@@ -919,7 +921,7 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
       print("type error: FFI function", name, "cannot use inout")
       p.err = 1
     }
-    if t == 1 {
+    if t == 1 or t == 5 {
       nflo = nflo + 1
     } else {
       if t == 3 or t == 1024 or t == 1025 {
@@ -934,7 +936,7 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
       }
     }
   }
-  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or is_enumt(ret) or is_ptrt(ret)) {
+  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or ret == 5 or is_enumt(ret) or is_ptrt(ret)) {
     print("type error: unsupported FFI return in", name)
     p.err = 1
   }
@@ -1056,6 +1058,7 @@ type C { sname: [str], stype: [i64], smut: [i64], nsym: i64, err: i64 }
 fn tname(p: P, t: i64): str {
   if t == 0 { return "i64" }
   if t == 1 { return "f64" }
+  if t == 5 { return "f32" }
   if t == 2 { return "bool" }
   if t == 3 { return "str" }
   if t == 4 { return "()" }
@@ -1071,10 +1074,10 @@ fn tname(p: P, t: i64): str {
 }
 
 fn compat(expect: i64, actual: i64): bool {
-  return expect == actual or (expect == 1 and actual == 0)
+  return expect == actual or ((expect == 1 or expect == 5) and (actual == 0 or actual == 1 or actual == 5))
 }
 
-fn is_num(t: i64): bool { return t == 0 or t == 1 }
+fn is_num(t: i64): bool { return t == 0 or t == 1 or t == 5 }
 
 fn define(inout c: C, name: str, t: i64, m: i64) {
   c.sname[c.nsym] = name
@@ -1208,6 +1211,14 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
       return 5
     }
     return 1
+  }
+  if name == "f32" {
+    if na != 1 or not is_num(att[0]) {
+      print("type error: f32 expects one numeric arg")
+      c.err = 1
+      return 5
+    }
+    return 5
   }
   if name == "int" {
     if na != 1 {
@@ -1413,6 +1424,7 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
     if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" {
       if is_num(lt) and is_num(rt) {
         if lt == 1 or rt == 1 { return 1 }
+        if lt == 5 or rt == 5 { return 5 }
         return 0
       }
       print("type error: cannot apply", op, "to", tname(p, lt), "and", tname(p, rt))
@@ -1732,7 +1744,7 @@ fn check_program(p: P, inout c: C) {
 // ---------- evaluator ----------
 
 // runtime value: t is the type code from the checker; i64/bool/enum live in
-// i, f64 in f, str in s; arrays and records are heap blocks (o=offset,
+// i, f32/f64 in f, str in s; arrays and records are heap blocks (o=offset,
 // n=len/field count). Records have value semantics: blocks are copied
 // whenever a record is stored (var bind, assignment, array slot) — reads and
 // immutable bindings share the block.
@@ -1750,6 +1762,7 @@ type M {
 fn vunit(): V { return V { t: 4, i: 0, f: 0.0, s: "", o: 0, n: 0 } }
 fn vint(x: i64): V { return V { t: 0, i: x, f: 0.0, s: "", o: 0, n: 0 } }
 fn vfloat(x: f64): V { return V { t: 1, i: 0, f: x, s: "", o: 0, n: 0 } }
+fn vf32(x: f64): V { return V { t: 5, i: 0, f: float(f32(x)), s: "", o: 0, n: 0 } }
 fn vbool(b: i64): V { return V { t: 2, i: b, f: 0.0, s: "", o: 0, n: 0 } }
 fn vstr(s: str): V { return V { t: 3, i: 0, f: 0.0, s: s, o: 0, n: 0 } }
 
@@ -1758,9 +1771,12 @@ fn num_of(v: V): f64 {
   return v.f
 }
 
-// int widens to float where the static type demands it
+// Numeric values narrow or widen where the static type demands it.
 fn coerce(v: V, want: i64): V {
   if want == 1 and v.t == 0 { return vfloat(float(v.i)) }
+  if want == 1 and v.t == 5 { return vfloat(v.f) }
+  if want == 5 and v.t == 0 { return vf32(float(v.i)) }
+  if want == 5 and v.t == 1 { return vf32(v.f) }
   return v
 }
 
@@ -1810,6 +1826,7 @@ fn copy_array_val(inout m: M, v: V): V {
 fn put_v(v: V) {
   if v.t == 0 { puti(v.i) }
   if v.t == 1 { putf(v.f) }
+  if v.t == 5 { putf(v.f) }
   if v.t == 2 {
     if v.i == 1 { putb(true) } else { putb(false) }
   }
@@ -1840,11 +1857,18 @@ fn eval_bin(inout m: M, op: str, l: V, r: V): V {
     }
     let a = num_of(l)
     let b = num_of(r)
-    if op == "+" { return vfloat(a + b) }
-    if op == "-" { return vfloat(a - b) }
-    if op == "*" { return vfloat(a * b) }
-    if op == "/" { return vfloat(a / b) }
-    return vfloat(a % b)
+    if l.t == 1 or r.t == 1 {
+      if op == "+" { return vfloat(a + b) }
+      if op == "-" { return vfloat(a - b) }
+      if op == "*" { return vfloat(a * b) }
+      if op == "/" { return vfloat(a / b) }
+      return vfloat(a % b)
+    }
+    if op == "+" { return vf32(a + b) }
+    if op == "-" { return vf32(a - b) }
+    if op == "*" { return vf32(a * b) }
+    if op == "/" { return vf32(a / b) }
+    return vf32(a % b)
   }
   if op == "==" or op == "!=" {
     var same = 0
@@ -1879,7 +1903,7 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
   var float_len = 0
   for j in 0..p.fnp[f] {
     let v = vals[j]
-    if v.t == 1 { float_len = float_len + 1 }
+    if v.t == 1 or v.t == 5 { float_len = float_len + 1 }
     if v.t == 3 { control_len = control_len + len(v.s) }
     if v.t == 1024 { control_len = control_len + v.n }
     if v.t == 1025 { float_len = float_len + v.n }
@@ -1898,6 +1922,12 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
       floats[float_data] = v.f
       float_data = float_data + 1
     } else {
+      if v.t == 5 {
+        control[descriptor] = 5
+        control[descriptor + 1] = float_data
+        floats[float_data] = v.f
+        float_data = float_data + 1
+      } else {
       if v.t == 3 {
         control[descriptor] = 2
         control[descriptor + 1] = control_data
@@ -1930,6 +1960,7 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
           }
         }
       }
+      }
     }
   }
   if lu_ffi_prepare(p.flib[f], p.fname[f]) == 0 {
@@ -1941,7 +1972,11 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
   if p.fret[f] == 1 {
     float_result = lu_ffi_call_f(control, floats)
   } else {
-    integer_result = lu_ffi_call_i(control, floats)
+    if p.fret[f] == 5 {
+      float_result = lu_ffi_call_f32(control, floats)
+    } else {
+      integer_result = lu_ffi_call_i(control, floats)
+    }
   }
   for j in 0..p.fnp[f] {
     let v = vals[j]
@@ -1960,6 +1995,7 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
   }
   if p.fret[f] == 0 { return vint(integer_result) }
   if p.fret[f] == 1 { return vfloat(float_result) }
+  if p.fret[f] == 5 { return vf32(float_result) }
   if p.fret[f] == 2 { return vbool(integer_result) }
   if is_enumt(p.fret[f]) {
     return V { t: p.fret[f], i: integer_result, f: 0.0, s: "", o: 0, n: 0 }
@@ -2054,6 +2090,7 @@ fn eval_call(p: P, inout m: M, e: i64): V {
     return vfloat(atan2(x, y))
   }
   if name == "float" { return vfloat(num_of(eval_expr(p, m, argv[0]))) }
+  if name == "f32" { return vf32(num_of(eval_expr(p, m, argv[0]))) }
   if name == "int" {
     let v = eval_expr(p, m, argv[0])
     if v.t == 0 { return v }
@@ -2150,6 +2187,7 @@ fn eval_expr(p: P, inout m: M, e: i64): V {
     if m.halt == 1 { return vunit() }
     if nd.text == "-" {
       if v.t == 0 { return vint(0 - v.i) }
+      if v.t == 5 { return vf32(0.0 - v.f) }
       return vfloat(0.0 - v.f)
     }
     return vbool(1 - v.i)

@@ -849,6 +849,10 @@ impl<'a> Interp<'a> {
                     floats[float_index] = as_f64(value)?;
                     float_index += 1;
                 }
+                (Type::F32, value) => {
+                    floats[float_index] = f64::from_bits((as_f64(value)? as f32).to_bits() as u64);
+                    float_index += 1;
+                }
                 (Type::Str, Value::Str(bytes)) => {
                     ints[int_index] = bytes.as_ptr() as i64;
                     ints[int_index + 1] = bytes.len() as i64;
@@ -888,6 +892,7 @@ impl<'a> Interp<'a> {
         }
         let result = unsafe {
             match &declaration.ret {
+                Type::F32 => Value::Float32(crate::ffi::call_f32(pointer, ints, floats)),
                 Type::F64 => Value::Float(crate::ffi::call_f64(pointer, ints, floats)),
                 Type::Unit => {
                     crate::ffi::call_i64(pointer, ints, floats);
