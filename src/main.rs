@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: lu <run|build|interp> <file.lu> [program args...]\n\
+        "usage: lu <run|build|check|interp> <file.lu> [program args...]\n\
          \x20      lu build --lib [--shared] [-o name] <file.lu>\n\
          \x20      lu test [--runs N] <file.lu>\n\
          \x20      lu fmt [--check] <file.lu>"
@@ -189,6 +189,7 @@ fn run_pipeline(
                 Ok(true)
             }
             "test" => interp::Interp::new(&ir).run_properties(property_runs),
+            "check" => Ok(true),
             m => Err(format!("unknown mode `{}`", m)),
         }
     })()

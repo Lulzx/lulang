@@ -84,6 +84,14 @@ Writable contiguous NumPy `float64`/`int64` arrays and compatible Python
 buffers are passed directly to the generated C shim. Install the local package
 with `python3 -m pip install python/pylulang`.
 
+### Editor tooling
+
+`tools/lulang_lsp.py` is a dependency-free Language Server with live
+diagnostics, formatting, symbols, completion, hover, and go-to-definition.
+Set `LULANG_BIN` if `lu` is not on `PATH`. A VS Code extension with syntax
+highlighting and native editor providers lives in `editors/vscode`; the
+tree-sitter grammar and highlight query live in `editors/tree-sitter-lulang`.
+
 ## Architecture
 
 One front end, four back ends, packaged as the `lu_syntax`, `lu_check`, `lu_ir`,

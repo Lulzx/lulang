@@ -148,3 +148,13 @@ fn ffi_boundary_subset_and_register_caps_are_checked() {
         );
     }
 }
+
+#[test]
+fn check_mode_validates_without_executing_main() {
+    let output = run("check", "main { print(1 / 0) }\n");
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    let output = run("check", "main { print(unknown) }\n");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown variable"));
+}
