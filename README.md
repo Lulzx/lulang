@@ -159,6 +159,14 @@ refer to a declared dependency. Resolution composes the dependency graph
 before one whole-program typecheck and optimization pipeline. Set
 `LULANG_CACHE` to override the cache location.
 
+### Flagship: luphysics
+
+[`lib/luphysics`](lib/luphysics) is the end-to-end showcase: value-semantic
+vectors and bodies, softened N-body integration, rigid-circle impulses,
+executable conservation laws, native/WASI builds, an exported SoA integration
+kernel with a generated C header, and an optional raylib visualizer. Run
+`lu run` or `lu test --runs 1000` from that directory.
+
 ## Architecture
 
 One front end, four back ends, packaged as the `lu_syntax`, `lu_check`, `lu_ir`,

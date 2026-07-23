@@ -1,0 +1,179 @@
+// luphysics — small value-semantic particle and rigid-circle kernels.
+
+type Vec2 {
+  x: f64,
+  y: f64,
+}
+
+type Body {
+  position: Vec2,
+  velocity: Vec2,
+  force: Vec2,
+  inv_mass: f64,
+  radius: f64,
+}
+
+fn vec2(x: f64, y: f64): Vec2 {
+  return Vec2 { x: x, y: y }
+}
+
+fn vadd(a: Vec2, b: Vec2): Vec2 {
+  return Vec2 { x: a.x + b.x, y: a.y + b.y }
+}
+
+fn vsub(a: Vec2, b: Vec2): Vec2 {
+  return Vec2 { x: a.x - b.x, y: a.y - b.y }
+}
+
+fn vscale(a: Vec2, scale: f64): Vec2 {
+  return Vec2 { x: a.x * scale, y: a.y * scale }
+}
+
+fn vdot(a: Vec2, b: Vec2): f64 {
+  return a.x * b.x + a.y * b.y
+}
+
+fn length_squared(a: Vec2): f64 {
+  return vdot(a, a)
+}
+
+fn integrated_velocity(body: Body, dt: f64): Vec2 {
+  if body.inv_mass == 0.0 {
+    return body.velocity
+  }
+  let acceleration = vscale(body.force, body.inv_mass)
+  return vadd(body.velocity, vscale(acceleration, dt))
+}
+
+fn integrated_position(body: Body, dt: f64): Vec2 {
+  return vadd(body.position, vscale(integrated_velocity(body, dt), dt))
+}
+
+fn circle_impulse(first: Body, second: Body, restitution: f64): f64 {
+  let delta = vsub(second.position, first.position)
+  let distance2 = length_squared(delta)
+  let radius = first.radius + second.radius
+  if distance2 <= 0.0 or distance2 > radius * radius {
+    return 0.0
+  }
+  let distance = sqrt(distance2)
+  let normal = vscale(delta, 1.0 / distance)
+  let relative_speed = vdot(vsub(second.velocity, first.velocity), normal)
+  let inverse_mass = first.inv_mass + second.inv_mass
+  if relative_speed >= 0.0 or inverse_mass <= 0.0 {
+    return 0.0
+  }
+  return -(1.0 + restitution) * relative_speed / inverse_mass
+}
+
+fn circle_normal(first: Body, second: Body): Vec2 {
+  let delta = vsub(second.position, first.position)
+  return vscale(delta, 1.0 / sqrt(length_squared(delta)))
+}
+
+fn collision_velocity_first(first: Body, second: Body, restitution: f64): Vec2 {
+  let impulse = circle_impulse(first, second, restitution)
+  if impulse == 0.0 { return first.velocity }
+  return vsub(first.velocity, vscale(circle_normal(first, second), impulse * first.inv_mass))
+}
+
+fn collision_velocity_second(first: Body, second: Body, restitution: f64): Vec2 {
+  let impulse = circle_impulse(first, second, restitution)
+  if impulse == 0.0 { return second.velocity }
+  return vadd(second.velocity, vscale(circle_normal(first, second), impulse * second.inv_mass))
+}
+
+fn gravity_at(
+  x: [f64],
+  y: [f64],
+  mass: [f64],
+  body: i64,
+  count: i64,
+  gravity: f64,
+  softening: f64,
+): Vec2 {
+  var ax = 0.0
+  var ay = 0.0
+  for other in 0..count {
+    if other != body {
+      let dx = x[other] - x[body]
+      let dy = y[other] - y[body]
+      let distance2 = dx * dx + dy * dy + softening * softening
+      let inverse_distance = 1.0 / sqrt(distance2)
+      let scale = gravity * mass[other] * inverse_distance * inverse_distance * inverse_distance
+      ax = ax + dx * scale
+      ay = ay + dy * scale
+    }
+  }
+  return vec2(ax, ay)
+}
+
+fn step_velocity_x(
+  inout vx: [f64],
+  x: [f64],
+  y: [f64],
+  mass: [f64],
+  count: i64,
+  gravity: f64,
+  softening: f64,
+  dt: f64,
+) {
+  for body in 0..count {
+    let acceleration = gravity_at(x, y, mass, body, count, gravity, softening)
+    vx[body] = vx[body] + acceleration.x * dt
+  }
+}
+
+fn step_velocity_y(
+  inout vy: [f64],
+  x: [f64],
+  y: [f64],
+  mass: [f64],
+  count: i64,
+  gravity: f64,
+  softening: f64,
+  dt: f64,
+) {
+  for body in 0..count {
+    let acceleration = gravity_at(x, y, mass, body, count, gravity, softening)
+    vy[body] = vy[body] + acceleration.y * dt
+  }
+}
+
+fn advance_axis(
+  inout position: [f64],
+  velocity: [f64],
+  dt: f64,
+  count: i64,
+) {
+  for body in 0..count {
+    position[body] = position[body] + velocity[body] * dt
+  }
+}
+
+fn total_momentum_x(velocity: [f64], mass: [f64], count: i64): f64 {
+  return sum(i in 0..count) velocity[i] * mass[i]
+}
+
+fn total_kinetic_energy(
+  vx: [f64],
+  vy: [f64],
+  mass: [f64],
+  count: i64,
+): f64 {
+  return sum(i in 0..count) 0.5 * mass[i] * (vx[i] * vx[i] + vy[i] * vy[i])
+}
+
+// Embeddable SoA kernel: two arrays consume four integer-class registers,
+// leaving room for n while acceleration and dt use float-class registers.
+export fn integrate_axis(
+  position: [f64],
+  velocity: [f64],
+  acceleration: f64,
+  dt: f64,
+  count: i64,
+) {
+  for i in 0..count {
+    position[i] = position[i] + (velocity[i] + acceleration * dt) * dt
+  }
+}

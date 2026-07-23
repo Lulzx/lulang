@@ -360,21 +360,26 @@ fn append_package_source(
             files.extend(entries);
         }
     } else {
-        let preferred = if root {
-            directory.join("src/main.lu")
-        } else {
-            directory.join("src/lib.lu")
-        };
+        let preferred = directory.join("src/lib.lu");
         let fallback = directory.join("lib.lu");
-        if preferred.exists() {
+        if root {
+            if preferred.exists() {
+                files.push(preferred);
+            }
+            let main = directory.join("src/main.lu");
+            if main.exists() {
+                files.push(main);
+            } else {
+                return Err(format!("package `{}` has no src/main.lu", manifest.name));
+            }
+        } else if preferred.exists() {
             files.push(preferred);
         } else if fallback.exists() {
             files.push(fallback);
         } else {
             return Err(format!(
                 "package `{}` has no {}",
-                manifest.name,
-                if root { "src/main.lu" } else { "src/lib.lu" }
+                manifest.name, "src/lib.lu"
             ));
         }
     }

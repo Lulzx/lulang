@@ -36,7 +36,7 @@ than exposing internals.
 | 7 | `lu bindgen` C-header importer — **foundation shipped** | Very high | Medium–high |
 | 8 | `wasm32-wasi` / `wasm32-web` target — **shipped** | High | Medium |
 | 9 | Git-based package manager (`lu.toml`) — **foundation shipped** | High once libraries exist | Medium |
-| 10 | Flagship demo (`luphysics`) | High visibility | Medium |
+| 10 | Flagship demo (`luphysics`) — **shipped** | High visibility | Medium |
 | 11 | `lu doc` + benchmark observatory | High credibility | Medium |
 | 12 | Autodiff (`ludiff`, forward-mode duals first) | High technical value | High |
 
@@ -192,13 +192,16 @@ is intentionally no registry until roughly 20–30 meaningful packages exist.
 ### 10. Flagship showcase: `luphysics`
 
 Infrastructure alone doesn't create an ecosystem; applications prove why the
-language exists. Strongest flagship: a small rigid-body/particle physics
-engine — vectors, quaternions, collision kernels, integration, constraints,
-property tests for invariants, C ABI embedding, raylib visualizer. The
-language's teaser is already quaternion operators and `slerp`; this is that
-teaser grown up. Other candidates as the ecosystem matures: `luspice`
-(circuit simulation), `lurocket` (orbital mechanics), `luquant` (Monte Carlo
-pricing), `luimage` (kernels with visible output).
+language exists. `lib/luphysics` now supplies value-semantic vectors and
+bodies, softened N-body gravity, semi-implicit integration, rigid-circle
+impulses, conservation property tests, a WASI build, a C-embeddable SoA
+kernel, and an optional raylib visualizer with an explicit C boundary adapter.
+Its integration test exercises interpreter, JIT, AOT, properties, WASM
+production, generated headers, and a real C caller.
+
+Other candidates as the ecosystem matures: `luspice` (circuit simulation),
+`lurocket` (orbital mechanics), `luquant` (Monte Carlo pricing), and `luimage`
+(kernels with visible output).
 
 ### 11. `lu doc` + benchmark observatory
 

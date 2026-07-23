@@ -1,0 +1,21 @@
+main {
+  let count = 3
+  var x = [-1.0, 1.0, 0.0]
+  var y = [0.0, 0.0, 1.5]
+  var vx = [0.0, 0.0, 0.18]
+  var vy = [-0.12, 0.12, 0.0]
+  let mass = [1.0, 1.0, 0.25]
+  let before = total_momentum_x(vx, mass, count)
+  for frame in 0..200 {
+    step_velocity_x(vx, x, y, mass, count, 1.0, 0.05, 0.0025)
+    step_velocity_y(vy, x, y, mass, count, 1.0, 0.05, 0.0025)
+    advance_axis(x, vx, 0.0025, count)
+    advance_axis(y, vy, 0.0025, count)
+  }
+  let after = total_momentum_x(vx, mass, count)
+  print("luphysics")
+  print("body 0:", x[0], y[0])
+  print("body 1:", x[1], y[1])
+  print("momentum drift:", after - before)
+  print("kinetic energy:", total_kinetic_energy(vx, vy, mass, count))
+}

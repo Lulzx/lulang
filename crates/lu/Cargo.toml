@@ -47,6 +47,10 @@ path = "../../tests/wasm.rs"
 name = "package"
 path = "../../tests/package.rs"
 
+[[test]]
+name = "luphysics"
+path = "../../tests/luphysics.rs"
+
 [dependencies]
 lu_syntax.workspace = true
 lu_ir.workspace = true
