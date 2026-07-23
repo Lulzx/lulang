@@ -159,21 +159,24 @@ region and byte-copy it into codegen.lu (don't hardcode line numbers).
 
 ## Test plan
 
-- `tests/conformance.rs`: positive cases with deterministic, portable symbols
+- `tests/conformance.rs` (complete): positive cases with deterministic, portable symbols
   (`extern fn llabs(x: i64): i64`; `extern "m" fn cbrt(x: f64): f64`; an
   array-mutation case against a known `lu_*` runtime symbol declared as a
   plain extern). Negative cases: record in signature, >6 int-class args,
   `f32`, inout, unresolvable symbol.
-- New `tests/ffi_export.rs`: build a `--lib` fixture, compile a ~20-line C
+- `tests/ffi_export.rs` (complete): build a `--lib` fixture, compile a ~20-line C
   harness against the generated header with clang, run, diff stdout; a
   second harness via `python3 -c "import ctypes; ..."` guarded on python3
   presence.
-- Corpus: `corpus/ffi_cbrt.lu` (import) and `corpus/kernel_saxpy.lu` (export,
+- Corpus (complete): `corpus/ffi_cbrt.lu` (import) and
+  `corpus/kernel_saxpy.lu` (export,
   with `saxpy.c`/`saxpy.py` harnesses) — doubles as the README adoption demo.
-- Selfhost: bootstrap fixpoint after every slice; byte-diff `lu build`'s .ll
+- Selfhost (complete): bootstrap fixpoint after every slice; byte-diff
+  `lu build`'s .ll
   vs codegen.lu's .ll for an extern-using and an export-using corpus program;
-  CI check that interp.lu's shared region == codegen.lu's.
-- Close-out: README M8 status row; commit message ends "(M8)".
+  test that interp.lu's shared region == codegen.lu's. These invariants are
+  executable in `tests/selfhost_sync.rs`.
+- Close-out (complete): README M8 status row and the landed M8 commit.
 
 ## Risks
 

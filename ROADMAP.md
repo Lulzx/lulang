@@ -69,10 +69,12 @@ M8 boundary subset: `i64`, `f64`, `bool` (0/1 as `int64_t`), enums (i64 tag),
 `str` as `(const char*, int64_t)` parameters, `[i64]`/`[f64]` as
 `(T* data, int64_t n)`. Signatures capped at 6 integer-class + 8 float-class
 components (a language rule that keeps every argument in registers on both
-SysV x86-64 and AArch64). The first follow-up, boundary-only `c_ptr[T]` opaque
-handles, now works in all four tiers and in generated headers. Remaining
-follow-ups: `f32` at the boundary, `c_slice[T]`, `@c_layout` records, `str`
-returns, callbacks, and zero-copy array export handles.
+SysV x86-64 and AArch64). Boundary-only `c_ptr[T]` opaque handles now work in
+all four tiers and generated headers. Exact record metadata is opt-in through
+`@c_layout`; bindgen uses adapters rather than pretending that compiler-owned
+records have C layout. Remaining follow-ups: direct `f32` parameters,
+`c_slice[T]`, by-value `@c_layout` calls without adapters, `str` returns,
+callbacks, and zero-copy array export handles.
 
 ### 3. `pylulang`
 
@@ -136,6 +138,8 @@ the package in all four tiers plus the generated Python ABI.
 The first public version at `lulang.lulzx.space` includes a local browser
 interpreter, editable source, and examples for functions, reductions, arrays,
 and value semantics. It has no server-side execution and requires no install.
+The same deployment now includes the source-linked benchmark observatory and
+the Embedded notebook proof.
 Next: compile the reference interpreter to wasm32 (the CFG evaluator compiles
 where Cranelift won't), then add property tests, lowered IR, generated LLVM,
 and shareable permalinks. Best later examples are visual and surprising:
@@ -238,7 +242,11 @@ cross-language numerical answers, records median whole-process measurements,
 and links the lulang, C++, Rust, Julia, NumPy, and JavaScript implementations
 with machine/tool provenance and explicit semantic/layout assumptions. Missing
 runtimes remain visibly unmeasured. A scheduled workflow regenerates the same
-source-linked artifact.
+source-linked artifact. The public
+[observatory](https://lulang.lulzx.space/observatory) includes the checked
+LLVM, every language implementation, machine and tool provenance, the chosen
+layout and semantic assumptions, all five ablation switches, and the generated
+header/manifest/notebook for the Embedded proof.
 
 ### 12. `ludiff`
 
@@ -275,6 +283,15 @@ One packaged milestone arc built from items 1–4:
    conventional implementation from a notebook.
 6. VS Code syntax + diagnostics.
 7. A page showing the source, the generated header, and the benchmark.
+
+All seven steps are now executable in the repository. The
+[`lulang_embedded.ipynb`](examples/lulang_embedded.ipynb) notebook compiles a
+quaternion-slerp kernel through `pylulang`, checks it against NumPy, measures
+both after compilation, and fails if the compiled kernel does not win. The
+generated [header](examples/embedded_slerp.h) and
+[manifest](examples/embedded_slerp.json) are checked against fresh compiler
+output in the release suite. The public observatory publishes the same source,
+interface, method, and measured result.
 
 The adoption loop this creates:
 

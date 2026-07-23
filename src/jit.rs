@@ -796,6 +796,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             InstKind::Load(local) => {
                 *local != self.cfg.loops[loop_index].induction
                     && function.locals[*local as usize].ty == CType::F64
+                    && self.cfg_loop_invariant_local(function, loop_index, *local)
             }
             InstKind::Unary {
                 op: UnaryOp::Neg,
@@ -843,6 +844,26 @@ impl<'a, 'b> Gen<'a, 'b> {
                 .all(|value| self.cfg_vector_value(function, loop_index, *value)),
             _ => false,
         }
+    }
+
+    fn cfg_loop_invariant_local(
+        &self,
+        function: &ir::Function,
+        loop_index: usize,
+        local: ir::LocalId,
+    ) -> bool {
+        self.cfg.loops[loop_index].blocks.iter().all(|block| {
+            function.blocks[*block as usize]
+                .instructions
+                .iter()
+                .all(|instruction| match &instruction.kind {
+                    InstKind::Store { local: target, .. } => *target != local,
+                    InstKind::Call { inout, .. } => {
+                        !inout.iter().flatten().any(|target| *target == local)
+                    }
+                    _ => true,
+                })
+        })
     }
 
     fn gen_cfg_vector_value(

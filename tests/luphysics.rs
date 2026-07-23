@@ -97,5 +97,42 @@ fn flagship_physics_package_runs_properties_targets_and_c_embedding() {
         );
     }
 
+    if Command::new("python3")
+        .arg("-c")
+        .arg("import numpy")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        let notebook = run(Command::new("python3")
+            .arg(repository.join("examples/run_embedded_notebook.py"))
+            .env("LULANG_BIN", env!("CARGO_BIN_EXE_lu"))
+            .env("LULANG_NOTEBOOK_N", "20000")
+            .env("LULANG_NOTEBOOK_RUNS", "3")
+            .current_dir(&repository));
+        let notebook = String::from_utf8_lossy(&notebook.stdout);
+        assert!(notebook.contains("checksum:"));
+        assert!(notebook.contains("speedup:"));
+    }
+
+    let embedded_base = directory.join("embedded_slerp");
+    run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .args(["build", "--lib", "-o"])
+        .arg(&embedded_base)
+        .arg(repository.join("examples/embedded_slerp.lu")));
+    for extension in ["h", "json"] {
+        let generated = std::fs::read_to_string(embedded_base.with_extension(extension))
+            .expect("read generated Embedded interface");
+        let checked = std::fs::read_to_string(
+            repository
+                .join("examples")
+                .join(format!("embedded_slerp.{extension}")),
+        )
+        .expect("read checked Embedded interface");
+        assert_eq!(
+            generated, checked,
+            "checked Embedded {extension} drifted from the compiler"
+        );
+    }
+
     let _ = std::fs::remove_dir_all(directory);
 }

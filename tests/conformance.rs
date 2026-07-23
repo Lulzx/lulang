@@ -246,6 +246,61 @@ fn scalar_ffi_imports_match_across_all_tiers() {
 }
 
 #[test]
+fn simd_reductions_do_not_treat_inlined_return_slots_as_invariants() {
+    assert_success(
+        "simd_inlined_return_slot",
+        "fn one(): f64 { return 1.0 }\n\
+         main { print(sum(i in 0..8) one()) }\n",
+        b"8\n",
+    );
+}
+
+#[test]
+fn unresolved_ffi_symbols_fail_cleanly_in_every_tier() {
+    let source = "extern fn lulang_symbol_that_does_not_exist_7f42(x: i64): i64\n\
+         main { print(lulang_symbol_that_does_not_exist_7f42(1)) }\n";
+    let dir = CaseDir::new("ffi_unresolved_symbol", source);
+
+    for (backend, output) in [
+        ("interpreter", host("interp", &dir.source())),
+        ("JIT", host("run", &dir.source())),
+        ("self-hosted", selfhost(&dir.source())),
+    ] {
+        assert!(
+            !output.status.success()
+                || output.stdout.windows(5).any(|part| part == b"error")
+                || output.stderr.windows(5).any(|part| part == b"error"),
+            "unresolved symbol unexpectedly succeeded in {backend}"
+        );
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            diagnostic.contains("lulang_symbol_that_does_not_exist_7f42")
+                || diagnostic.contains("resolve")
+                || diagnostic.contains("symbol"),
+            "missing unresolved-symbol diagnostic in {backend}: {diagnostic}"
+        );
+    }
+
+    let built = run(Command::new(lu())
+        .args(["build", dir.source().to_str().unwrap()])
+        .current_dir(&dir.0));
+    assert!(
+        !built.status.success(),
+        "AOT linked an unresolved FFI symbol"
+    );
+    let diagnostic = String::from_utf8_lossy(&built.stderr);
+    assert!(
+        diagnostic.contains("lulang_symbol_that_does_not_exist_7f42")
+            || diagnostic.contains("undefined"),
+        "missing AOT linker diagnostic: {diagnostic}"
+    );
+}
+
+#[test]
 fn ffi_arrays_and_strings_match_across_all_tiers() {
     let dir = CaseDir::new("ffi_array_copyout", "");
     let extension = if cfg!(target_os = "macos") {
