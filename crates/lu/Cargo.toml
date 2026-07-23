@@ -23,6 +23,10 @@ path = "../../tests/frontend_perf.rs"
 name = "ffi_export"
 path = "../../tests/ffi_export.rs"
 
+[[test]]
+name = "pylulang"
+path = "../../tests/pylulang.rs"
+
 [dependencies]
 lu_syntax.workspace = true
 lu_ir.workspace = true

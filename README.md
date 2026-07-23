@@ -66,6 +66,24 @@ cargo build --release
 ./selfhost/build.sh --bootstrap      # 3-stage self-compilation; verifies the IR fixpoint
 ```
 
+### Python kernels
+
+The pure-Python `pylulang` package compiles source through the generated ABI
+manifest and exposes each `export fn` as a callable:
+
+```python
+import pylulang
+
+module = pylulang.compile(open("corpus/kernel_saxpy.lu").read())
+x = [1.0, 2.0, 3.0]
+y = [10.0, 20.0, 30.0]
+total = module.saxpy(2.0, x, y, 3)  # y is copied back: [12, 24, 36]
+```
+
+Writable contiguous NumPy `float64`/`int64` arrays and compatible Python
+buffers are passed directly to the generated C shim. Install the local package
+with `python3 -m pip install python/pylulang`.
+
 ## Architecture
 
 One front end, four back ends, packaged as the `lu_syntax`, `lu_check`, `lu_ir`,

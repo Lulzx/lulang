@@ -29,7 +29,7 @@ than exposing internals.
 |--:|---------|--------------------|--------|
 | 1 | Stable C import/export ABI (M8) — **complete** | Exceptional | Medium |
 | 2 | Generated C headers + machine-readable ABI manifest — **complete** | Exceptional | Low–medium |
-| 3 | `pylulang`: NumPy/Python bindings | Exceptional | Medium |
+| 3 | `pylulang`: NumPy/Python bindings — **complete (v0.1)** | Exceptional | Medium |
 | 4 | LSP + VS Code extension (tree-sitter first) | Very high | Medium |
 | 5 | `lu-numerics` first-party library corpus | Very high | Continuous |
 | 6 | Web playground (interpreter → wasm32) | High | Medium |

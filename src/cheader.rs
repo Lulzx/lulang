@@ -132,9 +132,28 @@ pub fn emit_header(program: &LoweredProgram, guard_name: &str) -> Result<String,
 
 pub fn emit_manifest(program: &LoweredProgram, library: &str) -> String {
     let mut out = format!(
-        "{{\n  \"abi_version\": 1,\n  \"library\": {},\n  \"exports\": [",
+        "{{\n  \"abi_version\": 1,\n  \"library\": {},\n  \"enums\": {{",
         json_string(library)
     );
+    for (enum_index, definition) in program.enums.iter().enumerate() {
+        if enum_index == 0 {
+            out.push('\n');
+        } else {
+            out.push_str(",\n");
+        }
+        let _ = write!(out, "    {}: [", json_string(&definition.name));
+        for (variant_index, variant) in definition.variants.iter().enumerate() {
+            if variant_index != 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&json_string(variant));
+        }
+        out.push(']');
+    }
+    if !program.enums.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("  },\n  \"exports\": [");
     let exports = program
         .functions
         .iter()
