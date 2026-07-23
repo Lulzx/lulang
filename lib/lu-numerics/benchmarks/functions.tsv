@@ -1,0 +1,27 @@
+function	group	driver	workload
+dot	vector	src/main.lu	4-element order-free reduction
+norm2	vector	src/main.lu	4-element norm
+axpy	vector	src/main.lu	boundary transform
+scale	vector	src/main.lu	boundary transform
+mean	statistics	src/main.lu	4 samples
+variance	statistics	src/main.lu	4 samples
+mse	statistics	src/main.lu	4 paired samples
+trapz_uniform	integration	src/main.lu	4 uniform samples
+trapz_xy	integration	src/main.lu	4 coordinate samples
+polynomial_eval	polynomial	src/main.lu	cubic Horner evaluation
+gemv_inplace	linalg	src/main.lu	2x2 matrix
+matmul_square_inplace	linalg	src/main.lu	2x2 matrices
+convolution_inplace	signal	src/main.lu	4 samples x 2 taps
+moving_average_inplace	signal	src/main.lu	4 samples x 2 window
+lcg_step	random	src/main.lu	one deterministic step
+monte_carlo_pi	random	src/main.lu	20000 samples
+bisect_sqrt	optimize	src/main.lu	50 iterations
+sinc	special	src/main.lu	one scalar
+normal_pdf	special	src/main.lu	one scalar
+sigmoid	special	src/main.lu	one scalar
+clamp	geometry	src/main.lu	one scalar
+lerp	geometry	src/main.lu	one scalar
+distance3	geometry	src/main.lu	two scalar points
+determinant2	linalg	src/main.lu	2x2 determinant
+factorial	special	src/main.lu	n=10
+binomial	special	src/main.lu	n=10 k=4

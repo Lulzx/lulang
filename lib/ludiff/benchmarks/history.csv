@@ -1,0 +1,2 @@
+timestamp,label,runs,interp_ms,jit_ms,aot_ms,compile_ms
+1784790700,ludiff,5,2.181442,4.100575,2.004300,63.000667

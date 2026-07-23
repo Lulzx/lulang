@@ -58,6 +58,9 @@ cargo build --release
 ./target/release/lu build --lib -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu build --lib --shared -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu bindgen --lib m -o math.lu /usr/include/math.h
+./target/release/lu bench --runs 7 corpus/bench_dot.lu
+./target/release/lu doc --runs 100 -o target/doc corpus/kernel_saxpy.lu
+./target/release/lu build --emit-llvm -o kernel.ll corpus/kernel_saxpy.lu
 ./target/release/lu fmt corpus/slerp.lu    # canonical Unicode operators + layout
 ./target/release/lu fmt --check corpus/slerp.lu
 ./target/release/lu run selfhost/lexer.lu  # the lulang lexer, written in lulang
@@ -115,11 +118,15 @@ explicit diagnostics.
 
 ### Editor tooling
 
-`tools/lulang_lsp.py` is a dependency-free Language Server with live
-diagnostics, formatting, symbols, completion, hover, and go-to-definition.
-Set `LULANG_BIN` if `lu` is not on `PATH`. A VS Code extension with syntax
-highlighting and native editor providers lives in `editors/vscode`; the
-tree-sitter grammar and highlight query live in `editors/tree-sitter-lulang`.
+`lu lsp` starts the dependency-free Language Server with live diagnostics,
+formatting, symbols, typed hover/completion, function and operator
+go-to-definition, and executable property lenses. A failed lens publishes the
+shrunk counterexample on the property declaration. Set `LULANG_LSP` only when
+the Python server is installed outside the usual source/share paths. The VS
+Code extension in `editors/vscode` also provides these features directly,
+enables format-on-save, and includes `dot`, `norm`, and `approx` Unicode input
+snippets. The tree-sitter grammar and highlight query live in
+`editors/tree-sitter-lulang`.
 
 ### WebAssembly targets
 
@@ -166,6 +173,42 @@ vectors and bodies, softened N-body integration, rigid-circle impulses,
 executable conservation laws, native/WASI builds, an exported SoA integration
 kernel with a generated C header, and an optional raylib visualizer. Run
 `lu run` or `lu test --runs 1000` from that directory.
+
+### First-party numerics
+
+[`lib/lu-numerics`](lib/lu-numerics) is a package of 26 documented kernels
+across vectors, statistics, integration, dense linear algebra, signal
+processing, random/Monte Carlo work, optimization, geometry, and special
+functions. Every export is tied to an executable law, benchmark entry,
+generated function page, and C++/NumPy/Julia reference source.
+
+### Autodiff: ludiff
+
+[`lib/ludiff`](lib/ludiff) implements forward-mode automatic differentiation
+as ordinary library code: a two-field `Dual` record, user-defined `⊕`, `⊖`,
+`⊗`, and `⊘` operators, elementary derivative rules, and nine executable laws
+including a finite-difference check. No compiler differentiation pass exists.
+The exported example returns a scalar derivative through the stable C ABI
+without exposing `Dual` record layout.
+
+### Executable documentation and benchmarks
+
+`lu bench [--runs N] [file.lu]` measures whole-process interpreter, JIT, and
+AOT execution and appends the result to `benchmarks/history.csv`. With no file,
+it resolves the current `lu.toml` package.
+
+`lu doc [--runs N] [-o directory] [file.lu]` generates a static site containing
+one page per function, adjacent `///` prose, example calls, related property
+statuses, local benchmark history, exported C signatures, the ABI manifest,
+source, and generated LLVM. Package docs include laws from `tests/*.lu`, so the
+status shown beside an API is an executed claim rather than copied prose.
+
+The generated benchmark observatory links every measurement to its lulang,
+C++, Rust, Julia, NumPy, and JavaScript source, publishes the selfhost result
+and measurement environment when available, and names semantic/layout
+differences. Regenerate the checked-in matrix with
+`python3 benchmarks/run_observatory.py --runs 7 --bootstrap`; a scheduled
+workflow produces the same source-linked artifact.
 
 ## Architecture
 

@@ -1,0 +1,18 @@
+{
+  "generated_at": "2026-07-23T07:06:48.648149+00:00",
+  "git_commit": "4cae796dc1525c5ecf1680137ec608895cefced2",
+  "git_dirty": true,
+  "runs_per_command": 5,
+  "platform": "macOS-26.6-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "processor": "arm",
+  "python": "3.14.6",
+  "tools": {
+    "clang": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "rust": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+    "julia": null,
+    "numpy": "2.2.6",
+    "bun": "1.3.14"
+  },
+  "environment": {}
+}

@@ -1,0 +1,2 @@
+timestamp,label,runs,interp_ms,jit_ms,aot_ms,compile_ms
+1784789737,luphysics,2,24.538958,111.239604,2.046646,100.103375

@@ -135,6 +135,30 @@ fn property_run_count_is_configurable() {
 }
 
 #[test]
+fn one_property_can_be_selected_for_editor_lenses() {
+    let output = run_args(
+        &[
+            "test",
+            "--runs",
+            "9",
+            "--property",
+            "selected",
+            "/dev/stdin",
+        ],
+        "property skipped(x: i64) { false }\nproperty selected(x: i64) { x == x }\n",
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"property selected ... ok (9 runs)\n");
+
+    let missing = run_args(
+        &["test", "--property", "missing", "/dev/stdin"],
+        "property selected(x: i64) { x == x }\n",
+    );
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown property `missing`"));
+}
+
+#[test]
 fn ffi_declarations_parse_and_exports_remain_callable_in_host_tiers() {
     assert_modes(
         "extern \"m\" fn cbrt(x: f64): f64\n\

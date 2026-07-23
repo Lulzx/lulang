@@ -22,6 +22,21 @@
       "scopeName": "source.lulang",
       "path": "./syntaxes/lulang.tmLanguage.json"
     }],
+    "snippets": [{
+      "language": "lulang",
+      "path": "./snippets/lulang.json"
+    }],
+    "commands": [{
+      "command": "lulang.runProperty",
+      "title": "lulang: Run Property"
+    }],
+    "configurationDefaults": {
+      "[lulang]": {
+        "editor.defaultFormatter": "lulang.lulang",
+        "editor.formatOnSave": true,
+        "editor.codeLens": true
+      }
+    },
     "configuration": {
       "title": "lulang",
       "properties": {

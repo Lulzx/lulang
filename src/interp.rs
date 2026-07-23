@@ -23,6 +23,13 @@ pub struct Interp<'a> {
     ir: &'a LoweredProgram,
 }
 
+#[derive(Clone, Debug)]
+pub struct PropertyStatus {
+    pub name: String,
+    pub passed: bool,
+    pub runs: u32,
+}
+
 fn as_f64(v: &Value) -> Result<f64, String> {
     match v {
         Value::Float32(f) => Ok(*f as f64),
@@ -105,9 +112,28 @@ impl<'a> Interp<'a> {
     }
 
     pub fn run_properties(&self, runs: u32) -> Result<bool, String> {
+        self.run_properties_filtered(runs, None)
+    }
+
+    pub fn run_property(&self, runs: u32, name: &str) -> Result<bool, String> {
+        if !self
+            .ir
+            .properties
+            .iter()
+            .any(|property| property.name == name)
+        {
+            return Err(format!("unknown property `{name}`"));
+        }
+        self.run_properties_filtered(runs, Some(name))
+    }
+
+    fn run_properties_filtered(&self, runs: u32, only: Option<&str>) -> Result<bool, String> {
         let mut all_ok = true;
         let mut rng: u64 = 0x9E3779B97F4A7C15;
         for prop in &self.ir.properties {
+            if only.is_some_and(|name| name != prop.name) {
+                continue;
+            }
             let function_id = prop.function;
             let mut failed = None;
             for _ in 0..runs {
@@ -150,6 +176,45 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(all_ok)
+    }
+
+    pub fn property_statuses(&self, runs: u32) -> Result<Vec<PropertyStatus>, String> {
+        let mut statuses = Vec::new();
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        for property in &self.ir.properties {
+            let mut passed = true;
+            let mut completed_runs = 0;
+            for _ in 0..runs {
+                let args = property
+                    .params
+                    .iter()
+                    .map(|(_, ty)| self.gen_value(ty, &mut rng))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let value = self
+                    .execute(&self.ir.functions[property.function as usize], args)?
+                    .0;
+                match value {
+                    Value::Bool(true) => completed_runs += 1,
+                    Value::Bool(false) => {
+                        passed = false;
+                        completed_runs += 1;
+                        break;
+                    }
+                    value => {
+                        return Err(format!(
+                            "property `{}` returned non-bool {:?}",
+                            property.name, value
+                        ))
+                    }
+                }
+            }
+            statuses.push(PropertyStatus {
+                name: property.name.clone(),
+                passed,
+                runs: completed_runs,
+            });
+        }
+        Ok(statuses)
     }
 
     /// Greedy shrink: repeatedly try simpler variants of each argument, keeping

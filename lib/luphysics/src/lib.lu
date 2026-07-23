@@ -13,30 +13,37 @@ type Body {
   radius: f64,
 }
 
+/// Constructs a two-dimensional vector.
 fn vec2(x: f64, y: f64): Vec2 {
   return Vec2 { x: x, y: y }
 }
 
+/// Adds two vectors component by component.
 fn vadd(a: Vec2, b: Vec2): Vec2 {
   return Vec2 { x: a.x + b.x, y: a.y + b.y }
 }
 
+/// Subtracts the second vector from the first.
 fn vsub(a: Vec2, b: Vec2): Vec2 {
   return Vec2 { x: a.x - b.x, y: a.y - b.y }
 }
 
+/// Multiplies a vector by a scalar.
 fn vscale(a: Vec2, scale: f64): Vec2 {
   return Vec2 { x: a.x * scale, y: a.y * scale }
 }
 
+/// Computes the Euclidean dot product.
 fn vdot(a: Vec2, b: Vec2): f64 {
   return a.x * b.x + a.y * b.y
 }
 
+/// Computes squared length without an unnecessary square root.
 fn length_squared(a: Vec2): f64 {
   return vdot(a, a)
 }
 
+/// Advances velocity with a semi-implicit Euler force step.
 fn integrated_velocity(body: Body, dt: f64): Vec2 {
   if body.inv_mass == 0.0 {
     return body.velocity
@@ -45,10 +52,12 @@ fn integrated_velocity(body: Body, dt: f64): Vec2 {
   return vadd(body.velocity, vscale(acceleration, dt))
 }
 
+/// Advances position using the newly integrated velocity.
 fn integrated_position(body: Body, dt: f64): Vec2 {
   return vadd(body.position, vscale(integrated_velocity(body, dt), dt))
 }
 
+/// Computes the scalar normal impulse for two overlapping circles.
 fn circle_impulse(first: Body, second: Body, restitution: f64): f64 {
   let delta = vsub(second.position, first.position)
   let distance2 = length_squared(delta)
@@ -66,23 +75,27 @@ fn circle_impulse(first: Body, second: Body, restitution: f64): f64 {
   return -(1.0 + restitution) * relative_speed / inverse_mass
 }
 
+/// Returns the contact normal from the first circle to the second.
 fn circle_normal(first: Body, second: Body): Vec2 {
   let delta = vsub(second.position, first.position)
   return vscale(delta, 1.0 / sqrt(length_squared(delta)))
 }
 
+/// Returns the first circle's post-collision velocity.
 fn collision_velocity_first(first: Body, second: Body, restitution: f64): Vec2 {
   let impulse = circle_impulse(first, second, restitution)
   if impulse == 0.0 { return first.velocity }
   return vsub(first.velocity, vscale(circle_normal(first, second), impulse * first.inv_mass))
 }
 
+/// Returns the second circle's post-collision velocity.
 fn collision_velocity_second(first: Body, second: Body, restitution: f64): Vec2 {
   let impulse = circle_impulse(first, second, restitution)
   if impulse == 0.0 { return second.velocity }
   return vadd(second.velocity, vscale(circle_normal(first, second), impulse * second.inv_mass))
 }
 
+/// Computes softened gravitational acceleration at one body.
 fn gravity_at(
   x: [f64],
   y: [f64],
@@ -108,6 +121,7 @@ fn gravity_at(
   return vec2(ax, ay)
 }
 
+/// Integrates the x velocity plane from a shared position snapshot.
 fn step_velocity_x(
   inout vx: [f64],
   x: [f64],
@@ -124,6 +138,7 @@ fn step_velocity_x(
   }
 }
 
+/// Integrates the y velocity plane from a shared position snapshot.
 fn step_velocity_y(
   inout vy: [f64],
   x: [f64],
@@ -140,6 +155,7 @@ fn step_velocity_y(
   }
 }
 
+/// Advances one position plane using its corresponding velocity plane.
 fn advance_axis(
   inout position: [f64],
   velocity: [f64],
@@ -151,10 +167,12 @@ fn advance_axis(
   }
 }
 
+/// Reduces total momentum along one axis.
 fn total_momentum_x(velocity: [f64], mass: [f64], count: i64): f64 {
   return sum(i in 0..count) velocity[i] * mass[i]
 }
 
+/// Reduces total two-dimensional kinetic energy.
 fn total_kinetic_energy(
   vx: [f64],
   vy: [f64],
@@ -166,6 +184,7 @@ fn total_kinetic_energy(
 
 // Embeddable SoA kernel: two arrays consume four integer-class registers,
 // leaving room for n while acceleration and dt use float-class registers.
+/// Advances an externally owned position plane through the stable C ABI.
 export fn integrate_axis(
   position: [f64],
   velocity: [f64],

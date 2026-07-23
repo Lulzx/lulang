@@ -343,10 +343,16 @@ fn append_package_source(
 ) -> Result<(), String> {
     let manifest = read_manifest(&directory.join("lu.toml"))?;
     let mut files = Vec::new();
-    if root && mode == "test" {
+    if root && matches!(mode, "test" | "doc") {
         let library = directory.join("src/lib.lu");
         if library.exists() {
             files.push(library);
+        }
+        if mode == "doc" {
+            let main = directory.join("src/main.lu");
+            if main.exists() {
+                files.push(main);
+            }
         }
         let tests = directory.join("tests");
         if tests.exists() {
@@ -384,7 +390,10 @@ fn append_package_source(
         }
     }
     if files.is_empty() {
-        return Err(format!("package `{}` has no test sources", manifest.name));
+        return Err(format!(
+            "package `{}` has no {} sources",
+            manifest.name, mode
+        ));
     }
     for file in files {
         let canonical = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());

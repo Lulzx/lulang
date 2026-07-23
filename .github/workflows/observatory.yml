@@ -1,0 +1,33 @@
+name: Benchmark observatory
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install NumPy
+        run: python3 -m pip install numpy
+      - name: Measure source-linked matrix
+        run: python3 benchmarks/run_observatory.py --runs 7 --bootstrap
+      - name: Build executable documentation
+        working-directory: lib/luphysics
+        run: ../../target/release/lu doc --runs 100 -o ../../target/observatory-site
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lulang-observatory
+          path: |
+            benchmarks/observatory.tsv
+            benchmarks/environment.json
+            target/observatory-site

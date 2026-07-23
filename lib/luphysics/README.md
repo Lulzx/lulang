@@ -14,9 +14,14 @@ Run it from this directory:
 ```bash
 lu run
 lu test --runs 1000
+lu bench --runs 7
+lu doc --runs 100
 lu build --target wasm32-wasi
 lu build --lib --shared -o luphysics src/lib.lu
 ```
+
+`lu doc` executes the laws in `tests/laws.lu` and writes the API, their status,
+generated C ABI, LLVM IR, and benchmark observatory to `target/doc`.
 
 If raylib is installed, `./run_raylib.sh` builds the small boundary adapter and
 runs an interactive three-body visualizer. The adapter deliberately converts

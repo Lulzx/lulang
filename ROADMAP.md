@@ -31,14 +31,14 @@ than exposing internals.
 | 2 | Generated C headers + machine-readable ABI manifest — **complete** | Exceptional | Low–medium |
 | 3 | `pylulang`: NumPy/Python bindings — **complete (v0.1)** | Exceptional | Medium |
 | 4 | LSP + VS Code extension (tree-sitter first) — **complete (v0.1)** | Very high | Medium |
-| 5 | `lu-numerics` first-party library corpus — **foundation shipped** | Very high | Continuous |
+| 5 | `lu-numerics` first-party library corpus — **complete (v0.1)** | Very high | Continuous |
 | 6 | Web playground (interpreter → wasm32) — **v0.1 shipped** | High | Medium |
 | 7 | `lu bindgen` C-header importer — **foundation shipped** | Very high | Medium–high |
 | 8 | `wasm32-wasi` / `wasm32-web` target — **shipped** | High | Medium |
 | 9 | Git-based package manager (`lu.toml`) — **foundation shipped** | High once libraries exist | Medium |
 | 10 | Flagship demo (`luphysics`) — **shipped** | High visibility | Medium |
-| 11 | `lu doc` + benchmark observatory | High credibility | Medium |
-| 12 | Autodiff (`ludiff`, forward-mode duals first) | High technical value | High |
+| 11 | `lu doc` + benchmark observatory — **shipped** | High credibility | Medium |
+| 12 | Autodiff (`ludiff`, forward-mode duals first) — **shipped** | High technical value | High |
 
 ### 1–2. C ABI: `extern` + `export` (milestone M8)
 
@@ -104,6 +104,12 @@ the syntax reads as a barrier instead of a feature. Deliverable: one VS Code
 extension bundling grammar + LSP + operator input + "run property" commands
 with inline counterexample display.
 
+The v0.1 deliverable now includes `lu lsp`, typed symbol completion/hover,
+function and Unicode-operator definition navigation, format-on-save, Unicode
+input snippets, and per-property code lenses. A lens invokes
+`lu test --property NAME`; failures attach the shrunk counterexample directly
+to the declaration.
+
 ### 5. `lu-numerics`
 
 In a numerics language, the stdlib of math types *is* the ecosystem — seed it
@@ -115,6 +121,15 @@ finding, Monte Carlo kernels. **Every function ships with (1) properties,
 (2) benchmarks, (3) a C++/NumPy/Julia comparison, (4) generated docs.**
 First-class `property` blocks with shrinking are genuinely differentiating —
 they should appear throughout the ecosystem, not stay a compiler demo.
+
+`lib/lu-numerics` now ships as a package with 26 boundary-callable kernels
+covering vector algebra, statistics, integration, polynomials, dense linear
+algebra, signal processing, deterministic random/Monte Carlo work,
+optimization, geometry, special functions, and combinatorics. Every export has
+adjacent prose, is reached by an executable law, appears in the per-function
+benchmark registry, and maps to checked C++/NumPy/Julia reference source.
+Integration coverage rejects undocumented or unclaimed function pages and runs
+the package in all four tiers plus the generated Python ABI.
 
 ### 6. Web playground
 
@@ -186,8 +201,8 @@ moving branch does not change a locked build. Dependency `src/lib.lu` files
 are composed in graph order before the root and enter one whole-program
 frontend/optimizer. `use name` is checked against declared dependencies.
 
-`bench` and `doc` become package-aware with the observatory item below. There
-is intentionally no registry until roughly 20–30 meaningful packages exist.
+`bench` and `doc` are package-aware. There is intentionally no registry until
+roughly 20–30 meaningful packages exist.
 
 ### 10. Flagship showcase: `luphysics`
 
@@ -215,11 +230,30 @@ ablation flags already exist: `LU_MATH/LU_IFCONV/LU_LICM/LU_SIMD/LU_LAYOUT`),
 chosen layout, and the semantic assumptions responsible for the number. That
 page is the marketing; it's what gets linked.
 
+This now ships as package-aware `lu bench` and `lu doc`. Documentation builds
+execute package laws from `tests/*.lu`, publish their status, source, generated
+LLVM, C header and ABI manifest, and attach local benchmark history. The
+observatory runner builds the host and three-stage selfhost compilers, verifies
+cross-language numerical answers, records median whole-process measurements,
+and links the lulang, C++, Rust, Julia, NumPy, and JavaScript implementations
+with machine/tool provenance and explicit semantic/layout assumptions. Missing
+runtimes remain visibly unmeasured. A scheduled workflow regenerates the same
+source-linked artifact.
+
 ### 12. `ludiff`
 
 Forward-mode automatic differentiation as *library code* — dual numbers as
 records with user-defined operators, no compiler support needed. Reverse mode
-later. AD fits the language beautifully but is high-effort; it waits.
+later. AD fits the language beautifully without widening the compiler.
+
+`lib/ludiff` now provides ordinary compiler-owned `Dual` records, seeded
+variables and constants, user-defined sum/difference/product/quotient
+operators, sine, cosine, square-root and constant-power rules, a composed
+example, and a scalar C export that keeps record layout behind the boundary.
+Nine executable laws cover algebraic rules, the chain rule, and agreement with
+a central finite difference. Integration tests run the same library through
+the reference interpreter, JIT, LLVM AOT, self-hosted interpreter, WASI
+production, and a real C caller. Reverse mode remains deliberately later work.
 
 ## Explicit non-goals (for now)
 
