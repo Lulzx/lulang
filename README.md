@@ -118,11 +118,15 @@ explicit diagnostics.
 
 ### Editor tooling
 
-`tools/lulang_lsp.py` is a dependency-free Language Server with live
-diagnostics, formatting, symbols, completion, hover, and go-to-definition.
-Set `LULANG_BIN` if `lu` is not on `PATH`. A VS Code extension with syntax
-highlighting and native editor providers lives in `editors/vscode`; the
-tree-sitter grammar and highlight query live in `editors/tree-sitter-lulang`.
+`lu lsp` starts the dependency-free Language Server with live diagnostics,
+formatting, symbols, typed hover/completion, function and operator
+go-to-definition, and executable property lenses. A failed lens publishes the
+shrunk counterexample on the property declaration. Set `LULANG_LSP` only when
+the Python server is installed outside the usual source/share paths. The VS
+Code extension in `editors/vscode` also provides these features directly,
+enables format-on-save, and includes `dot`, `norm`, and `approx` Unicode input
+snippets. The tree-sitter grammar and highlight query live in
+`editors/tree-sitter-lulang`.
 
 ### WebAssembly targets
 

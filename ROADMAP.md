@@ -104,6 +104,12 @@ the syntax reads as a barrier instead of a feature. Deliverable: one VS Code
 extension bundling grammar + LSP + operator input + "run property" commands
 with inline counterexample display.
 
+The v0.1 deliverable now includes `lu lsp`, typed symbol completion/hover,
+function and Unicode-operator definition navigation, format-on-save, Unicode
+input snippets, and per-property code lenses. A lens invokes
+`lu test --property NAME`; failures attach the shrunk counterexample directly
+to the declaration.
+
 ### 5. `lu-numerics`
 
 In a numerics language, the stdlib of math types *is* the ecosystem — seed it

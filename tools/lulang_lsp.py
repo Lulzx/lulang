@@ -85,6 +85,13 @@ DECLARATION = re.compile(
     r"(?m)^[ \t]*(?:(export|extern)(?:[ \t]+\"[^\"]*\")?[ \t]+)?"
     r"(fn|type|enum|property)[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
 )
+FUNCTION_DECLARATION = re.compile(
+    r"(?m)^[ \t]*(?:export[ \t]+)?fn[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+    r"[ \t]*(\([^)]*\)(?:[ \t]*:[ \t]*[^{\n]+)?)"
+)
+PROPERTY_DECLARATION = re.compile(
+    r"(?m)^[ \t]*property[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+)
 
 
 def document_symbols(text: str) -> list[dict[str, Any]]:
@@ -107,6 +114,118 @@ def document_symbols(text: str) -> list[dict[str, Any]]:
             },
         })
     return symbols
+
+
+def operator_declarations(text: str) -> list[dict[str, Any]]:
+    declarations = []
+    for line_number, line in enumerate(text.splitlines()):
+        stripped = line.lstrip()
+        if not stripped.startswith("operator"):
+            continue
+        rest = stripped[len("operator"):]
+        if not rest:
+            continue
+        if rest[0].isspace():
+            body = rest.lstrip()
+            if not body or ")" not in body:
+                continue
+            opening = body[0]
+            after_parameter = body.split(")", 1)[1].lstrip()
+            if not after_parameter:
+                continue
+            closing = after_parameter[0]
+            glyph = opening
+            aliases = {opening, closing}
+            display = f"{opening}…{closing}"
+            character = line.find(opening, len(line) - len(stripped) + len("operator"))
+        else:
+            if ")" not in rest:
+                continue
+            after_parameter = rest.split(")", 1)[1].lstrip()
+            match = re.match(r"([^\w\s(]+)", after_parameter)
+            if not match:
+                continue
+            glyph = match.group(1)
+            aliases = {glyph}
+            display = glyph
+            character = line.find(glyph, len(line) - len(stripped) + len("operator"))
+        declarations.append({
+            "glyph": glyph,
+            "aliases": aliases,
+            "display": display,
+            "signature": stripped.split("{", 1)[0].strip(),
+            "range": {
+                "start": {"line": line_number, "character": character},
+                "end": {"line": line_number, "character": character + len(glyph)},
+            },
+        })
+    return declarations
+
+
+def operator_at(text: str, line: int, character: int) -> dict[str, Any] | None:
+    rows = text.splitlines()
+    if line >= len(rows):
+        return None
+    row = rows[line]
+    for declaration in operator_declarations(text):
+        for alias in declaration["aliases"]:
+            start = 0
+            while True:
+                start = row.find(alias, start)
+                if start < 0:
+                    break
+                if start <= character < start + len(alias):
+                    return declaration
+                start += len(alias)
+    return None
+
+
+def property_lenses(text: str, uri: str) -> list[dict[str, Any]]:
+    lenses = []
+    for match in PROPERTY_DECLARATION.finditer(text):
+        line = text.count("\n", 0, match.start())
+        character = match.start(1) - (text.rfind("\n", 0, match.start(1)) + 1)
+        source_range = {
+            "start": {"line": line, "character": character},
+            "end": {"line": line, "character": character + len(match.group(1))},
+        }
+        lenses.append({
+            "range": source_range,
+            "command": {
+                "title": "Run property (100 cases)",
+                "command": "lulang.runProperty",
+                "arguments": [uri, match.group(1), source_range],
+            },
+        })
+    return lenses
+
+
+def run_property(text: str, name: str, runs: int = 100) -> tuple[bool, str]:
+    with tempfile.NamedTemporaryFile("w", suffix=".lu", delete=False) as source:
+        source.write(text)
+        path = source.name
+    try:
+        result = subprocess.run(
+            [
+                compiler_path(), "test", "--runs", str(runs),
+                "--property", name, path,
+            ],
+            text=True,
+            capture_output=True,
+        )
+    finally:
+        Path(path).unlink(missing_ok=True)
+    output = "\n".join(
+        part.strip() for part in [result.stdout, result.stderr] if part.strip()
+    )
+    return result.returncode == 0, output
+
+
+def declaration_signature(text: str, name: str) -> str | None:
+    for match in FUNCTION_DECLARATION.finditer(text):
+        if match.group(1) == name:
+            return f"fn {name}{match.group(2).strip()}"
+    return None
 
 
 def word_at(text: str, line: int, character: int) -> str:
@@ -172,7 +291,9 @@ class Server:
                 "documentSymbolProvider": True,
                 "hoverProvider": True,
                 "definitionProvider": True,
+                "codeLensProvider": {"resolveProvider": False},
                 "completionProvider": {"triggerCharacters": []},
+                "executeCommandProvider": {"commands": ["lulang.runProperty"]},
             }, "serverInfo": {"name": "lulang-lsp", "version": "0.1.0"}})
         elif method == "shutdown":
             self.shutdown = True
@@ -207,13 +328,35 @@ class Server:
             items = [{"label": item, "kind": 14} for item in KEYWORDS]
             items += [{"label": item, "kind": 3, "detail": BUILTINS[item]}
                       for item in BUILTINS]
+            uri = params["textDocument"]["uri"]
+            items += [
+                {"label": match.group(1), "kind": 3,
+                 "detail": declaration_signature(self.documents[uri], match.group(1))}
+                for match in FUNCTION_DECLARATION.finditer(self.documents[uri])
+            ]
+            items += [
+                {"label": "dot → ·", "kind": 24, "insertText": "·"},
+                {"label": "approx → ≈", "kind": 24, "insertText": "≈"},
+                {"label": "norm → ‖…‖", "kind": 24,
+                 "insertText": "‖${1:value}‖", "insertTextFormat": 2},
+            ]
             self.response(identifier, {"isIncomplete": False, "items": items})
         elif method == "textDocument/hover":
             uri = params["textDocument"]["uri"]
             position = params["position"]
             word = word_at(self.documents[uri], position["line"], position["character"])
-            result = {"contents": {"kind": "markdown", "value": f"```lu\n{BUILTINS[word]}\n```"}} \
-                if word in BUILTINS else None
+            operator = operator_at(
+                self.documents[uri], position["line"], position["character"]
+            )
+            detail = BUILTINS.get(word) or declaration_signature(
+                self.documents[uri], word
+            )
+            if operator:
+                detail = operator["signature"]
+            result = (
+                {"contents": {"kind": "markdown", "value": f"```lu\n{detail}\n```"}}
+                if detail else None
+            )
             self.response(identifier, result)
         elif method == "textDocument/definition":
             uri = params["textDocument"]["uri"]
@@ -221,8 +364,45 @@ class Server:
             word = word_at(self.documents[uri], position["line"], position["character"])
             symbol = next((item for item in document_symbols(self.documents[uri])
                            if item["name"] == word), None)
-            self.response(identifier, {"uri": uri, "range": symbol["selectionRange"]}
-                          if symbol else None)
+            operator = operator_at(
+                self.documents[uri], position["line"], position["character"]
+            )
+            target = symbol["selectionRange"] if symbol else (
+                operator["range"] if operator else None
+            )
+            self.response(identifier, {"uri": uri, "range": target} if target else None)
+        elif method == "textDocument/codeLens":
+            uri = params["textDocument"]["uri"]
+            self.response(identifier, property_lenses(self.documents[uri], uri))
+        elif method == "workspace/executeCommand":
+            if params.get("command") != "lulang.runProperty":
+                self.response(identifier, None)
+            else:
+                uri, name, source_range = params.get("arguments", [None, None, None])
+                if uri not in self.documents or not name:
+                    self.response(identifier, None)
+                else:
+                    success, output = run_property(self.documents[uri], name)
+                    if not success:
+                        self.send({
+                            "jsonrpc": "2.0",
+                            "method": "textDocument/publishDiagnostics",
+                            "params": {
+                                "uri": uri,
+                                "diagnostics": [{
+                                    "range": source_range,
+                                    "severity": 1,
+                                    "source": "lulang property",
+                                    "message": output,
+                                }],
+                            },
+                        })
+                    self.send({
+                        "jsonrpc": "2.0",
+                        "method": "window/showMessage",
+                        "params": {"type": 3 if success else 1, "message": output},
+                    })
+                    self.response(identifier, output)
         elif identifier is not None:
             self.response(identifier, None)
         return True

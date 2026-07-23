@@ -14,7 +14,7 @@ SPEC.loader.exec_module(LSP)
 class LspTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["LULANG_BIN"] = str(ROOT / "target/release/lu")
+        os.environ.setdefault("LULANG_BIN", str(ROOT / "target/release/lu"))
 
     def test_diagnostics_use_non_executing_check_mode(self):
         self.assertEqual(LSP.diagnostics("main { print(1 / 0) }\n"), [])
@@ -27,6 +27,27 @@ class LspTest(unittest.TestCase):
         symbols = LSP.document_symbols(source)
         self.assertEqual([symbol["name"] for symbol in symbols], ["twice"])
         self.assertIn("export fn twice", LSP.format_document(source))
+
+    def test_operator_navigation_property_lenses_and_single_property_runs(self):
+        source = (
+            "operator+ (a: i64) ⊕ (b: i64): i64 { a + b }\n"
+            "property skipped(x: i64) { false }\n"
+            "property selected(x: i64) { 2 ⊕ 3 == 5 }\n"
+            "main { print(2 ⊕ 3) }\n"
+        )
+        operators = LSP.operator_declarations(source)
+        self.assertEqual(operators[0]["glyph"], "⊕")
+        row = source.splitlines()[3]
+        target = LSP.operator_at(source, 3, row.index("⊕"))
+        self.assertEqual(target["range"], operators[0]["range"])
+        lenses = LSP.property_lenses(source, "file:///example.lu")
+        self.assertEqual(
+            [lens["command"]["arguments"][1] for lens in lenses],
+            ["skipped", "selected"],
+        )
+        success, output = LSP.run_property(source, "selected", 11)
+        self.assertTrue(success, output)
+        self.assertIn("property selected ... ok (11 runs)", output)
 
 
 if __name__ == "__main__":

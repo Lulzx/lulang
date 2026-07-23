@@ -1,0 +1,26 @@
+{
+  "Dot product operator": {
+    "prefix": ["dot", "\\dot"],
+    "body": ["·"],
+    "description": "Insert the dot-product operator"
+  },
+  "Approximate equality": {
+    "prefix": ["approx", "\\approx"],
+    "body": ["≈"],
+    "description": "Insert approximate equality"
+  },
+  "Norm operator": {
+    "prefix": ["norm", "\\norm"],
+    "body": ["‖${1:value}‖"],
+    "description": "Insert the norm circumfix operator"
+  },
+  "Property declaration": {
+    "prefix": "property",
+    "body": [
+      "property ${1:name}(${2:x}: ${3:f64}) {",
+      "  ${4:condition}",
+      "}"
+    ],
+    "description": "Declare an executable property"
+  }
+}

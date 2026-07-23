@@ -41,5 +41,14 @@ fn lsp_and_editor_assets_validate() {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        let package = std::fs::read_to_string(repository.join("editors/vscode/package.json"))
+            .expect("read VS Code manifest");
+        assert!(package.contains("\"lulang.runProperty\""));
+        assert!(package.contains("\"editor.formatOnSave\": true"));
+        let snippets =
+            std::fs::read_to_string(repository.join("editors/vscode/snippets/lulang.json"))
+                .expect("read snippets");
+        assert!(snippets.contains("‖${1:value}‖"));
+        assert!(snippets.contains("\\\\dot"));
     }
 }

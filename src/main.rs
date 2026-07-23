@@ -17,13 +17,14 @@ fn usage() -> ExitCode {
          \x20      lu init [package-name]\n\
          \x20      lu add <name> --git <url> --rev <revision>\n\
          \x20      lu fetch\n\
+         \x20      lu lsp\n\
          \x20      lu bench [--runs N] [file.lu]\n\
          \x20      lu doc [--runs N] [-o directory] [file.lu]\n\
          \x20      lu build --lib [--shared] [-o name] <file.lu>\n\
          \x20      lu build --target <wasm32-wasi|wasm32-web> [-o file.wasm] <file.lu>\n\
          \x20      lu build --emit-llvm [-o file.ll] <file.lu>\n\
          \x20      lu bindgen [--lib name] [--no-shims] [-o file.lu] <header.h>\n\
-         \x20      lu test [--runs N] <file.lu>\n\
+         \x20      lu test [--runs N] [--property name] <file.lu>\n\
          \x20      lu fmt [--check] <file.lu>"
     );
     ExitCode::FAILURE
@@ -46,6 +47,7 @@ fn main() -> ExitCode {
                 | "fetch"
                 | "bench"
                 | "doc"
+                | "lsp"
         )
     });
     let mode = match args.get(1) {
@@ -68,6 +70,12 @@ fn main() -> ExitCode {
     if mode == "bench" {
         return package_result(benchmark::run(&args[2..]));
     }
+    if mode == "lsp" {
+        if args.len() != 2 {
+            return usage();
+        }
+        return run_lsp();
+    }
     let mut runs = 100u32;
     let mut check_format = false;
     let mut build_library = false;
@@ -75,6 +83,7 @@ fn main() -> ExitCode {
     let mut build_target = None;
     let mut emit_llvm = false;
     let mut output_name = None;
+    let mut property_name = None;
     let mut bindgen_library = None;
     let mut bindgen_shims = true;
     let mut positionals = Vec::new();
@@ -92,6 +101,14 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
+                i += 2;
+            }
+            "--property" if mode == "test" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("error: --property needs a name");
+                    return ExitCode::FAILURE;
+                };
+                property_name = Some(value.clone());
                 i += 2;
             }
             "--check" if mode == "fmt" => {
@@ -236,6 +253,7 @@ fn main() -> ExitCode {
     let path_owned = path.to_string();
     let output_name_owned = output_name.clone();
     let build_target_owned = build_target.clone();
+    let property_name_owned = property_name.clone();
     let result = std::thread::Builder::new()
         .stack_size(512 << 20)
         .spawn(move || {
@@ -249,6 +267,7 @@ fn main() -> ExitCode {
                 build_target_owned.as_deref(),
                 emit_llvm,
                 output_name_owned.as_deref(),
+                property_name_owned.as_deref(),
             )
         })
         .expect("spawn")
@@ -272,6 +291,45 @@ fn package_result(result: Result<String, String>) -> ExitCode {
         }
         Err(error) => {
             eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_lsp() -> ExitCode {
+    let repository_script =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/lulang_lsp.py");
+    let installed_script = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .map(|path| path.join("../share/lulang/lulang_lsp.py"));
+    let script = std::env::var_os("LULANG_LSP")
+        .map(std::path::PathBuf::from)
+        .or_else(|| repository_script.exists().then_some(repository_script))
+        .or_else(|| installed_script.filter(|path| path.exists()));
+    let Some(script) = script else {
+        eprintln!("error: cannot find lulang_lsp.py; set LULANG_LSP");
+        return ExitCode::FAILURE;
+    };
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: cannot locate `lu`: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match std::process::Command::new("python3")
+        .arg(script)
+        .env("LULANG_BIN", executable)
+        .status()
+    {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => {
+            eprintln!("error: language server exited with {status}");
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            eprintln!("error: cannot start language server: {error}");
             ExitCode::FAILURE
         }
     }
@@ -419,6 +477,7 @@ fn run_pipeline(
     build_target: Option<&str>,
     emit_llvm: bool,
     output_name: Option<&str>,
+    property_name: Option<&str>,
 ) -> Result<bool, String> {
     (|| -> Result<bool, String> {
         let toks = lexer::lex(src)?;
@@ -472,7 +531,10 @@ fn run_pipeline(
                 }
                 Ok(true)
             }
-            "test" => interp::Interp::new(&ir).run_properties(property_runs),
+            "test" => match property_name {
+                Some(name) => interp::Interp::new(&ir).run_property(property_runs, name),
+                None => interp::Interp::new(&ir).run_properties(property_runs),
+            },
             "doc" => {
                 for out in docgen::build(&ir, src, path, output_name, property_runs)? {
                     eprintln!("built {}", out);

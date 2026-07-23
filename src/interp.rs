@@ -112,9 +112,28 @@ impl<'a> Interp<'a> {
     }
 
     pub fn run_properties(&self, runs: u32) -> Result<bool, String> {
+        self.run_properties_filtered(runs, None)
+    }
+
+    pub fn run_property(&self, runs: u32, name: &str) -> Result<bool, String> {
+        if !self
+            .ir
+            .properties
+            .iter()
+            .any(|property| property.name == name)
+        {
+            return Err(format!("unknown property `{name}`"));
+        }
+        self.run_properties_filtered(runs, Some(name))
+    }
+
+    fn run_properties_filtered(&self, runs: u32, only: Option<&str>) -> Result<bool, String> {
         let mut all_ok = true;
         let mut rng: u64 = 0x9E3779B97F4A7C15;
         for prop in &self.ir.properties {
+            if only.is_some_and(|name| name != prop.name) {
+                continue;
+            }
             let function_id = prop.function;
             let mut failed = None;
             for _ in 0..runs {
