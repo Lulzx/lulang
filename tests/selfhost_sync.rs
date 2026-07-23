@@ -125,5 +125,38 @@ fn ffi_import_and_export_ir_match_the_host_byte_for_byte() {
         "direct f32 imports and exports drifted between host and selfhost"
     );
 
+    let c_slice_source = directory.join("c-slice-boundary.lu");
+    std::fs::write(
+        &c_slice_source,
+        "export fn borrowed_sum(values: c_slice[f64]): f64 {\n\
+           return sum(i in 0..len(values)) values[i]\n\
+         }\n\
+         main {\n\
+           let values = arr(3, 2.0)\n\
+           print(borrowed_sum(values))\n\
+         }\n",
+    )
+    .expect("write c_slice boundary fixture");
+    let host_c_slice_path = directory.join("host-c-slice.ll");
+    let host_c_slice = emit_host_ir(&c_slice_source, &host_c_slice_path);
+    let selfhost_c_slice = emit_selfhost_ir(&repository, &c_slice_source, triple);
+    let wrapper_start = "define dso_local double @\"borrowed_sum\"";
+    let host_wrapper = host_c_slice
+        .split(wrapper_start)
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("host c_slice wrapper");
+    let selfhost_wrapper = selfhost_c_slice
+        .split(wrapper_start)
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("selfhost c_slice wrapper");
+    assert_eq!(
+        host_wrapper, selfhost_wrapper,
+        "borrowed c_slice export wrapper drifted between host and selfhost"
+    );
+    assert!(host_wrapper.contains("(ptr %c0, i64 %c1)"));
+    assert!(!host_wrapper.contains("lu_arr_new_raw"));
+
     let _ = std::fs::remove_dir_all(directory);
 }

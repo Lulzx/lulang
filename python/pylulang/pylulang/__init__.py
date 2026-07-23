@@ -34,6 +34,8 @@ def _find_compiler(explicit: str | os.PathLike[str] | None) -> str:
 
 
 def _scalar_ctype(type_name: str, enums: set[str]) -> type[ctypes._SimpleCData]:
+    if type_name == "f32":
+        return ctypes.c_float
     if type_name == "f64":
         return ctypes.c_double
     if type_name in {"i64", "bool"} or type_name in enums:
@@ -41,7 +43,9 @@ def _scalar_ctype(type_name: str, enums: set[str]) -> type[ctypes._SimpleCData]:
     raise LulangError(f"unsupported manifest type {type_name!r}")
 
 
-def _array_argument(value: Any, element: str) -> tuple[Any, int, Any]:
+def _array_argument(
+    value: Any, element: str, *, writable: bool
+) -> tuple[Any, int, Any]:
     ctype = ctypes.c_double if element == "f64" else ctypes.c_int64
 
     try:
@@ -52,8 +56,9 @@ def _array_argument(value: Any, element: str) -> tuple[Any, int, Any]:
         expected = numpy.float64 if element == "f64" else numpy.int64
         if value.dtype != expected:
             raise TypeError(f"expected a {expected} NumPy array, got {value.dtype}")
-        if not value.flags.c_contiguous or not value.flags.writeable:
-            raise TypeError("lulang array arguments must be writable and C-contiguous")
+        if not value.flags.c_contiguous or (writable and not value.flags.writeable):
+            requirement = "writable and C-contiguous" if writable else "C-contiguous"
+            raise TypeError(f"lulang array arguments must be {requirement}")
         return value.ctypes.data_as(ctypes.POINTER(ctype)), int(value.size), value
 
     if isinstance(value, ctypes.Array):
@@ -62,10 +67,12 @@ def _array_argument(value: Any, element: str) -> tuple[Any, int, Any]:
     if isinstance(value, list):
         storage = (ctype * len(value))(*value)
 
-        def copy_back() -> None:
-            value[:] = storage[:]
+        if writable:
+            def copy_back() -> None:
+                value[:] = storage[:]
 
-        return ctypes.cast(storage, ctypes.POINTER(ctype)), len(value), (storage, copy_back)
+            return ctypes.cast(storage, ctypes.POINTER(ctype)), len(value), (storage, copy_back)
+        return ctypes.cast(storage, ctypes.POINTER(ctype)), len(value), storage
 
     try:
         view = memoryview(value)
@@ -103,6 +110,11 @@ class _Function:
                 argtypes.extend(
                     [ctypes.POINTER(_scalar_ctype(element, enums)), ctypes.c_int64]
                 )
+            elif type_name.startswith("c_slice["):
+                element = type_name[len("c_slice["):-1]
+                argtypes.extend(
+                    [ctypes.POINTER(_scalar_ctype(element, enums)), ctypes.c_int64]
+                )
             else:
                 argtypes.append(_scalar_ctype(type_name, enums))
         self._function.argtypes = argtypes
@@ -125,11 +137,19 @@ class _Function:
                 flattened.extend([ctypes.cast(storage, ctypes.c_void_p), len(encoded)])
                 keepalive.append(storage)
             elif type_name.startswith("["):
-                pointer, length, owner = _array_argument(value, type_name[1:-1])
+                pointer, length, owner = _array_argument(
+                    value, type_name[1:-1], writable=True
+                )
                 flattened.extend([pointer, length])
                 keepalive.append(owner)
                 if isinstance(owner, tuple):
                     copy_backs.append(owner[1])
+            elif type_name.startswith("c_slice["):
+                pointer, length, owner = _array_argument(
+                    value, type_name[len("c_slice["):-1], writable=False
+                )
+                flattened.extend([pointer, length])
+                keepalive.append(owner)
             elif type_name == "bool":
                 flattened.append(int(bool(value)))
             else:

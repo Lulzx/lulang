@@ -176,7 +176,7 @@ vectorization) as lulang IR transforms rather than clang flags.
 
 ---
 
-## 11. C boundary pointers
+## 11. C boundary pointers and slices
 
 `c_ptr[T]` is an opaque, boundary-only C pointer. It may be received from or
 returned to an `extern` function, stored in a local, passed unchanged, returned
@@ -190,6 +190,13 @@ does not give lulang access to C layout. The JIT and AOT represent `c_ptr[T]`
 as a native pointer. The interpreters carry the same pointer bits through the
 FFI bridge without inspecting the pointee.
 
+`c_slice[i64]` and `c_slice[f64]` are borrowed, read-only boundary views.
+They cross C as `(const T *data, int64_t length)`, may be indexed and passed
+to `len`, and cannot be mutated or returned. The borrow lasts only for the
+call. Converting an ordinary scalar array to a slice passes its existing data
+buffer without copying; an exported function receives the caller's C buffer
+directly. This does not expose the layout of ordinary arrays or records.
+
 `@c_layout type Name { ... }` opts a record into stable C field order and
 layout metadata. Its fields are restricted to exact-width boundary scalars,
 `c_ptr[T]`, and nested `@c_layout` records; empty records, layout cycles,
@@ -202,8 +209,9 @@ using an annotated record behind `c_ptr[Name]` is already supported.
 Generated bindgen adapters may expose a record-valued lulang parameter without
 passing that record through the boundary. The generated lulang wrapper
 flattens its logical fields into supported scalar arguments, and generated C
-code reconstructs the C value before the real call. Narrow integer, C `float`,
-and C `_Bool` conversions follow the same rule. This is an adapter contract,
+code reconstructs the C value before the real call. Narrow integer and C
+`_Bool` conversions follow the same rule; C `float` maps directly to boundary
+`f32`. This is an adapter contract,
 not a relaxation of the boundary type set or a promise about internal record
 layout.
 

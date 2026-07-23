@@ -203,9 +203,9 @@ impl Parser {
             Ok(format!("[{}]", inner))
         } else {
             let name = self.ident()?;
-            if name == "c_ptr" && self.is_sym("[") {
+            if (name == "c_ptr" || name == "c_slice") && self.is_sym("[") {
                 self.next();
-                let inner = if self.is_sym("(") {
+                let inner = if name == "c_ptr" && self.is_sym("(") {
                     self.next();
                     self.eat_sym(")")?;
                     self.eat_sym("]")?;
@@ -214,7 +214,7 @@ impl Parser {
                     self.parse_type_str()?
                 };
                 self.eat_sym("]")?;
-                Ok(format!("c_ptr[{}]", inner))
+                Ok(format!("{}[{}]", name, inner))
             } else {
                 Ok(name)
             }

@@ -74,9 +74,12 @@ SysV x86-64 and AArch64). Boundary-only `c_ptr[T]` opaque handles now work in
 all four tiers and generated headers. Exact record metadata is opt-in through
 `@c_layout`; bindgen uses adapters rather than pretending that compiler-owned
 records have C layout. Direct `f32` parameters and returns now work in all
-four tiers and bindgen emits C `float` directly. Remaining follow-ups:
-`c_slice[T]`, by-value `@c_layout` calls without adapters, `str` returns,
-callbacks, and zero-copy array export handles.
+four tiers and bindgen emits C `float` directly. Borrowed
+`c_slice[i64|f64]` parameters are read-only `(const T*, length)` views in all
+four tiers; exported kernels and `pylulang` consume C-contiguous buffers
+without an array copy. Remaining follow-ups: by-value `@c_layout` calls
+without adapters, `str` returns, callbacks, and owning zero-copy array export
+handles.
 
 ### 3. `pylulang`
 

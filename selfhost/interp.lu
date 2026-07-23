@@ -237,8 +237,10 @@ type P {
 }
 
 fn is_arrt(t: i64): bool { return t >= 1024 and t < 2048 }
-fn is_ptrt(t: i64): bool { return t >= 2048 }
+fn is_ptrt(t: i64): bool { return t >= 2048 and t < 3072 }
+fn is_slicet(t: i64): bool { return t >= 3072 and t < 4096 }
 fn elem_of(t: i64): i64 { return t - 1024 }
+fn slice_elem(t: i64): i64 { return t - 3072 }
 fn is_enumt(t: i64): bool { return t >= 16 and t < 64 }
 fn is_rect(t: i64): bool { return t >= 64 and t < 1024 }
 
@@ -711,6 +713,12 @@ fn parse_type(inout p: P): i64 {
     return t + 1024
   }
   let t = take_ident(p)
+  if t == "c_slice" {
+    expect_sym(p, "[")
+    let inner = parse_type(p)
+    expect_sym(p, "]")
+    return inner + 3072
+  }
   if t == "c_ptr" {
     expect_sym(p, "[")
     var inner = 4
@@ -753,6 +761,10 @@ fn parse_type_decl(inout p: P) {
       let f = take_ident(p)
       expect_sym(p, ":")
       let t = parse_type(p)
+      if is_slicet(t) {
+        print("type error: record field", f, "cannot store a borrowed c_slice")
+        p.err = 1
+      }
       p.flname[p.nfl] = f
       p.flty[p.nfl] = t
       p.nfl = p.nfl + 1
@@ -924,7 +936,7 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
     if t == 1 or t == 5 {
       nflo = nflo + 1
     } else {
-      if t == 3 or t == 1024 or t == 1025 {
+      if t == 3 or t == 1024 or t == 1025 or t == 3072 or t == 3073 {
         ni = ni + 2
       } else {
         if t == 0 or t == 2 or is_enumt(t) or is_ptrt(t) {
@@ -954,6 +966,17 @@ fn parse_named_fn(inout p: P, exported: i64) {
   if cur_is_sym(p, ":") {
     p.pos = p.pos + 1
     ret = parse_type(p)
+  }
+  for i in 0..np2 {
+    let t = p.ptype[po + i]
+    if is_slicet(t) and not (slice_elem(t) == 0 or slice_elem(t) == 1) {
+      print("type error: c_slice elements must be i64 or f64 in", name)
+      p.err = 1
+    }
+  }
+  if is_slicet(ret) {
+    print("type error: function", name, "cannot return a borrowed c_slice")
+    p.err = 1
   }
   let body = parse_block(p)
   add_fn(p, name, ret, po, np2, body, 0)
@@ -1068,13 +1091,14 @@ fn tname(p: P, t: i64): str {
   if t == 1025 { return "[f64]" }
   if t == 1026 { return "[bool]" }
   if t == 1027 { return "[str]" }
+  if is_slicet(t) { return "c_slice[..]" }
   if is_ptrt(t) { return "c_ptr[..]" }
   if is_arrt(t) { return "[..]" }
   return "<error>"
 }
 
 fn compat(expect: i64, actual: i64): bool {
-  return expect == actual or ((expect == 1 or expect == 5) and (actual == 0 or actual == 1 or actual == 5))
+  return expect == actual or ((expect == 1 or expect == 5) and (actual == 0 or actual == 1 or actual == 5)) or (is_slicet(expect) and is_arrt(actual) and slice_elem(expect) == elem_of(actual))
 }
 
 fn is_num(t: i64): bool { return t == 0 or t == 1 or t == 5 }
@@ -1229,7 +1253,7 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
     return 0
   }
   if name == "len" {
-    if na != 1 or (att[0] != 3 and not is_arrt(att[0])) {
+    if na != 1 or (att[0] != 3 and not is_arrt(att[0]) and not is_slicet(att[0])) {
       print("type error: len expects an array or str")
       c.err = 1
       return 5
@@ -1454,6 +1478,7 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
       return 5
     }
     if is_arrt(bt) { return elem_of(bt) }
+    if is_slicet(bt) { return slice_elem(bt) }
     if bt == 3 { return 0 }
     print("type error: cannot index into", tname(p, bt))
     c.err = 1
@@ -1777,6 +1802,9 @@ fn coerce(v: V, want: i64): V {
   if want == 1 and v.t == 5 { return vfloat(v.f) }
   if want == 5 and v.t == 0 { return vf32(float(v.i)) }
   if want == 5 and v.t == 1 { return vf32(v.f) }
+  if is_slicet(want) and is_arrt(v.t) and slice_elem(want) == elem_of(v.t) {
+    return V { t: want, i: 0, f: 0.0, s: "", o: v.o, n: v.n }
+  }
   return v
 }
 
@@ -1905,8 +1933,8 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
     let v = vals[j]
     if v.t == 1 or v.t == 5 { float_len = float_len + 1 }
     if v.t == 3 { control_len = control_len + len(v.s) }
-    if v.t == 1024 { control_len = control_len + v.n }
-    if v.t == 1025 { float_len = float_len + v.n }
+    if v.t == 1024 or v.t == 3072 { control_len = control_len + v.n }
+    if v.t == 1025 or v.t == 3073 { float_len = float_len + v.n }
   }
   var control = arr(control_len, 0)
   var floats = arr(float_len, 0.0)
@@ -1937,7 +1965,7 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
         }
         control_data = control_data + len(v.s)
       } else {
-        if v.t == 1024 {
+        if v.t == 1024 or v.t == 3072 {
           control[descriptor] = 3
           control[descriptor + 1] = control_data
           control[descriptor + 2] = v.n
@@ -1946,7 +1974,7 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
           }
           control_data = control_data + v.n
         } else {
-          if v.t == 1025 {
+          if v.t == 1025 or v.t == 3073 {
             control[descriptor] = 4
             control[descriptor + 1] = float_data
             control[descriptor + 2] = v.n

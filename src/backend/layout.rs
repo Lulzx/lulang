@@ -16,6 +16,7 @@ pub fn components(p: &Program, ty: &Type) -> Result<Vec<Component>, String> {
         Type::I64 | Type::Bool | Type::Enum(_) => vec![Component::I64],
         Type::Str => vec![Component::Ptr, Component::I64],
         Type::Arr(_) => vec![Component::Ptr],
+        Type::CSlice(_) => vec![Component::Ptr, Component::I64],
         Type::CPtr(_) => vec![Component::Ptr],
         Type::Unit => vec![],
         Type::Rec(ti) => {

@@ -192,10 +192,45 @@ fn ffi_boundary_subset_and_register_caps_are_checked() {
             "type P { x: i64 }\nexport fn bad(p: P): i64 { p.x }\nmain {}\n",
             "unsupported parameter",
         ),
+        (
+            "extern fn bad(values: c_slice[f32]): f64\nmain {}\n",
+            "unsupported parameter",
+        ),
+        (
+            "extern fn bad(a: c_slice[f64], b: c_slice[f64], c: c_slice[f64], d: c_slice[f64])\nmain {}\n",
+            "maximum is 6 and 8",
+        ),
     ];
     for (source, message) in cases {
         let output = run("interp", source);
         assert!(!output.status.success(), "accepted invalid FFI signature");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "unexpected error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn borrowed_c_slices_are_read_only_and_cannot_escape() {
+    let cases = [
+        (
+            "fn bad(values: c_slice[f64]) {\n values[0] = 1.0\n}\nmain {}\n",
+            "read-only",
+        ),
+        (
+            "fn bad(values: c_slice[f64]): c_slice[f64] { return values }\nmain {}\n",
+            "cannot return a borrowed c_slice",
+        ),
+        (
+            "type Bad { values: c_slice[f64] }\nmain {}\n",
+            "cannot store a borrowed c_slice",
+        ),
+    ];
+    for (source, message) in cases {
+        let output = run("check", source);
+        assert!(!output.status.success(), "accepted escaping c_slice");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains(message),
             "unexpected error: {}",

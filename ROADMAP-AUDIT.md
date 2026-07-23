@@ -22,7 +22,7 @@ ordinary lulang records across the boundary. The invariant is exercised by
 |---:|---|---|
 | 1 | Stable C import/export ABI | Parser/checker/IR in `src/{ast,parser,check,ir}.rs`; interpreter, JIT, LLVM, and selfhost execution; four-tier scalar/array/string/pointer and unresolved-symbol cases in `tests/conformance.rs`. |
 | 2 | C headers and ABI manifests | `src/cheader.rs`; static/shared C and ctypes callers in `tests/ffi_export.rs`; generated Embedded `.h`/`.json` drift check in `tests/luphysics.rs`. |
-| 3 | `pylulang` v0.1 | Installable package under `python/pylulang`; writable contiguous NumPy buffers cross directly into the C shim; list, scalar, mutation, boolean, and NumPy coverage in `tests/pylulang.rs`. |
+| 3 | `pylulang` v0.1 | Installable package under `python/pylulang`; mutable arrays retain copy-out semantics while borrowed `c_slice` accepts read-only contiguous NumPy storage without an internal array copy; list, scalar, mutation, boolean, f32, and NumPy coverage in `tests/pylulang.rs`. |
 | 4 | LSP and VS Code v0.1 | Tree-sitter grammar, VS Code grammar/snippets/extension, `lu lsp`, typed hover/completion, function/operator definitions, format-on-save, property lenses and inline counterexamples; `tests/lsp.rs` plus `tools/tests/test_lulang_lsp.py`. |
 | 5 | `lu-numerics` v0.1 | 26 kernels, 11 law groups, per-function benchmark registry, C++/NumPy/Julia twins, generated docs and all-tier/generated-Python execution; enforced by `tests/numerics.rs` and `lib/lu-numerics/test_numerics.py`. |
 | 6 | Public playground v0.1 | Local browser interpreter with editable examples and no server execution in `playground/app/playground.tsx`; rendered-route tests in `playground/tests`; production site at `lulang.lulzx.space`. |
@@ -43,6 +43,10 @@ ordinary lulang records across the boundary. The invariant is exercised by
 - Direct scalar `f32` is a shipped compatible extension: `cbrtf` executes in
   all four tiers, C callers exercise generated `float` exports, bindgen maps
   C `float` without a shim, and host/selfhost LLVM is byte-identical.
+- Borrowed `c_slice[i64|f64]` is a shipped compatible extension: all tiers
+  index and import the read-only view, export wrappers pass `(const T*, len)`
+  without `lu_arr_new_raw`, C callers use generated const-pointer headers,
+  and `pylulang` accepts read-only contiguous NumPy buffers.
 - `tests/selfhost_sync.rs` byte-compares the shared frontend region and the
   host/selfhost LLVM for an import and a scalar export.
 - `selfhost/build.sh --bootstrap` proves stage 1 = stage 2 and stage 2 =
@@ -85,9 +89,9 @@ plus scaled reference-interpreter corpus agreement.
 
 ## Explicitly deferred by the roadmap
 
-`c_slice[T]`, string returns, callbacks, zero-copy export handles,
-reverse-mode AD, native WASM SIMD parity, a package registry, and the broader
-bindgen C surface remain later work. The browser's current
+String returns, callbacks, owning zero-copy array export handles, reverse-mode
+AD, native WASM SIMD parity, a package registry, and the broader bindgen C
+surface remain later work. The browser's current
 interpreter is local TypeScript; compiling the reference CFG evaluator to
 WASM plus property/IR panels and permalinks is the next playground increment.
 These are not silently claimed by the shipped v0.1/foundation slices.

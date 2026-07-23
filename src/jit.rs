@@ -44,6 +44,7 @@ fn array_local_for_value(function: &ir::Function, value: ir::ValueId) -> Option<
                 _ => None,
             })?
         })
+        .filter(|local| matches!(function.locals[*local as usize].ty, CType::Arr(_)))
 }
 
 fn cfg_value_definition(
@@ -570,6 +571,19 @@ impl<'a, 'b> Gen<'a, 'b> {
             }
             (CType::F32, CType::F64) => vec![self.b.ins().fdemote(types::F32, values[0])],
             (CType::F64, CType::F32) => vec![self.b.ins().fpromote(types::F64, values[0])],
+            (CType::CSlice(want), CType::Arr(got)) if want == got => {
+                let slots = self
+                    .b
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), values[0], 0);
+                let stride = comps(self.p, want)?.len() as i64;
+                let length = if stride == 1 {
+                    slots
+                } else {
+                    self.b.ins().sdiv_imm(slots, stride)
+                };
+                vec![self.b.ins().iadd_imm(values[0], 8), length]
+            }
             _ => return Err(format!("cannot coerce IR value {:?} to {:?}", got, want)),
         };
         Ok(values)
@@ -1518,6 +1532,22 @@ impl<'a, 'b> Gen<'a, 'b> {
                 .uload8(types::I64, MemFlags::trusted(), addr, 0);
             return Ok((CType::I64, vec![byte]));
         }
+        if let CType::CSlice(elem) = base_ty {
+            self.check_idx(index, base[1]);
+            let components = comps(self.p, &elem)?;
+            if components.len() != 1 {
+                return Err("c_slice elements must have one ABI component".into());
+            }
+            let offset = self.b.ins().imul_imm(index, components[0].bytes() as i64);
+            let address = self.b.ins().iadd(base[0], offset);
+            return Ok((
+                *elem,
+                vec![self
+                    .b
+                    .ins()
+                    .load(components[0], MemFlags::trusted(), address, 0)],
+            ));
+        }
         let CType::Arr(elem) = base_ty else {
             return Err("IR index on non-array".into());
         };
@@ -1937,6 +1967,9 @@ impl<'a, 'b> Gen<'a, 'b> {
             "len" => {
                 let elem = match &atys[0] {
                     CType::Arr(e) => e.as_ref().clone(),
+                    CType::CSlice(_) => {
+                        return Ok((CType::I64, vec![avals[0][1]]));
+                    }
                     _ => return Err("`len` expects array".into()),
                 };
                 let stride = comps(self.p, &elem)?.len() as i64;

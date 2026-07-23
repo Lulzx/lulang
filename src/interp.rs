@@ -347,6 +347,7 @@ impl<'a> Interp<'a> {
             Str => "str".into(),
             Unit => "()".into(),
             Arr(t) => format!("[{}]", self.type_name(t)),
+            CSlice(t) => format!("c_slice[{}]", self.type_name(t)),
             CPtr(t) => format!("c_ptr[{}]", self.type_name(t)),
             Rec(i) => self.ir.records[*i].name.clone(),
             Enum(i) => self.ir.enums[*i].name.clone(),
@@ -868,8 +869,32 @@ impl<'a> Interp<'a> {
                         ),
                         _ => return Err("unsupported FFI array element type".into()),
                     };
-                    arrays.push((argument_index, native));
-                    let array = &arrays.last().unwrap().1;
+                    arrays.push((argument_index, true, native));
+                    let array = &arrays.last().unwrap().2;
+                    match array {
+                        NativeArray::I64(values) => {
+                            ints[int_index] = values.as_ptr() as i64;
+                            ints[int_index + 1] = values.len() as i64;
+                        }
+                        NativeArray::F64(values) => {
+                            ints[int_index] = values.as_ptr() as i64;
+                            ints[int_index + 1] = values.len() as i64;
+                        }
+                    }
+                    int_index += 2;
+                }
+                (Type::CSlice(element), Value::Arr(cells)) => {
+                    let native = match element.as_ref() {
+                        Type::I64 => NativeArray::I64(
+                            cells.iter().map(as_i64).collect::<Result<Vec<_>, _>>()?,
+                        ),
+                        Type::F64 => NativeArray::F64(
+                            cells.iter().map(as_f64).collect::<Result<Vec<_>, _>>()?,
+                        ),
+                        _ => return Err("unsupported FFI c_slice element type".into()),
+                    };
+                    arrays.push((argument_index, false, native));
+                    let array = &arrays.last().unwrap().2;
                     match array {
                         NativeArray::I64(values) => {
                             ints[int_index] = values.as_ptr() as i64;
@@ -908,7 +933,10 @@ impl<'a> Interp<'a> {
             }
         };
         let mut copyouts = vec![None; args.len()];
-        for (index, array) in arrays {
+        for (index, copyout, array) in arrays {
+            if !copyout {
+                continue;
+            }
             let cells = match array {
                 NativeArray::I64(values) => values.into_iter().map(Value::Int).collect(),
                 NativeArray::F64(values) => values.into_iter().map(Value::Float).collect(),

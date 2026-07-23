@@ -580,6 +580,10 @@ fn compatible(expected: &Type, actual: &Type) -> bool {
         || (matches!(expected, Type::F32 | Type::F64) && *actual == Type::I64)
         || (*expected == Type::F32 && *actual == Type::F64)
         || (*expected == Type::F64 && *actual == Type::F32)
+        || matches!(
+            (expected, actual),
+            (Type::CSlice(expected), Type::Arr(actual)) if expected == actual
+        )
 }
 
 struct Builder<'a> {
