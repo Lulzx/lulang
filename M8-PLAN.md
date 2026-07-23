@@ -10,10 +10,9 @@ current tree (Cargo workspace where `crates/*` are `#[path]` shims into
 Before starting M8, the tree must pass the standing verification bar:
 `cargo test --release`, the corpus under all tiers, and
 `selfhost/build.sh --bootstrap` (stage-2/stage-3 byte-identical IR). As of
-2026-07-23 the bootstrap is **broken** — see [KNOWN-ISSUES.md](KNOWN-ISSUES.md)
-for the open JIT miscompilation that must be fixed first (one of the two
-regressions found during pre-flight is already fixed in
-`src/backend/optimization.rs::normalize_block_order`).
+2026-07-23 all pre-flight regressions in
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md) are fixed, the release tests pass, and the
+bootstrap has regained its stage-1/2/3 byte-identical fixpoint.
 
 ## Syntax
 

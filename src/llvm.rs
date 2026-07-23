@@ -491,17 +491,23 @@ impl<'a> Emit<'a> {
                 },
             }),
             InstKind::Load(local) => Some(self.load_var(&Self::ir_local(*local))?),
-            InstKind::Store { local, value: id } => {
+            InstKind::Store {
+                local,
+                value: id,
+                retain_arrays,
+            } => {
                 let v = value(*id)?;
                 let want = &function.locals[*local as usize].ty;
                 let mut v = self.coerce_ev(v, want)?;
-                for offset in array_component_offsets(self.p, want)? {
-                    let copy = self.t();
-                    self.line(format!(
-                        "{} = call ptr @lu_arr_clone(ptr {})",
-                        copy, v.regs[offset]
-                    ));
-                    v.regs[offset] = copy;
+                if *retain_arrays {
+                    for offset in array_component_offsets(self.p, want)? {
+                        let copy = self.t();
+                        self.line(format!(
+                            "{} = call ptr @lu_arr_clone(ptr {})",
+                            copy, v.regs[offset]
+                        ));
+                        v.regs[offset] = copy;
+                    }
                 }
                 self.store_var(&Self::ir_local(*local), &v)?;
                 None

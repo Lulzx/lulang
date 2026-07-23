@@ -49,7 +49,13 @@ pub enum Callee {
 pub enum InstKind {
     Constant(Constant),
     Load(LocalId),
-    Store { local: LocalId, value: ValueId },
+    Store {
+        local: LocalId,
+        value: ValueId,
+        /// Whether this store creates a persistent language-level value copy.
+        /// Inliner parameter/result shuttles are call-scoped borrows.
+        retain_arrays: bool,
+    },
     Unary { op: UnaryOp, value: ValueId },
     Binary { op: BinaryOp, lhs: ValueId, rhs: ValueId },
     Select { condition: ValueId, then_value: ValueId, else_value: ValueId },
@@ -222,7 +228,7 @@ impl LoweredProgram {
                             let local = f.locals.get(*local as usize).ok_or_else(|| format!("IR `{}` loads invalid local", f.name))?;
                             if local.ty != inst.ty { return Err(format!("IR `{}` load type mismatch", f.name)); }
                         }
-                        InstKind::Store { local, value } => {
+                        InstKind::Store { local, value, .. } => {
                             let local = f.locals.get(*local as usize).ok_or_else(|| format!("IR `{}` stores invalid local", f.name))?;
                             if !compatible(&local.ty, &f.values[*value as usize]) { return Err(format!("IR `{}` store type mismatch", f.name)); }
                         }
@@ -408,7 +414,13 @@ impl<'a> Builder<'a> {
     }
     fn constant(&mut self, c: Constant, ty: Type) -> ValueId { self.emit(InstKind::Constant(c), ty) }
     fn load(&mut self, local: LocalId) -> ValueId { self.emit(InstKind::Load(local), self.locals[local as usize].ty.clone()) }
-    fn store(&mut self, local: LocalId, value: ValueId) { self.effect(InstKind::Store { local, value }); }
+    fn store(&mut self, local: LocalId, value: ValueId) {
+        self.effect(InstKind::Store {
+            local,
+            value,
+            retain_arrays: true,
+        });
+    }
     fn expr_type(&self, e: ExprId) -> Result<Type, String> { self.types[e as usize].clone().ok_or_else(|| format!("lowering: expression {} has no type", e)) }
 
     fn block(&mut self, stmts: &[StmtId]) -> Result<Option<ValueId>, String> {

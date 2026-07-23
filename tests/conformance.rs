@@ -217,3 +217,19 @@ fn arrays_nested_in_records_still_have_value_semantics() {
         b"7 0\n",
     );
 }
+
+#[test]
+fn inlined_inout_record_mutation_preserves_array_snapshots() {
+    assert_host_success(
+        "inlined_inout_record_cow",
+        "type Bag { values: [i64] }\n\
+         fn mutate(inout bag: Bag) { bag.values[0] = 7 }\n\
+         main {\n\
+           var original = Bag { arr(1, 0) }\n\
+           let snapshot = original\n\
+           mutate(original)\n\
+           print(original.values[0], snapshot.values[0])\n\
+         }\n",
+        b"7 0\n",
+    );
+}

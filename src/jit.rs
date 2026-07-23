@@ -127,6 +127,7 @@ impl<'a> Jit<'a> {
             ("lu_arr_new_i64", runtime::lu_arr_new_i64 as *const u8),
             ("lu_arr_new_raw", runtime::lu_arr_new_raw as *const u8),
             ("lu_arr_clone", runtime::lu_arr_clone as *const u8),
+            ("lu_arr_cow", runtime::lu_arr_cow as *const u8),
             ("lu_str_eq", runtime::lu_str_eq as *const u8),
             ("lu_oob", runtime::lu_oob as *const u8),
             ("lu_i64_div", runtime::lu_i64_div as *const u8),
@@ -213,6 +214,7 @@ impl<'a> Jit<'a> {
             ("lu_arr_new_i64", 1, &[types::I64, types::I64], false),
             ("lu_arr_new_raw", 1, &[types::I64, types::I64], false),
             ("lu_arr_clone", 1, &[types::I64], false),
+            ("lu_arr_cow", 1, &[types::I64], false),
             (
                 "lu_str_eq",
                 1,
@@ -355,13 +357,7 @@ impl<'a> Jit<'a> {
             let mut cursor = 0;
             for &local in &function.params {
                 let n = comps(g.p, &function.locals[local as usize].ty)?.len();
-                let mut values = incoming[cursor..cursor + n].to_vec();
-                for offset in array_component_offsets(
-                    g.p,
-                    &function.locals[local as usize].ty,
-                )? {
-                    values[offset] = g.call_import("lu_arr_clone", &[values[offset]])[0];
-                }
+                let values = incoming[cursor..cursor + n].to_vec();
                 g.define_ir_local(local, &values)?;
                 cursor += n;
             }
@@ -1043,12 +1039,18 @@ impl<'a, 'b> Gen<'a, 'b> {
                     .ok_or("invalid IR local")?;
                 Some((ty, vars.iter().map(|v| self.b.use_var(*v)).collect()))
             }
-            InstKind::Store { local, value: id } => {
+            InstKind::Store {
+                local,
+                value: id,
+                retain_arrays,
+            } => {
                 let (got, vals) = value(*id)?;
                 let want = &function.locals[*local as usize].ty;
                 let mut vals = self.coerce(want, &got, vals)?;
-                for offset in array_component_offsets(self.p, want)? {
-                    vals[offset] = self.call_import("lu_arr_clone", &[vals[offset]])[0];
+                if *retain_arrays {
+                    for offset in array_component_offsets(self.p, want)? {
+                        vals[offset] = self.call_import("lu_arr_clone", &[vals[offset]])[0];
+                    }
                 }
                 self.define_ir_local(*local, &vals)?;
                 None
@@ -1150,10 +1152,11 @@ impl<'a, 'b> Gen<'a, 'b> {
                 vec![self.b.ins().iconst(types::I64, *tag)],
             )),
             InstKind::SetIndex {
+                root,
+                path,
                 base,
                 index,
                 value: stored,
-                ..
             } => {
                 let base_id = *base;
                 let (base_ty, base) = value(*base)?;
@@ -1170,7 +1173,25 @@ impl<'a, 'b> Gen<'a, 'b> {
                             let array = array_local_for_value(function, base_id)?;
                             self.cfg_trusted.get(&(*loop_index, array)).copied()
                         });
-                let addrs = self.elem_addrs(base[0], index[0], &elem, trusted)?;
+                let unique = self.call_import("lu_arr_cow", &[base[0]])[0];
+                let (mut current, vars) = self
+                    .lookup(&Self::ir_local(*root))
+                    .ok_or("invalid indexed root")?;
+                let mut offset = 0;
+                for &field in path {
+                    let CType::Rec(record) = current else {
+                        return Err("indexed path crosses non-record".into());
+                    };
+                    let name = &self.p.types[record].fields[field].0;
+                    let (add, next) = field_offset(self.p, record, name)?;
+                    offset += add;
+                    current = next;
+                }
+                if !matches!(current, CType::Arr(_)) {
+                    return Err("indexed path does not end at an array".into());
+                }
+                self.b.def_var(vars[offset], unique);
+                let addrs = self.elem_addrs(unique, index[0], &elem, trusted)?;
                 for (reg, addr) in stored.iter().zip(addrs) {
                     self.b.ins().store(MemFlags::trusted(), *reg, addr, 0);
                 }

@@ -226,6 +226,7 @@ fn last_store_to(function: &Function, block: BlockId, local: LocalId) -> Option<
             InstKind::Store {
                 local: target,
                 value,
+                ..
             } if target == local => Some(value),
             _ => None,
         })
@@ -242,7 +243,7 @@ fn has_unit_increment(
             .instructions
             .iter()
             .any(|inst| {
-                let InstKind::Store { local, value } = inst.kind else {
+                let InstKind::Store { local, value, .. } = inst.kind else {
                     return false;
                 };
                 if local != induction {
@@ -342,7 +343,7 @@ fn find_reduction(
                     .instructions
                     .iter()
                     .filter_map(move |inst| match inst.kind {
-                        InstKind::Store { local, value } if local == accumulator => Some(value),
+                        InstKind::Store { local, value, .. } if local == accumulator => Some(value),
                         _ => None,
                     })
             })
@@ -571,6 +572,7 @@ fn inline_site(
             kind: InstKind::Store {
                 local: map_local(param),
                 value: argument,
+                retain_arrays: false,
             },
         });
     }
@@ -605,6 +607,7 @@ fn inline_site(
                     kind: InstKind::Store {
                         local: result_local,
                         value: map_value(value),
+                        retain_arrays: false,
                     },
                 });
                 for (index, target) in inout.iter().enumerate() {
@@ -624,6 +627,7 @@ fn inline_site(
                         kind: InstKind::Store {
                             local: *target,
                             value: loaded,
+                            retain_arrays: false,
                         },
                     });
                 }
@@ -649,9 +653,11 @@ fn remap_inst(
         InstKind::Store {
             local: id,
             value: v,
+            retain_arrays,
         } => InstKind::Store {
             local: local(*id),
             value: value(*v),
+            retain_arrays: *retain_arrays,
         },
         InstKind::Unary { op, value: v } => InstKind::Unary {
             op: *op,
@@ -771,7 +777,7 @@ pub fn if_convert(function: &mut Function) {
         let mut moved = Vec::new();
         for inst in then_insts {
             match inst.kind {
-                InstKind::Store { local, value } => {
+                InstKind::Store { local, value, .. } => {
                     then_stores.insert(local, value);
                 }
                 _ => moved.push(inst),
@@ -779,7 +785,7 @@ pub fn if_convert(function: &mut Function) {
         }
         for inst in else_insts {
             match inst.kind {
-                InstKind::Store { local, value } => {
+                InstKind::Store { local, value, .. } => {
                     else_stores.insert(local, value);
                 }
                 _ => moved.push(inst),
@@ -833,6 +839,7 @@ pub fn if_convert(function: &mut Function) {
                 kind: InstKind::Store {
                     local,
                     value: selected,
+                    retain_arrays: true,
                 },
             });
         }

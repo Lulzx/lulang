@@ -268,7 +268,7 @@ impl<'a> Interp<'a> {
                         Constant::Bool(v) => Value::Bool(*v), Constant::Bytes(v) => Value::Str(Rc::new(v.clone())), Constant::Unit => Value::Unit,
                     }),
                     InstKind::Load(local) => Some(locals[*local as usize].clone()),
-                    InstKind::Store { local, value } => {
+                    InstKind::Store { local, value, .. } => {
                         locals[*local as usize] = coerce(values[*value as usize].clone(), &function.locals[*local as usize].ty)?;
                         None
                     }

@@ -2,8 +2,9 @@
 // followed by 8-byte elements; allocations are leaked (benchmark-lifetime model,
 // real memory management arrives with the value-semantics IR).
 use std::alloc::{alloc, Layout};
+use std::collections::HashMap;
 use std::io::Write as _;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 // program arguments (everything after the source file on the CLI) and the
 // str-returning builtin protocol: calls that produce a str return the pointer
@@ -11,6 +12,11 @@ use std::sync::OnceLock;
 // (single-threaded language, same protocol as the C runtime).
 static ARGS: OnceLock<Vec<String>> = OnceLock::new();
 static mut LAST_LEN: i64 = 0;
+static ARRAY_REFS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+
+fn array_refs() -> &'static Mutex<HashMap<usize, usize>> {
+    ARRAY_REFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 pub fn set_args(args: Vec<String>) {
     let _ = ARGS.set(args);
@@ -130,6 +136,9 @@ fn arr_alloc(n: i64, stride: i64) -> *mut u8 {
         std::process::exit(1);
     }
     unsafe { *(p as *mut i64) = slot_count };
+    // Fresh arrays are SSA temporaries until a language local retains them
+    // through `lu_arr_clone`.
+    array_refs().lock().unwrap().insert(p as usize, 0);
     p
 }
 
@@ -157,11 +166,32 @@ pub extern "C" fn lu_arr_new_raw(n: i64, stride: i64) -> *mut u8 {
     arr_alloc(n, stride)
 }
 
-/// Clone the complete compiler-owned array allocation (header plus component
-/// planes). This is the copy primitive used at language value-copy boundaries.
+/// Share an immutable array allocation at a language value-copy boundary.
+/// Mutation goes through `lu_arr_cow`, preserving value semantics without
+/// eagerly copying large read-only compiler-state records.
 pub extern "C" fn lu_arr_clone(source: *const u8) -> *mut u8 {
     if source.is_null() {
         return std::ptr::null_mut();
+    }
+    let mut refs = array_refs().lock().unwrap();
+    *refs.entry(source as usize).or_insert(1) += 1;
+    source as *mut u8
+}
+
+/// Return uniquely owned storage for an array that is about to be mutated.
+/// Reference counts intentionally overestimate because the current runtime
+/// has no destruction hooks; that can cause an extra copy but never aliasing.
+pub extern "C" fn lu_arr_cow(source: *const u8) -> *mut u8 {
+    if source.is_null() {
+        return std::ptr::null_mut();
+    }
+    {
+        let mut refs = array_refs().lock().unwrap();
+        let count = refs.entry(source as usize).or_insert(1);
+        if *count == 1 {
+            return source as *mut u8;
+        }
+        *count -= 1;
     }
     let slots = unsafe { *(source as *const i64) };
     let bytes = usize::try_from(slots)
@@ -172,15 +202,8 @@ pub extern "C" fn lu_arr_clone(source: *const u8) -> *mut u8 {
             eprintln!("error: array allocation size overflow");
             std::process::exit(1);
         });
-    let layout = Layout::from_size_align(bytes, 8).unwrap_or_else(|_| {
-        eprintln!("error: array allocation size overflow");
-        std::process::exit(1);
-    });
-    let copy = unsafe { alloc(layout) };
-    if copy.is_null() {
-        eprintln!("error: out of memory cloning array");
-        std::process::exit(1);
-    }
+    let copy = arr_alloc(slots, 1);
+    array_refs().lock().unwrap().insert(copy as usize, 1);
     unsafe { std::ptr::copy_nonoverlapping(source, copy, bytes) };
     copy
 }

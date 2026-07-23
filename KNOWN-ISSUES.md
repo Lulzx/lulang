@@ -1,9 +1,8 @@
 # Known issues (2026-07-23)
 
 State of the JIT regressions found while pre-flighting M8 against the
-workspace-restructure tree. The correctness regressions are fixed, but the
-selfhost bootstrap remains blocked by issue 3; it blocks
-[M8-PLAN.md](M8-PLAN.md).
+workspace-restructure tree. All three are fixed and the selfhost bootstrap is
+back at its stage-1/2/3 byte-identical fixpoint.
 
 ## 1. FIXED — JIT assumed topological block order after IR inlining
 
@@ -60,21 +59,26 @@ before the fix (thirteen NUL bytes instead of `stable string`) and now passes.
 The original tiny-file repro and `selfhost/parser.lu` are byte-correct, and
 `cargo test --release` passes all 20 tests.
 
-## 3. OPEN — bootstrap stage 1 exceeds available memory
+## 3. FIXED — eager array copying exhausted memory in bootstrap stage 1
 
 With issue 2 fixed, bootstrap stage 1 proceeds past parsing but is killed by
 the OS while `lu run selfhost/codegen.lu selfhost/codegen.lu` emits the
 compiler. A measured run reached about 9.3 GB resident memory before SIGKILL.
-The reference interpreter was about 400 MB after 20 seconds and had already
-emitted roughly 557 KB.
 
-The immediate source is the current benchmark-lifetime runtime model:
-`lu_concat` allocates and intentionally leaks every immutable intermediate
-string. `codegen.lu` builds LLVM text through many nested concatenations, so
-self-compilation exhausts memory before stage 1 can flush its output. This is
-separate from issue 2's correctness bug and needs an ownership/lifetime or
-streaming-output design rather than an unsafe attempt to free inputs whose
-aliases are unknown.
+**Cause:** every language store eagerly cloned array components, and IR
+inlining represents call parameters/results with synthetic stores. Passing
+the selfhost compiler's large `P` and `G` records through inlined calls
+therefore copied their backing arrays repeatedly. Allocation tracing at the
+first GiB measured 1,013 MiB of array clones, 15 MiB of initial arrays, and
+effectively no string allocation.
+
+**Fix (uncommitted):** the JIT runtime now keeps array ownership counts in a
+side table without changing the compiler-owned array layout. Language stores
+retain shared storage, mutations call `lu_arr_cow` and update the owning local
+(including arrays nested in records), and inliner-generated parameter/result
+stores are explicitly marked as call-scoped borrows. Fresh SSA allocations
+start with zero persistent owners. The full `selfhost/build.sh --bootstrap`
+now completes, stage 1 matches stage 2, and stages 2/3 are byte-identical.
 
 ## Incident note: lost uncommitted jit.rs delta
 
