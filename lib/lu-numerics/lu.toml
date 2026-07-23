@@ -1,0 +1,5 @@
+[package]
+name = "lu_numerics"
+version = "0.1.0"
+
+[dependencies]

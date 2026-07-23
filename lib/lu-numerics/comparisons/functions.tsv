@@ -1,0 +1,27 @@
+function	group	cpp	numpy	julia	semantic_note
+dot	vector	numerics.cpp	numerics.py	numerics.jl	lulang sum is order-free
+norm2	vector	numerics.cpp	numerics.py	numerics.jl	lulang sum is order-free
+axpy	vector	numerics.cpp	numerics.py	numerics.jl	boundary buffers mutate; lulang values do not alias
+scale	vector	numerics.cpp	numerics.py	numerics.jl	boundary buffers mutate; lulang values do not alias
+mean	statistics	numerics.cpp	numerics.py	numerics.jl	population statistic
+variance	statistics	numerics.cpp	numerics.py	numerics.jl	population variance
+mse	statistics	numerics.cpp	numerics.py	numerics.jl	population mean
+trapz_uniform	integration	numerics.cpp	numerics.py	numerics.jl	trapezoid endpoints have half weight
+trapz_xy	integration	numerics.cpp	numerics.py	numerics.jl	explicit coordinates
+polynomial_eval	polynomial	numerics.cpp	numerics.py	numerics.jl	ascending coefficients
+gemv_inplace	linalg	numerics.cpp	numerics.py	numerics.jl	row-major boundary buffer
+matmul_square_inplace	linalg	numerics.cpp	numerics.py	numerics.jl	row-major square matrices
+convolution_inplace	signal	numerics.cpp	numerics.py	numerics.jl	causal convolution with zero extension
+moving_average_inplace	signal	numerics.cpp	numerics.py	numerics.jl	trailing partial windows
+lcg_step	random	numerics.cpp	numerics.py	numerics.jl	Park-Miller-style positive 31-bit state
+monte_carlo_pi	random	numerics.cpp	numerics.py	numerics.jl	deterministic scalar samples
+bisect_sqrt	optimize	numerics.cpp	numerics.py	numerics.jl	fixed iteration count
+sinc	special	numerics.cpp	numerics.py	numerics.jl	removable singularity is one
+normal_pdf	special	numerics.cpp	numerics.py	numerics.jl	standard normal
+sigmoid	special	numerics.cpp	numerics.py	numerics.jl	logistic function
+clamp	geometry	numerics.cpp	numerics.py	numerics.jl	closed interval
+lerp	geometry	numerics.cpp	numerics.py	numerics.jl	unclamped amount
+distance3	geometry	numerics.cpp	numerics.py	numerics.jl	scalar coordinates preserve the C ABI
+determinant2	linalg	numerics.cpp	numerics.py	numerics.jl	row-major two-by-two matrix
+factorial	special	numerics.cpp	numerics.py	numerics.jl	small non-negative i64 inputs
+binomial	special	numerics.cpp	numerics.py	numerics.jl	exact integer recurrence

@@ -31,7 +31,7 @@ than exposing internals.
 | 2 | Generated C headers + machine-readable ABI manifest — **complete** | Exceptional | Low–medium |
 | 3 | `pylulang`: NumPy/Python bindings — **complete (v0.1)** | Exceptional | Medium |
 | 4 | LSP + VS Code extension (tree-sitter first) — **complete (v0.1)** | Very high | Medium |
-| 5 | `lu-numerics` first-party library corpus — **foundation shipped** | Very high | Continuous |
+| 5 | `lu-numerics` first-party library corpus — **complete (v0.1)** | Very high | Continuous |
 | 6 | Web playground (interpreter → wasm32) — **v0.1 shipped** | High | Medium |
 | 7 | `lu bindgen` C-header importer — **foundation shipped** | Very high | Medium–high |
 | 8 | `wasm32-wasi` / `wasm32-web` target — **shipped** | High | Medium |
@@ -121,6 +121,15 @@ finding, Monte Carlo kernels. **Every function ships with (1) properties,
 (2) benchmarks, (3) a C++/NumPy/Julia comparison, (4) generated docs.**
 First-class `property` blocks with shrinking are genuinely differentiating —
 they should appear throughout the ecosystem, not stay a compiler demo.
+
+`lib/lu-numerics` now ships as a package with 26 boundary-callable kernels
+covering vector algebra, statistics, integration, polynomials, dense linear
+algebra, signal processing, deterministic random/Monte Carlo work,
+optimization, geometry, special functions, and combinatorics. Every export has
+adjacent prose, is reached by an executable law, appears in the per-function
+benchmark registry, and maps to checked C++/NumPy/Julia reference source.
+Integration coverage rejects undocumented or unclaimed function pages and runs
+the package in all four tiers plus the generated Python ABI.
 
 ### 6. Web playground
 

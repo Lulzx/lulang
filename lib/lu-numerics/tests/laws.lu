@@ -1,0 +1,78 @@
+property vector_laws(a0: i64, a1: i64, a2: i64) {
+  let a = [float(a0 % 100), float(a1 % 100), float(a2 % 100)]
+  let b = [float(a2 % 100), float(a0 % 100), float(a1 % 100)]
+  return dot(a, b, 3) ~= dot(b, a, 3) and norm2(a, 3) >= 0.0
+}
+
+property boundary_transforms_preserve_language_values(seed: i64) {
+  var data = [1.0, 2.0, 3.0, 4.0]
+  let other = [4.0, 3.0, 2.0, 1.0]
+  axpy(float(seed % 7), other, data, 4)
+  scale(2.0, data, 4)
+  gemv_inplace([1.0, 0.0, 0.0, 1.0], data, 2, 2)
+  matmul_square_inplace(data, [1.0, 0.0, 0.0, 1.0], 2)
+  convolution_inplace(data, [1.0, 0.5], 4, 2)
+  moving_average_inplace(data, 2, 4)
+  return data[0] == 1.0 and data[1] == 2.0 and data[2] == 3.0 and data[3] == 4.0
+}
+
+property statistics_laws(seed: i64) {
+  let shift = float(seed % 100) * 0.1
+  let values = [1.0 + shift, 2.0 + shift, 3.0 + shift]
+  let reversed = [3.0 + shift, 2.0 + shift, 1.0 + shift]
+  return mean(values, 3) ~= 2.0 + shift and variance(values, 3) >= 0.0 and mse(values, reversed, 3) ~= mse(reversed, values, 3)
+}
+
+property integration_is_exact_for_a_line(seed: i64) {
+  let slope = float(seed % 20)
+  let values = [0.0, slope, 2.0 * slope, 3.0 * slope]
+  let coordinates = [0.0, 1.0, 2.0, 3.0]
+  let expected = 4.5 * slope
+  return trapz_uniform(values, 1.0, 4) ~= expected and trapz_xy(coordinates, values, 4) ~= expected
+}
+
+property horner_matches_expansion(seed: i64) {
+  let value = float(seed % 100) * 0.01
+  let coefficients = [2.0, -3.0, 4.0, 0.5]
+  let expected = 2.0 - 3.0 * value + 4.0 * value * value + 0.5 * value * value * value
+  return polynomial_eval(coefficients, value, 4) ~= expected
+}
+
+property random_kernels_are_deterministic_and_bounded(seed: i64) {
+  let first = lcg_step(seed)
+  let second = lcg_step(seed)
+  let estimate = monte_carlo_pi(10000, seed)
+  return first == second and first >= 0 and first < 2147483647 and estimate > 2.9 and estimate < 3.4
+}
+
+property bisection_recovers_square(seed: i64) {
+  let value = abs(float(seed % 1000)) * 0.01 + 0.01
+  let root = bisect_sqrt(value, 50)
+  return abs(root * root - value) < 0.00000001
+}
+
+property special_function_symmetries(seed: i64) {
+  let value = float(seed % 500) * 0.001
+  return sinc(value) ~= sinc(-value) and normal_pdf(value) ~= normal_pdf(-value) and sigmoid(value) + sigmoid(-value) ~= 1.0
+}
+
+property scalar_helpers_obey_endpoints(seed: i64) {
+  let value = float(seed % 100)
+  return clamp(value, -2.0, 2.0) >= -2.0 and clamp(value, -2.0, 2.0) <= 2.0 and lerp(value, value + 4.0, 0.0) ~= value and lerp(value, value + 4.0, 1.0) ~= value + 4.0
+}
+
+property geometry_laws(seed: i64) {
+  let value = float(seed % 100) * 0.1
+  let forward = distance3(value, 2.0, 3.0, -1.0, 4.0, 7.0)
+  let backward = distance3(-1.0, 4.0, 7.0, value, 2.0, 3.0)
+  return forward ~= backward and determinant2(value, 2.0, 3.0, 4.0) ~= -determinant2(3.0, 4.0, value, 2.0)
+}
+
+property combinatoric_recurrences(seed: i64) {
+  var n = seed % 10
+  if n < 0 { n = -n }
+  n = n + 2
+  var k = seed % (n + 1)
+  if k < 0 { k = -k }
+  return factorial(n) == n * factorial(n - 1) and binomial(n, k) == binomial(n, n - k)
+}

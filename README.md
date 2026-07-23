@@ -174,6 +174,14 @@ executable conservation laws, native/WASI builds, an exported SoA integration
 kernel with a generated C header, and an optional raylib visualizer. Run
 `lu run` or `lu test --runs 1000` from that directory.
 
+### First-party numerics
+
+[`lib/lu-numerics`](lib/lu-numerics) is a package of 26 documented kernels
+across vectors, statistics, integration, dense linear algebra, signal
+processing, random/Monte Carlo work, optimization, geometry, and special
+functions. Every export is tied to an executable law, benchmark entry,
+generated function page, and C++/NumPy/Julia reference source.
+
 ### Autodiff: ludiff
 
 [`lib/ludiff`](lib/ludiff) implements forward-mode automatic differentiation

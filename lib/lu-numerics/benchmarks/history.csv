@@ -1,0 +1,2 @@
+timestamp,label,runs,interp_ms,jit_ms,aot_ms,compile_ms
+1784791678,lu_numerics,3,96.457430,81.728542,1.973653,157.021625
