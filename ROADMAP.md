@@ -69,9 +69,10 @@ M8 boundary subset: `i64`, `f64`, `bool` (0/1 as `int64_t`), enums (i64 tag),
 `str` as `(const char*, int64_t)` parameters, `[i64]`/`[f64]` as
 `(T* data, int64_t n)`. Signatures capped at 6 integer-class + 8 float-class
 components (a language rule that keeps every argument in registers on both
-SysV x86-64 and AArch64). Deferred follow-ups: `f32` at the boundary,
-`c_ptr[T]`/`c_slice[T]`, `@c_layout` records, `str` returns, callbacks,
-zero-copy array export handles.
+SysV x86-64 and AArch64). The first follow-up, boundary-only `c_ptr[T]` opaque
+handles, now works in all four tiers and in generated headers. Remaining
+follow-ups: `f32` at the boundary, `c_slice[T]`, `@c_layout` records, `str`
+returns, callbacks, and zero-copy array export handles.
 
 ### 3. `pylulang`
 
@@ -137,14 +138,15 @@ identity; raylib produces visible demos.
 
 The first slice ships a dependency-free C lexer/parser, typedef resolution,
 numeric macros, sequential enums, function prototypes, register-cap checking,
-and checker-valid `extern` generation. It deliberately emits only exact
-boundary matches (`int64_t`/LP64 `long`, `double`, and `void`); narrower
-integers, `float`, C `bool`, pointers, callbacks, and by-value aggregates are
-diagnosed instead of unsafely widened. A macOS `math.h` preflight currently
-produces 41 checker-valid imports. The remaining work for the full promised
-subset is therefore language work, not parser work: add `c_ptr[T]`, opaque
-handles, `@c_layout` records, and conversion shims for C-width scalars before
-turning those indexed declarations into bindings.
+and checker-valid `extern` generation. The second adds boundary-only
+`c_ptr[T]`, opaque C structs, and end-to-end pointer calls in the interpreter,
+JIT, AOT, and self-hosted compiler. Unsupported pointees degrade to the
+explicit untyped handle `c_ptr[()]`; no C layout is inferred. Narrower
+integers, `float`, C `bool`, callbacks, and by-value aggregates remain
+diagnostics instead of being unsafely widened. A macOS `math.h` preflight
+currently produces 41 checker-valid imports. The remaining work for the full
+promised subset is `@c_layout` records and conversion shims for C-width
+scalars, followed by callbacks.
 
 ### 8. WASM target
 

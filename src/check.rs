@@ -11,6 +11,7 @@ pub enum Type {
     Str,
     Unit,
     Arr(Box<Type>),
+    CPtr(Box<Type>),
     Rec(usize),
     Enum(usize),
 }
@@ -59,6 +60,11 @@ pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
         _ => {
             if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
                 Ok(Type::Arr(Box::new(resolve_type(p, inner)?)))
+            } else if let Some(inner) = s
+                .strip_prefix("c_ptr[")
+                .and_then(|inner| inner.strip_suffix(']'))
+            {
+                Ok(Type::CPtr(Box::new(resolve_type(p, inner)?)))
             } else if let Some(ei) = p.enums.iter().position(|e| e.name == s) {
                 Ok(Type::Enum(ei))
             } else {
@@ -225,6 +231,11 @@ impl<'a> Checker<'a> {
             _ => {
                 if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
                     Ok(Type::Arr(Box::new(self.resolve(inner)?)))
+                } else if let Some(inner) = s
+                    .strip_prefix("c_ptr[")
+                    .and_then(|inner| inner.strip_suffix(']'))
+                {
+                    Ok(Type::CPtr(Box::new(self.resolve(inner)?)))
                 } else if let Some(ei) = self.p.enums.iter().position(|e| e.name == s) {
                     Ok(Type::Enum(ei))
                 } else {
@@ -245,14 +256,14 @@ impl<'a> Checker<'a> {
     ) -> Result<(), String> {
         fn param_classes(ty: &Type) -> Result<(usize, usize), String> {
             match ty {
-                Type::I64 | Type::Bool | Type::Enum(_) => Ok((1, 0)),
+                Type::I64 | Type::Bool | Type::Enum(_) | Type::CPtr(_) => Ok((1, 0)),
                 Type::F64 => Ok((0, 1)),
                 Type::Str => Ok((2, 0)),
                 Type::Arr(element) if matches!(element.as_ref(), Type::I64 | Type::F64) => {
                     Ok((2, 0))
                 }
                 _ => Err(
-                    "allowed boundary types are i64, f64, bool, enums, str, [i64], and [f64]"
+                    "allowed boundary types are i64, f64, bool, enums, c_ptr[T], str, [i64], and [f64]"
                         .into(),
                 ),
             }
@@ -267,10 +278,10 @@ impl<'a> Checker<'a> {
         }
         if !matches!(
             ret,
-            Type::Unit | Type::I64 | Type::F64 | Type::Bool | Type::Enum(_)
+            Type::Unit | Type::I64 | Type::F64 | Type::Bool | Type::Enum(_) | Type::CPtr(_)
         ) {
             return Err(format!(
-                "FFI signature `{}` has unsupported return type; returns are limited to (), i64, f64, bool, and enums",
+                "FFI signature `{}` has unsupported return type; returns are limited to (), i64, f64, bool, enums, and c_ptr[T]",
                 name
             ));
         }
@@ -296,6 +307,7 @@ impl<'a> Checker<'a> {
             Type::Str => "str".into(),
             Type::Unit => "()".into(),
             Type::Arr(t) => format!("[{}]", self.name(t)),
+            Type::CPtr(t) => format!("c_ptr[{}]", self.name(t)),
             Type::Rec(i) => self.p.types[*i].name.clone(),
             Type::Enum(i) => self.p.enums[*i].name.clone(),
         }

@@ -222,7 +222,8 @@ type P {
   err: i64
 }
 
-fn is_arrt(t: i64): bool { return t >= 1024 }
+fn is_arrt(t: i64): bool { return t >= 1024 and t < 2048 }
+fn is_ptrt(t: i64): bool { return t >= 2048 }
 fn elem_of(t: i64): i64 { return t - 1024 }
 fn is_enumt(t: i64): bool { return t >= 16 and t < 64 }
 fn is_rect(t: i64): bool { return t >= 64 and t < 1024 }
@@ -696,6 +697,18 @@ fn parse_type(inout p: P): i64 {
     return t + 1024
   }
   let t = take_ident(p)
+  if t == "c_ptr" {
+    expect_sym(p, "[")
+    var inner = 4
+    if cur_is_sym(p, "(") {
+      p.pos = p.pos + 1
+      expect_sym(p, ")")
+    } else {
+      inner = parse_type(p)
+    }
+    expect_sym(p, "]")
+    return inner + 2048
+  }
   if t == "i64" or t == "i32" { return 0 }
   if t == "f64" or t == "f32" { return 1 }
   if t == "bool" { return 2 }
@@ -899,7 +912,7 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
       if t == 3 or t == 1024 or t == 1025 {
         ni = ni + 2
       } else {
-        if t == 0 or t == 2 or is_enumt(t) {
+        if t == 0 or t == 2 or is_enumt(t) or is_ptrt(t) {
           ni = ni + 1
         } else {
           print("type error: unsupported FFI parameter in", name)
@@ -908,7 +921,7 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
       }
     }
   }
-  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or is_enumt(ret)) {
+  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or is_enumt(ret) or is_ptrt(ret)) {
     print("type error: unsupported FFI return in", name)
     p.err = 1
   }
@@ -1031,6 +1044,7 @@ fn tname(p: P, t: i64): str {
   if t == 1025 { return "[f64]" }
   if t == 1026 { return "[bool]" }
   if t == 1027 { return "[str]" }
+  if is_ptrt(t) { return "c_ptr[..]" }
   if is_arrt(t) { return "[..]" }
   return "<error>"
 }
@@ -1839,6 +1853,7 @@ fn wcount(p: P, t: i64): i64 {
 fn compty(p: P, t: i64, k: i64): str {
   if t == 1 { return "double" }
   if is_arrt(t) { return "ptr" }
+  if is_ptrt(t) { return "ptr" }
   if t == 3 {
     if k == 0 { return "ptr" }
     return "i64"
@@ -2506,6 +2521,15 @@ fn emit_bin(p: P, inout g: G, op: str, l: i64, r: i64): R {
       return rpush1(g, 2, t)
     }
     return rpush1(g, 2, eq)
+  }
+  if (op == "==" or op == "!=") and is_ptrt(lv.t) and is_ptrt(rv.t) {
+    let bit = newt(g)
+    var cc = "eq"
+    if op == "!=" { cc = "ne" }
+    eline(c9(bit, " = icmp ", cc, " ptr ", g.rs[lv.o], ", ", g.rs[rv.o], "", ""))
+    let out = newt(g)
+    eline(c4(out, " = zext i1 ", bit, " to i64"))
+    return rpush1(g, 2, out)
   }
   if op == "~=" {
     // |a-b| <= max(|a|,|b|) * 2^-40 + 2^-100 (approximate-equality contract)
@@ -3229,7 +3253,7 @@ fn emit_extern_decl(p: P, f: i64) {
   puts(c8("declare ", rt, " @\"", p.fname[f], "\"(", parts, ")", ""))
   putnl()
   if p.flib[f] != "" {
-    puts(c3("; link: -l", p.flib[f], ""))
+    puts(c3("; link: ", p.flib[f], ""))
     putnl()
   }
 }

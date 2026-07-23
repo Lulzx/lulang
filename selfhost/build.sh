@@ -47,5 +47,21 @@ if [ -x target/release/luc ]; then
 else
   $LU run selfhost/codegen.lu "$SRC" "$TRIPLE" > "$TMP/lu_sh_$STEM.ll"
 fi
-clang -O3 -mcpu=native -o "$OUT" "$TMP/lu_sh_$STEM.ll" "$RT"
+LINK_FLAGS=$(
+  sed -n 's/^; link: //p' "$TMP/lu_sh_$STEM.ll" |
+    sort -u |
+    while IFS= read -r lib; do
+      if [ "${lib#*/}" != "$lib" ] ||
+        [ "${lib%.so}" != "$lib" ] ||
+        [ "${lib%.dylib}" != "$lib" ]; then
+        printf '%s\n' "$lib"
+      else
+        printf '%s\n' "-l$lib"
+      fi
+    done
+)
+# Link entries are compiler-produced library names. Like LU_LINK_FLAGS in the
+# host driver, whitespace in a library path is intentionally unsupported.
+# shellcheck disable=SC2086
+clang -O3 -mcpu=native -o "$OUT" "$TMP/lu_sh_$STEM.ll" "$RT" $LINK_FLAGS
 echo "$OUT"

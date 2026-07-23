@@ -71,6 +71,15 @@ pub fn generate(header: &str, input: &Path, library: &str) -> Result<Generated, 
     );
     let _ = writeln!(source, "// C library: {}\n", library);
 
+    for structure in &parsed.structs {
+        let _ = writeln!(
+            source,
+            "// Opaque C aggregate; usable only behind c_ptr[{}].",
+            structure
+        );
+        let _ = writeln!(source, "type {} {{}}\n", structure);
+    }
+
     for declaration in &parsed.enums {
         if declaration
             .variants
@@ -144,12 +153,6 @@ pub fn generate(header: &str, input: &Path, library: &str) -> Result<Generated, 
             .push("no directly ABI-safe C functions were found".into());
     }
 
-    if !parsed.structs.is_empty() {
-        parsed.warnings.push(format!(
-            "{} struct declaration(s) were indexed but not emitted; fixed-layout boundary records require `@c_layout` support",
-            parsed.structs.len()
-        ));
-    }
     if !parsed.warnings.is_empty() {
         source.push_str("// Bindgen diagnostics:\n");
         for warning in &parsed.warnings {
@@ -183,7 +186,7 @@ fn render_function(
     let mut float_classes = 0usize;
     for (index, parameter) in function.params.iter().enumerate() {
         let ty = map_type(&parameter.ty, aliases, false)?;
-        match ty {
+        match ty.as_str() {
             "f64" => float_classes += 1,
             "str" => int_classes += 2,
             _ => int_classes += 1,
@@ -199,35 +202,52 @@ fn render_function(
             "signature needs {int_classes} integer-class and {float_classes} float-class registers; maximum is 6 and 8"
         ));
     }
-    Ok(format!(
-        "extern \"{}\" fn {}({}): {}\n",
+    let declaration = format!(
+        "extern \"{}\" fn {}({})",
         escape_string(library),
         function.name,
-        params.join(", "),
-        ret
-    ))
+        params.join(", ")
+    );
+    Ok(if ret == "()" {
+        format!("{declaration}\n")
+    } else {
+        format!("{declaration}: {ret}\n")
+    })
 }
 
 fn map_type(
     ty: &CType,
     aliases: &BTreeMap<String, CType>,
     return_position: bool,
-) -> Result<&'static str, String> {
+) -> Result<String, String> {
     let resolved = resolve_alias(ty, aliases)?;
     if resolved.function_pointer {
         return Err("function pointers are deferred with callbacks".into());
     }
     if resolved.pointers != 0 {
-        return Err(
-            "raw pointers and opaque handles require the boundary-only `c_ptr[T]` type".into(),
-        );
+        let mut pointee = match canonical_base(&resolved.base).as_str() {
+            "double" => "f64".into(),
+            "int64_t" | "signed long" | "signed long int" | "long" | "long int" | "intptr_t"
+            | "ptrdiff_t" => "i64".into(),
+            base if base.starts_with("struct ") || base.starts_with("union ") => base
+                .split_whitespace()
+                .nth(1)
+                .filter(|name| valid_identifier(name))
+                .unwrap_or("()")
+                .into(),
+            _ => "()".into(),
+        };
+        for _ in 0..resolved.pointers {
+            pointee = format!("c_ptr[{pointee}]");
+        }
+        return Ok(pointee);
     }
     match canonical_base(&resolved.base).as_str() {
-        "void" if return_position => Ok("()"),
+        "void" if return_position => Ok("()".into()),
         "void" => Err("a parameter cannot have type void".into()),
-        "double" => Ok("f64"),
+        "double" => Ok("f64".into()),
         "int64_t" | "signed long" | "signed long int" | "long" | "long int" | "intptr_t"
-        | "ptrdiff_t" => Ok("i64"),
+        | "ptrdiff_t" => Ok("i64".into()),
         "bool" | "_Bool" => Err(
             "C bool is not the lulang boundary bool (`int64_t`); a conversion shim is required"
                 .into(),
@@ -853,7 +873,7 @@ mod tests {
         assert!(generated
             .warnings
             .iter()
-            .any(|warning| warning.contains("raw pointers")));
+            .any(|warning| warning.contains("size_t")));
         assert!(generated
             .warnings
             .iter()

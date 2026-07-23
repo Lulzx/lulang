@@ -98,11 +98,12 @@ lu check math.lu
 
 The importer emits constants, sequential enums, typedef-resolved parameters,
 and functions whose C types have an exact lulang boundary representation.
-Declarations involving narrower C integers, `float`, C `bool`, pointers,
-callbacks, or by-value aggregates are parsed but reported as explicit
-diagnostics. They are not silently widened or reinterpreted. Pointer and
-fixed-layout declarations will become emit-capable with the planned
-boundary-only `c_ptr[T]` and `@c_layout` types.
+Raw pointers and opaque structs are emitted as boundary-only `c_ptr[T]`
+handles: they may cross an `extern` boundary, be stored, passed, and compared,
+but cannot be dereferenced or used to expose C layout. Declarations involving
+narrower C integers, `float`, C `bool`, callbacks, or by-value aggregates are
+parsed but reported as explicit diagnostics. They are not silently widened or
+reinterpreted. Fixed-layout declarations require the future `@c_layout` type.
 
 ### Editor tooling
 

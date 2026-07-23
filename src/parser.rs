@@ -187,7 +187,22 @@ impl Parser {
             self.eat_sym("]")?;
             Ok(format!("[{}]", inner))
         } else {
-            self.ident()
+            let name = self.ident()?;
+            if name == "c_ptr" && self.is_sym("[") {
+                self.next();
+                let inner = if self.is_sym("(") {
+                    self.next();
+                    self.eat_sym(")")?;
+                    self.eat_sym("]")?;
+                    return Ok("c_ptr[()]".into());
+                } else {
+                    self.parse_type_str()?
+                };
+                self.eat_sym("]")?;
+                Ok(format!("c_ptr[{}]", inner))
+            } else {
+                Ok(name)
+            }
         }
     }
 

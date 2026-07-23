@@ -96,3 +96,30 @@ fn exported_library_works_from_c_and_ctypes() {
 
     let _ = std::fs::remove_dir_all(directory);
 }
+
+#[test]
+fn exported_opaque_pointer_uses_void_pointer_header_abi() {
+    let directory = std::env::temp_dir().join(format!("lulang_ffi_pointer_{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create fixture directory");
+    let source = directory.join("pointer_echo.lu");
+    std::fs::write(
+        &source,
+        "export fn pointer_echo(pointer: c_ptr[()]): c_ptr[()] {\n  return pointer\n}\n",
+    )
+    .expect("write source");
+    let base = directory.join("pointer_echo");
+
+    run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .args(["build", "--lib", "-o"])
+        .arg(&base)
+        .arg(&source));
+
+    let header = std::fs::read_to_string(directory.join("pointer_echo.h")).expect("read header");
+    assert!(header.contains("void * pointer_echo(void * pointer);"));
+    let manifest =
+        std::fs::read_to_string(directory.join("pointer_echo.json")).expect("read manifest");
+    assert!(manifest.contains("\"type\": \"c_ptr[()]\""));
+    assert!(manifest.contains("\"ret\": \"c_ptr[()]\""));
+
+    let _ = std::fs::remove_dir_all(directory);
+}

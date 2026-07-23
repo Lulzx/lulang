@@ -41,14 +41,13 @@ fn bindgen_generates_checker_valid_imports_and_reports_deferred_types() {
     assert!(source.contains("extern \"m\" fn hypot(x: f64, y: f64): f64"));
     assert!(source.contains("extern \"m\" fn clamp_index(value: i64, low: i64, high: i64): i64"));
     assert!(!source.contains("extern \"m\" fn narrow_float"));
-    assert!(!source.contains("extern \"m\" fn allocate_bytes"));
+    assert!(source.contains("extern \"m\" fn allocate_bytes(size: i64): c_ptr[()]"));
     assert!(!source.contains("extern \"m\" fn consume_vector"));
 
     let diagnostics = String::from_utf8_lossy(&generated.stderr);
     assert!(diagnostics.contains("C float requires direct f32 boundary support"));
-    assert!(diagnostics.contains("raw pointers and opaque handles"));
     assert!(diagnostics.contains("@c_layout"));
-    assert!(diagnostics.contains("generated 2 C import(s)"));
+    assert!(diagnostics.contains("generated 3 C import(s)"));
 
     let checked = Command::new(lu())
         .args(["check"])
@@ -113,23 +112,52 @@ fn generated_imports_call_a_compiled_c_library() {
         .expect("open generated bindings");
     write!(
         bindings_file,
-        "\nmain {{\n  print(bindgen_add(20, 22))\n  print(bindgen_scale(1.5, 2.0))\n}}\n"
+        "\nmain {{\n  print(bindgen_add(20, 22))\n  print(bindgen_scale(1.5, 2.0))\n  let box = bindgen_box_new(99)\n  print(bindgen_box_read(box))\n  bindgen_box_free(box)\n}}\n"
     )
     .expect("append test program");
 
-    let executed = Command::new(lu())
-        .args(["run"])
+    for mode in ["interp", "run"] {
+        let executed = Command::new(lu())
+            .args([mode])
+            .arg(&bindings)
+            .output()
+            .expect("execute generated bindings");
+        assert!(
+            executed.status.success(),
+            "{mode} generated bindings failed:\n{}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&executed.stdout),
+            "42\n3\n99\n",
+            "unexpected {mode} output"
+        );
+    }
+
+    let executable = directory.join("bindgen_runtime_aot");
+    let built = Command::new(lu())
+        .args(["build", "-o"])
+        .arg(&executable)
         .arg(&bindings)
         .output()
-        .expect("execute generated bindings");
+        .expect("build generated bindings");
+    assert!(
+        built.status.success(),
+        "AOT build failed:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let executed = Command::new(&executable)
+        .output()
+        .expect("execute AOT generated bindings");
     assert!(
         executed.status.success(),
-        "generated bindings failed:\n{}",
+        "AOT generated bindings failed:\n{}",
         String::from_utf8_lossy(&executed.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&executed.stdout), "42\n3\n");
+    assert_eq!(String::from_utf8_lossy(&executed.stdout), "42\n3\n99\n");
 
     let _ = std::fs::remove_file(&bindings);
     let _ = std::fs::remove_file(&library);
+    let _ = std::fs::remove_file(&executable);
     let _ = std::fs::remove_dir(&directory);
 }

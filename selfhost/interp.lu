@@ -235,7 +235,8 @@ type P {
   err: i64
 }
 
-fn is_arrt(t: i64): bool { return t >= 1024 }
+fn is_arrt(t: i64): bool { return t >= 1024 and t < 2048 }
+fn is_ptrt(t: i64): bool { return t >= 2048 }
 fn elem_of(t: i64): i64 { return t - 1024 }
 fn is_enumt(t: i64): bool { return t >= 16 and t < 64 }
 fn is_rect(t: i64): bool { return t >= 64 and t < 1024 }
@@ -709,6 +710,18 @@ fn parse_type(inout p: P): i64 {
     return t + 1024
   }
   let t = take_ident(p)
+  if t == "c_ptr" {
+    expect_sym(p, "[")
+    var inner = 4
+    if cur_is_sym(p, "(") {
+      p.pos = p.pos + 1
+      expect_sym(p, ")")
+    } else {
+      inner = parse_type(p)
+    }
+    expect_sym(p, "]")
+    return inner + 2048
+  }
   if t == "i64" or t == "i32" { return 0 }
   if t == "f64" or t == "f32" { return 1 }
   if t == "bool" { return 2 }
@@ -912,7 +925,7 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
       if t == 3 or t == 1024 or t == 1025 {
         ni = ni + 2
       } else {
-        if t == 0 or t == 2 or is_enumt(t) {
+        if t == 0 or t == 2 or is_enumt(t) or is_ptrt(t) {
           ni = ni + 1
         } else {
           print("type error: unsupported FFI parameter in", name)
@@ -921,7 +934,7 @@ fn validate_ffi_sig(inout p: P, name: str, po: i64, np2: i64, ret: i64) {
       }
     }
   }
-  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or is_enumt(ret)) {
+  if not (ret == 0 or ret == 1 or ret == 2 or ret == 4 or is_enumt(ret) or is_ptrt(ret)) {
     print("type error: unsupported FFI return in", name)
     p.err = 1
   }
@@ -1044,6 +1057,7 @@ fn tname(p: P, t: i64): str {
   if t == 1025 { return "[f64]" }
   if t == 1026 { return "[bool]" }
   if t == 1027 { return "[str]" }
+  if is_ptrt(t) { return "c_ptr[..]" }
   if is_arrt(t) { return "[..]" }
   return "<error>"
 }
@@ -1792,6 +1806,7 @@ fn put_v(v: V) {
     if v.i == 1 { putb(true) } else { putb(false) }
   }
   if v.t == 3 { puts(v.s) }
+  if is_ptrt(v.t) { puti(v.i) }
 }
 
 fn eval_bin(inout m: M, op: str, l: V, r: V): V {
@@ -1828,7 +1843,7 @@ fn eval_bin(inout m: M, op: str, l: V, r: V): V {
     if l.t == 3 {
       if l.s == r.s { same = 1 }
     } else {
-      if l.t == 2 or is_enumt(l.t) {
+      if l.t == 2 or is_enumt(l.t) or is_ptrt(l.t) {
         if l.i == r.i { same = 1 }
       } else {
         if num_of(l) == num_of(r) { same = 1 }
@@ -1939,6 +1954,9 @@ fn eval_extern(p: P, inout m: M, f: i64, vals: [V]): V {
   if p.fret[f] == 1 { return vfloat(float_result) }
   if p.fret[f] == 2 { return vbool(integer_result) }
   if is_enumt(p.fret[f]) {
+    return V { t: p.fret[f], i: integer_result, f: 0.0, s: "", o: 0, n: 0 }
+  }
+  if is_ptrt(p.fret[f]) {
     return V { t: p.fret[f], i: integer_result, f: 0.0, s: "", o: 0, n: 0 }
   }
   return vunit()

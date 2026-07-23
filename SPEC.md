@@ -174,6 +174,22 @@ vectorization) as lulang IR transforms rather than clang flags.
 
 ---
 
+## 11. C boundary pointers
+
+`c_ptr[T]` is an opaque, boundary-only C pointer. It may be received from or
+returned to an `extern` function, stored in a local, passed unchanged, returned
+from an exported function, and compared for equality with the same pointer
+type. `c_ptr[()]` is the deliberately untyped handle used when the pointee is
+unknown.
+
+There is no pointer literal, address-of operator, dereference, arithmetic, or
+conversion to an integer. `T` documents and checks the boundary contract; it
+does not give lulang access to C layout. The JIT and AOT represent `c_ptr[T]`
+as a native pointer. The interpreters carry the same pointer bits through the
+FFI bridge without inspecting the pointee.
+
+---
+
 # v0.2 additions (M6 — the self-hosting surface)
 
 Implemented in all three tiers (interpreter, Cranelift JIT, LLVM AOT):

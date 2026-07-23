@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 fn c_scalar_type(ty: &Type) -> Result<&'static str, String> {
     match ty {
         Type::I64 | Type::Bool | Type::Enum(_) => Ok("int64_t"),
+        Type::CPtr(_) => Ok("void *"),
         Type::F64 => Ok("double"),
         Type::Unit => Ok("void"),
         _ => Err(format!("unsupported C ABI type {:?}", ty)),
@@ -39,6 +40,7 @@ fn lu_type_name(program: &LoweredProgram, ty: &Type) -> String {
         Type::Str => "str".into(),
         Type::Unit => "()".into(),
         Type::Arr(element) => format!("[{}]", lu_type_name(program, element)),
+        Type::CPtr(element) => format!("c_ptr[{}]", lu_type_name(program, element)),
         Type::Rec(index) => program.records[*index].name.clone(),
         Type::Enum(index) => program.enums[*index].name.clone(),
     }

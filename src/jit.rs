@@ -1440,8 +1440,13 @@ impl<'a, 'b> Gen<'a, 'b> {
             let bit = self.b.ins().fcmp(FloatCC::LessThanOrEqual, diff, tol);
             return Ok((CType::Bool, vec![self.b.ins().uextend(types::I64, bit)]));
         }
-        let both_int = matches!(lt, CType::I64 | CType::Bool | CType::Enum(_))
-            && matches!(rt, CType::I64 | CType::Bool | CType::Enum(_));
+        let both_int = matches!(
+            lt,
+            CType::I64 | CType::Bool | CType::Enum(_) | CType::CPtr(_)
+        ) && matches!(
+            rt,
+            CType::I64 | CType::Bool | CType::Enum(_) | CType::CPtr(_)
+        );
         let bit = if both_int {
             self.b.ins().icmp(
                 match op {

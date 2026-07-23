@@ -1080,10 +1080,16 @@ impl<'a> Emit<'a> {
             && !matches!(rhs.ty, CType::F32 | CType::F64)
         {
             let bit = self.t();
+            let compare_type = if matches!(lhs.ty, CType::CPtr(_)) {
+                "ptr"
+            } else {
+                "i64"
+            };
             self.line(format!(
-                "{} = icmp {} i64 {}, {}",
+                "{} = icmp {} {} {}, {}",
                 bit,
                 if op == Eq { "eq" } else { "ne" },
+                compare_type,
                 lhs.regs[0],
                 rhs.regs[0]
             ));
