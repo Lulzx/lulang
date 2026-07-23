@@ -482,6 +482,9 @@ fn build_output(
             declaration.name,
             params.join(", ")
         );
+        if let Some(library) = &declaration.lib {
+            let _ = writeln!(module, "; link: {}", library);
+        }
     }
     if !ir.externs.is_empty() {
         module.push('\n');

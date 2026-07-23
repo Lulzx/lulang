@@ -29,3 +29,8 @@ That makes the result reproducible and honest about startup, but it is not a
 microbenchmark of kernel cycles alone. NumPy slerp uses its natural vectorized
 batch representation; the observatory calls that layout difference out rather
 than presenting it as a like-for-like scalar loop.
+
+`ir/` contains the exact host LLVM emitted for the two public rows.
+`embedded.tsv` records the separate notebook adoption demo: the generated
+shared-library call is timed after compilation, checked against its NumPy twin,
+and reproducible with `examples/run_embedded_notebook.py`.

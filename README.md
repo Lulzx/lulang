@@ -37,6 +37,7 @@ testing.
 | [ROADMAP.md](ROADMAP.md) | Ecosystem growth plan: C ABI boundary, pylulang, bindgen, tooling, playground, showcase apps |
 | [M8-PLAN.md](M8-PLAN.md) | Implementation plan for the C ABI milestone (extern/export, per-tier, slices, test plan) |
 | [KNOWN-ISSUES.md](KNOWN-ISSUES.md) | Fixed JIT correctness and bootstrap-memory regressions |
+| [ROADMAP-AUDIT.md](ROADMAP-AUDIT.md) | Requirement-by-requirement implementation and verification evidence |
 
 ## Milestone status
 
@@ -72,6 +73,7 @@ cargo build --release
 ./experiments/alcubierre.sh          # replicate AE's "alcubierre" benchmark table
 ./selfhost/build.sh prog.lu          # AOT-compile prog.lu with the compiler written in lulang
 ./selfhost/build.sh --bootstrap      # 3-stage self-compilation; verifies the IR fixpoint
+python3 tools/verify_corpus.py       # four-tier corpus differential gate
 ```
 
 ### Python kernels
@@ -173,6 +175,11 @@ vectors and bodies, softened N-body integration, rigid-circle impulses,
 executable conservation laws, native/WASI builds, an exported SoA integration
 kernel with a generated C header, and an optional raylib visualizer. Run
 `lu run` or `lu test --runs 1000` from that directory.
+
+The [Embedded notebook](examples/lulang_embedded.ipynb) compiles the
+quaternion-slerp export with `pylulang`, checks it against NumPy, and measures
+both implementations. Run it without a Jupyter dependency with
+`python3 examples/run_embedded_notebook.py`.
 
 ### First-party numerics
 

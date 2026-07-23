@@ -1,0 +1,2 @@
+date	kernel	count	runs	lulang_ms	numpy_ms	speedup	machine	command
+2026-07-23	quaternion slerp	2000000	5	9.593	62.425	6.51	Apple arm64 macOS 26.6	LULANG_NOTEBOOK_N=2000000 LULANG_NOTEBOOK_RUNS=5 python3 examples/run_embedded_notebook.py

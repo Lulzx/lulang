@@ -1,0 +1,9 @@
+{
+  "abi_version": 1,
+  "library": "embedded_slerp",
+  "enums": {  },
+  "c_layout_records": {  },
+  "exports": [
+    {"name": "slerp_checksum", "params": [{"name": "count", "type": "i64"}], "ret": "f64"}
+  ]
+}

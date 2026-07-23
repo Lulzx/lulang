@@ -19,7 +19,7 @@ value table in that order, so a value defined in a later-indexed dominator
 was "unavailable". The interpreter walks the CFG dynamically and LLVM IR has
 no textual-order requirement, which is why only the JIT broke.
 
-**Fix (landed, uncommitted):** `normalize_block_order` in
+**Fix (landed):** `normalize_block_order` in
 `src/backend/optimization.rs`, called at the end of `inline_calls` — renumbers
 blocks into reverse postorder from the entry (a definition's block dominates
 its uses, and dominators precede what they dominate in RPO, so index-order
@@ -52,7 +52,7 @@ addresses. Later compiler allocations reused that memory for names such as
 The main function often hid the bug because its optimized clone remains alive
 through execution.
 
-**Fix (uncommitted, in `src/jit.rs`):** JIT-owned boxed copies of string
+**Fix (landed, in `src/jit.rs`):** JIT-owned boxed copies of string
 constants now stay alive until generated code finishes executing. A recursive
 outlined-function regression in `tests/conformance.rs` failed deterministically
 before the fix (thirteen NUL bytes instead of `stable string`) and now passes.
@@ -72,13 +72,31 @@ therefore copied their backing arrays repeatedly. Allocation tracing at the
 first GiB measured 1,013 MiB of array clones, 15 MiB of initial arrays, and
 effectively no string allocation.
 
-**Fix (uncommitted):** the JIT runtime now keeps array ownership counts in a
+**Fix (landed):** the JIT runtime now keeps array ownership counts in a
 side table without changing the compiler-owned array layout. Language stores
 retain shared storage, mutations call `lu_arr_cow` and update the owning local
 (including arrays nested in records), and inliner-generated parameter/result
 stores are explicitly marked as call-scoped borrows. Fresh SSA allocations
 start with zero persistent owners. The full `selfhost/build.sh --bootstrap`
 now completes, stage 1 matches stage 2, and stages 2/3 are byte-identical.
+
+## 4. FIXED — SIMD `sum` treated an inlined return slot as invariant
+
+**Symptom:** `lu run corpus/alcubierre.lu` printed `total: 0`; the reference
+interpreter and both AOT compilers printed `25.587776819835558`.
+`LU_SIMD=off` restored the correct JIT result.
+
+**Cause:** reduction vectorization allowed any non-induction `f64` local as a
+loop invariant. After `rho` was inlined inside `sum`, the callee return slot
+was an ordinary local but was stored on every iteration. SIMD splatted its
+pre-loop zero value and skipped the scalar loop body.
+
+**Fix:** `cfg_vector_value` now proves that a loaded local has no stores or
+`inout` writes in the natural loop before treating it as invariant.
+`simd_reductions_do_not_treat_inlined_return_slots_as_invariants` is the small
+four-tier regression. `tools/verify_corpus.py` additionally runs the full
+benchmark inputs across JIT, host AOT, and selfhost AOT and scaled forms
+through the reference interpreter.
 
 ## Incident note: lost uncommitted jit.rs delta
 

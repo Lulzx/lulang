@@ -200,6 +200,51 @@ fn ffi_boundary_subset_and_register_caps_are_checked() {
 }
 
 #[test]
+fn ffi_names_cannot_collide_or_use_the_runtime_namespace() {
+    let cases = [
+        (
+            "extern fn print(x: i64)\nmain {}\n",
+            "collides with an existing function",
+        ),
+        (
+            "fn local(x: i64): i64 { x }\nextern fn local(x: i64): i64\nmain {}\n",
+            "collides with an existing function",
+        ),
+        (
+            "extern fn lu_private(x: i64): i64\nmain {}\n",
+            "uses reserved `lu_` prefix",
+        ),
+        (
+            "extern fn same(x: i64): i64\nextern fn same(x: i64): i64\nmain {}\n",
+            "duplicate extern",
+        ),
+    ];
+    for (source, message) in cases {
+        let output = run("check", source);
+        assert!(!output.status.success(), "accepted colliding FFI name");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "unexpected error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn extern_declarations_are_top_level_only() {
+    let output = run("check", "main { extern fn hidden(x: i64): i64 }\n");
+    assert!(
+        !output.status.success(),
+        "accepted a nested extern declaration"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected") || stderr.contains("expected"),
+        "unexpected error: {stderr}"
+    );
+}
+
+#[test]
 fn check_mode_validates_without_executing_main() {
     let output = run("check", "main { print(1 / 0) }\n");
     assert!(output.status.success());

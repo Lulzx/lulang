@@ -1,0 +1,61 @@
+// Notebook kernel: value-semantic quaternion slerp behind one scalar C export.
+
+type Quat { w: f64, x: f64, y: f64, z: f64 }
+
+operator* (a: Quat) · (b: Quat): f64 {
+  return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+operator ‖(q: Quat)‖: f64 { return sqrt(q · q) }
+
+fn scale(q: Quat, factor: f64): Quat {
+  return Quat {
+    w: q.w * factor,
+    x: q.x * factor,
+    y: q.y * factor,
+    z: q.z * factor,
+  }
+}
+
+fn add(a: Quat, b: Quat): Quat {
+  return Quat {
+    w: a.w + b.w,
+    x: a.x + b.x,
+    y: a.y + b.y,
+    z: a.z + b.z,
+  }
+}
+
+fn normalize(q: Quat): Quat {
+  return scale(q, 1.0 / ‖q‖)
+}
+
+fn slerp(a: Quat, b: Quat, t: f64): Quat {
+  var dot = a · b
+  var endpoint = b
+  if dot < 0.0 {
+    dot = -dot
+    endpoint = scale(b, -1.0)
+  }
+  var first_weight = 1.0 - t
+  var second_weight = t
+  if dot < 0.9995 {
+    let theta = acos(dot)
+    let sine = sin(theta)
+    first_weight = sin((1.0 - t) * theta) / sine
+    second_weight = sin(t * theta) / sine
+  }
+  return normalize(add(scale(a, first_weight), scale(endpoint, second_weight)))
+}
+
+/// Computes a deterministic checksum for n quaternion interpolations.
+export fn slerp_checksum(count: i64): f64 {
+  let first = normalize(Quat { 1.0, 2.0, 3.0, 4.0 })
+  let second = normalize(Quat { 4.0, 3.0, 2.0, 1.0 })
+  var checksum = 0.0
+  for index in 0..count {
+    let t = float(index) / float(count)
+    checksum = checksum + ‖slerp(first, second, t)‖
+  }
+  return checksum
+}

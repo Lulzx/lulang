@@ -32,3 +32,13 @@ The implementation deliberately uses records as compiler-owned values and
 arrays as the numerical storage boundary. No internal `Body` or `Vec2` layout
 is promised to C; only the exported array/scalar kernel crosses the stable
 boundary ABI.
+
+The repository-level
+[`examples/lulang_embedded.ipynb`](../../examples/lulang_embedded.ipynb)
+is the low-commitment adoption demo: it compiles a quaternion-slerp checksum
+behind one scalar export, loads it with `pylulang`, verifies the answer against
+NumPy, and reports measured median timings. It can also run without Jupyter:
+
+```bash
+python3 examples/run_embedded_notebook.py
+```

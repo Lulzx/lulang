@@ -7,10 +7,13 @@ export const metadata: Metadata = {
     "lulang is a small language for numerical computing with value semantics, native code generation, and C and Python interfaces.",
 };
 
-const boundaryCode = `export fn saxpy(a: f64, x: [f64], inout y: [f64], n: i64) {
+const boundaryCode = `export fn saxpy(a: f64, x: [f64], y: [f64], n: i64): f64 {
+  var total = 0.0
   for i in 0..n {
     y[i] = a * x[i] + y[i]
+    total = total + y[i]
   }
+  return total
 }`;
 
 export default function Home() {
@@ -23,6 +26,7 @@ export default function Home() {
         <div className="nav-links">
           <a href="#why">Overview</a>
           <a href="#playground">Playground</a>
+          <a href="#observatory">Benchmarks</a>
           <a href="https://github.com/Lulzx/lulang">Source</a>
         </div>
         <a className="nav-cta" href="#playground">Run online</a>
@@ -127,8 +131,37 @@ export default function Home() {
         <Playground />
       </section>
 
+      <section className="observatory-summary" id="observatory">
+        <div className="section-index light">04 / BENCHMARK OBSERVATORY</div>
+        <div className="observatory-summary-copy">
+          <h2>The benchmark includes its source.</h2>
+          <p>
+            Results are whole-process medians. Each row names the machine,
+            compiler, layout, floating-point assumptions, and source used in
+            every language. A missing runtime is left blank.
+          </p>
+          <a className="button-primary" href="/observatory">Open the observatory</a>
+        </div>
+        <div className="observatory-mini" aria-label="Benchmark snapshot">
+          <div className="observatory-mini-head">
+            <span>2026-07-23 · APPLE ARM64</span>
+            <span>LOWER IS BETTER</span>
+          </div>
+          <div className="observatory-mini-row">
+            <b>dot 2M × 20</b>
+            <span><small>lulang selfhost</small>13.677 ms</span>
+            <span><small>C++ fast</small>11.902 ms</span>
+          </div>
+          <div className="observatory-mini-row">
+            <b>slerp 2M</b>
+            <span><small>lulang selfhost</small>12.096 ms</span>
+            <span><small>C++ fast</small>12.669 ms</span>
+          </div>
+        </div>
+      </section>
+
       <section className="tiers">
-        <div className="section-index">04 / IMPLEMENTATIONS</div>
+        <div className="section-index">05 / IMPLEMENTATIONS</div>
         <div className="tier-track">
           <div><span>REFERENCE</span><b>CFG interpreter</b></div>
           <i>→</i><div><span>DEVELOP</span><b>Cranelift JIT</b></div>
@@ -144,6 +177,7 @@ export default function Home() {
         </div>
         <div className="footer-links">
           <a href="#playground">Open playground</a>
+          <a href="/observatory">Benchmark observatory</a>
           <a href="https://github.com/Lulzx/lulang">GitHub ↗</a>
           <a href="https://github.com/Lulzx/lulang/blob/main/ROADMAP.md">Roadmap ↗</a>
         </div>
