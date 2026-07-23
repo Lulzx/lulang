@@ -10,7 +10,7 @@ use crate::backend::layout::{
 };
 use crate::backend::optimization::{
     analyze_cfg, array_local_for_value, if_convert, inline_calls, licm, simd_reduction_plan,
-    CfgAnalysis, SimdExpr,
+    CfgAnalysis, SimdExpr, SimdScalar,
 };
 use crate::check::{resolve_type, Type as CType};
 use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
@@ -693,10 +693,17 @@ impl<'a, 'b> Gen<'a, 'b> {
         let (_, upper) = Self::ir_value(values, loop_info.upper)?;
         let index_var = self.b.declare_var(types::I64);
         self.b.def_var(index_var, lower[0]);
-        let vector_accs: Vec<_> = (0..4).map(|_| self.b.declare_var(types::F64X2)).collect();
-        let scalar_acc = self.b.declare_var(types::F64);
-        let zero = self.b.ins().f64const(0.0);
-        let vector_zero = self.b.ins().splat(types::F64X2, zero);
+        let (scalar_type, vector_type) = match plan.scalar {
+            SimdScalar::F64 => (types::F64, types::F64X2),
+            SimdScalar::I64 => (types::I64, types::I64X2),
+        };
+        let vector_accs: Vec<_> = (0..4).map(|_| self.b.declare_var(vector_type)).collect();
+        let scalar_acc = self.b.declare_var(scalar_type);
+        let zero = match plan.scalar {
+            SimdScalar::F64 => self.b.ins().f64const(0.0),
+            SimdScalar::I64 => self.b.ins().iconst(types::I64, 0),
+        };
+        let vector_zero = self.b.ins().splat(vector_type, zero);
         for accumulator in &vector_accs {
             self.b.def_var(*accumulator, vector_zero);
         }
@@ -722,9 +729,12 @@ impl<'a, 'b> Gen<'a, 'b> {
         let batch = self.b.use_var(index_var);
         for (lane, accumulator) in vector_accs.iter().enumerate() {
             let at = self.b.ins().iadd_imm(batch, (lane * 2) as i64);
-            let item = self.gen_simd_vector_expr(loop_index, &plan.value, at)?;
+            let item = self.gen_simd_vector_expr(loop_index, plan.scalar, &plan.value, at)?;
             let current = self.b.use_var(*accumulator);
-            let next = self.b.ins().fadd(current, item);
+            let next = match plan.scalar {
+                SimdScalar::F64 => self.b.ins().fadd(current, item),
+                SimdScalar::I64 => self.b.ins().iadd(current, item),
+            };
             self.b.def_var(*accumulator, next);
         }
         let next_batch = self.b.ins().iadd_imm(batch, 8);
@@ -738,9 +748,12 @@ impl<'a, 'b> Gen<'a, 'b> {
 
         self.b.switch_to_block(scalar_body);
         let at = self.b.use_var(index_var);
-        let item = self.gen_simd_scalar_expr(loop_index, &plan.value, at)?;
+        let item = self.gen_simd_scalar_expr(loop_index, plan.scalar, &plan.value, at)?;
         let current = self.b.use_var(scalar_acc);
-        let next = self.b.ins().fadd(current, item);
+        let next = match plan.scalar {
+            SimdScalar::F64 => self.b.ins().fadd(current, item),
+            SimdScalar::I64 => self.b.ins().iadd(current, item),
+        };
         self.b.def_var(scalar_acc, next);
         let next_index = self.b.ins().iadd_imm(at, 1);
         self.b.def_var(index_var, next_index);
@@ -751,14 +764,29 @@ impl<'a, 'b> Gen<'a, 'b> {
         let a1 = self.b.use_var(vector_accs[1]);
         let a2 = self.b.use_var(vector_accs[2]);
         let a3 = self.b.use_var(vector_accs[3]);
-        let pairs0 = self.b.ins().fadd(a0, a1);
-        let pairs1 = self.b.ins().fadd(a2, a3);
-        let vector_total = self.b.ins().fadd(pairs0, pairs1);
+        let pairs0 = match plan.scalar {
+            SimdScalar::F64 => self.b.ins().fadd(a0, a1),
+            SimdScalar::I64 => self.b.ins().iadd(a0, a1),
+        };
+        let pairs1 = match plan.scalar {
+            SimdScalar::F64 => self.b.ins().fadd(a2, a3),
+            SimdScalar::I64 => self.b.ins().iadd(a2, a3),
+        };
+        let vector_total = match plan.scalar {
+            SimdScalar::F64 => self.b.ins().fadd(pairs0, pairs1),
+            SimdScalar::I64 => self.b.ins().iadd(pairs0, pairs1),
+        };
         let lane0 = self.b.ins().extractlane(vector_total, 0);
         let lane1 = self.b.ins().extractlane(vector_total, 1);
-        let lanes = self.b.ins().fadd(lane0, lane1);
+        let lanes = match plan.scalar {
+            SimdScalar::F64 => self.b.ins().fadd(lane0, lane1),
+            SimdScalar::I64 => self.b.ins().iadd(lane0, lane1),
+        };
         let scalar = self.b.use_var(scalar_acc);
-        let total = self.b.ins().fadd(lanes, scalar);
+        let total = match plan.scalar {
+            SimdScalar::F64 => self.b.ins().fadd(lanes, scalar),
+            SimdScalar::I64 => self.b.ins().iadd(lanes, scalar),
+        };
         self.define_ir_local(plan.accumulator, &[total])?;
         self.b.ins().jump(blocks[loop_info.exit as usize], &[]);
         self.skipped_cfg_blocks
@@ -769,6 +797,7 @@ impl<'a, 'b> Gen<'a, 'b> {
     fn gen_simd_vector_expr(
         &mut self,
         loop_index: usize,
+        scalar: SimdScalar,
         expr: &SimdExpr,
         index: Value,
     ) -> Result<Value, String> {
@@ -778,28 +807,49 @@ impl<'a, 'b> Gen<'a, 'b> {
                 self.b.ins().splat(types::F64X2, scalar)
             }
             SimdExpr::I64(value) => {
-                let scalar = self.b.ins().f64const(*value as f64);
-                self.b.ins().splat(types::F64X2, scalar)
+                let value = match scalar {
+                    SimdScalar::F64 => self.b.ins().f64const(*value as f64),
+                    SimdScalar::I64 => self.b.ins().iconst(types::I64, *value),
+                };
+                self.b.ins().splat(
+                    match scalar {
+                        SimdScalar::F64 => types::F64X2,
+                        SimdScalar::I64 => types::I64X2,
+                    },
+                    value,
+                )
             }
             SimdExpr::Invariant(local) => {
                 let (_, vars) = self
                     .lookup(&Self::ir_local(*local))
                     .ok_or("missing vector invariant")?;
-                let scalar = self.b.use_var(vars[0]);
-                self.b.ins().splat(types::F64X2, scalar)
+                let invariant = self.b.use_var(vars[0]);
+                self.b.ins().splat(
+                    match scalar {
+                        SimdScalar::F64 => types::F64X2,
+                        SimdScalar::I64 => types::I64X2,
+                    },
+                    invariant,
+                )
             }
             SimdExpr::Neg(value) => {
-                let inner = self.gen_simd_vector_expr(loop_index, value, index)?;
-                self.b.ins().fneg(inner)
+                let inner = self.gen_simd_vector_expr(loop_index, scalar, value, index)?;
+                match scalar {
+                    SimdScalar::F64 => self.b.ins().fneg(inner),
+                    SimdScalar::I64 => self.b.ins().ineg(inner),
+                }
             }
             SimdExpr::Binary { op, lhs, rhs } => {
-                let lhs = self.gen_simd_vector_expr(loop_index, lhs, index)?;
-                let rhs = self.gen_simd_vector_expr(loop_index, rhs, index)?;
-                match op {
-                    BinaryOp::Add => self.b.ins().fadd(lhs, rhs),
-                    BinaryOp::Sub => self.b.ins().fsub(lhs, rhs),
-                    BinaryOp::Mul => self.b.ins().fmul(lhs, rhs),
-                    BinaryOp::Div => self.b.ins().fdiv(lhs, rhs),
+                let lhs = self.gen_simd_vector_expr(loop_index, scalar, lhs, index)?;
+                let rhs = self.gen_simd_vector_expr(loop_index, scalar, rhs, index)?;
+                match (scalar, op) {
+                    (SimdScalar::F64, BinaryOp::Add) => self.b.ins().fadd(lhs, rhs),
+                    (SimdScalar::F64, BinaryOp::Sub) => self.b.ins().fsub(lhs, rhs),
+                    (SimdScalar::F64, BinaryOp::Mul) => self.b.ins().fmul(lhs, rhs),
+                    (SimdScalar::F64, BinaryOp::Div) => self.b.ins().fdiv(lhs, rhs),
+                    (SimdScalar::I64, BinaryOp::Add) => self.b.ins().iadd(lhs, rhs),
+                    (SimdScalar::I64, BinaryOp::Sub) => self.b.ins().isub(lhs, rhs),
+                    (SimdScalar::I64, BinaryOp::Mul) => self.b.ins().imul(lhs, rhs),
                     _ => return Err("unsupported vector binary".into()),
                 }
             }
@@ -811,9 +861,15 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let bytes = self.b.ins().imul_imm(index, 8);
                 let data = self.b.ins().iadd_imm(base, 8);
                 let address = self.b.ins().iadd(data, bytes);
-                self.b
-                    .ins()
-                    .load(types::F64X2, MemFlags::trusted(), address, 0)
+                self.b.ins().load(
+                    match scalar {
+                        SimdScalar::F64 => types::F64X2,
+                        SimdScalar::I64 => types::I64X2,
+                    },
+                    MemFlags::trusted(),
+                    address,
+                    0,
+                )
             }
             SimdExpr::Field {
                 local,
@@ -832,14 +888,20 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let lane = self.b.ins().imul_imm(index, 8);
                 let start = self.b.ins().iadd(data, plane);
                 let address = self.b.ins().iadd(start, lane);
-                self.b
-                    .ins()
-                    .load(types::F64X2, MemFlags::trusted(), address, 0)
+                self.b.ins().load(
+                    match scalar {
+                        SimdScalar::F64 => types::F64X2,
+                        SimdScalar::I64 => types::I64X2,
+                    },
+                    MemFlags::trusted(),
+                    address,
+                    0,
+                )
             }
             SimdExpr::Builtin { name, args } => {
                 let args = args
                     .iter()
-                    .map(|value| self.gen_simd_vector_expr(loop_index, value, index))
+                    .map(|value| self.gen_simd_vector_expr(loop_index, scalar, value, index))
                     .collect::<Result<Vec<_>, _>>()?;
                 match name.as_str() {
                     "sqrt" => self.b.ins().sqrt(args[0]),
@@ -855,12 +917,16 @@ impl<'a, 'b> Gen<'a, 'b> {
     fn gen_simd_scalar_expr(
         &mut self,
         loop_index: usize,
+        scalar: SimdScalar,
         expr: &SimdExpr,
         index: Value,
     ) -> Result<Value, String> {
         Ok(match expr {
             SimdExpr::F64(value) => self.b.ins().f64const(*value),
-            SimdExpr::I64(value) => self.b.ins().f64const(*value as f64),
+            SimdExpr::I64(value) => match scalar {
+                SimdScalar::F64 => self.b.ins().f64const(*value as f64),
+                SimdScalar::I64 => self.b.ins().iconst(types::I64, *value),
+            },
             SimdExpr::Invariant(local) => {
                 let (_, vars) = self
                     .lookup(&Self::ir_local(*local))
@@ -868,17 +934,23 @@ impl<'a, 'b> Gen<'a, 'b> {
                 self.b.use_var(vars[0])
             }
             SimdExpr::Neg(value) => {
-                let inner = self.gen_simd_scalar_expr(loop_index, value, index)?;
-                self.b.ins().fneg(inner)
+                let inner = self.gen_simd_scalar_expr(loop_index, scalar, value, index)?;
+                match scalar {
+                    SimdScalar::F64 => self.b.ins().fneg(inner),
+                    SimdScalar::I64 => self.b.ins().ineg(inner),
+                }
             }
             SimdExpr::Binary { op, lhs, rhs } => {
-                let lhs = self.gen_simd_scalar_expr(loop_index, lhs, index)?;
-                let rhs = self.gen_simd_scalar_expr(loop_index, rhs, index)?;
-                match op {
-                    BinaryOp::Add => self.b.ins().fadd(lhs, rhs),
-                    BinaryOp::Sub => self.b.ins().fsub(lhs, rhs),
-                    BinaryOp::Mul => self.b.ins().fmul(lhs, rhs),
-                    BinaryOp::Div => self.b.ins().fdiv(lhs, rhs),
+                let lhs = self.gen_simd_scalar_expr(loop_index, scalar, lhs, index)?;
+                let rhs = self.gen_simd_scalar_expr(loop_index, scalar, rhs, index)?;
+                match (scalar, op) {
+                    (SimdScalar::F64, BinaryOp::Add) => self.b.ins().fadd(lhs, rhs),
+                    (SimdScalar::F64, BinaryOp::Sub) => self.b.ins().fsub(lhs, rhs),
+                    (SimdScalar::F64, BinaryOp::Mul) => self.b.ins().fmul(lhs, rhs),
+                    (SimdScalar::F64, BinaryOp::Div) => self.b.ins().fdiv(lhs, rhs),
+                    (SimdScalar::I64, BinaryOp::Add) => self.b.ins().iadd(lhs, rhs),
+                    (SimdScalar::I64, BinaryOp::Sub) => self.b.ins().isub(lhs, rhs),
+                    (SimdScalar::I64, BinaryOp::Mul) => self.b.ins().imul(lhs, rhs),
                     _ => return Err("unsupported scalar binary".into()),
                 }
             }
@@ -890,9 +962,15 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let address = self.b.ins().imul_imm(index, 8);
                 let data = self.b.ins().iadd_imm(base, 8);
                 let address = self.b.ins().iadd(data, address);
-                self.b
-                    .ins()
-                    .load(types::F64, MemFlags::trusted(), address, 0)
+                self.b.ins().load(
+                    match scalar {
+                        SimdScalar::F64 => types::F64,
+                        SimdScalar::I64 => types::I64,
+                    },
+                    MemFlags::trusted(),
+                    address,
+                    0,
+                )
             }
             SimdExpr::Field {
                 local,
@@ -911,14 +989,20 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let lane = self.b.ins().imul_imm(index, 8);
                 let start = self.b.ins().iadd(data, plane);
                 let address = self.b.ins().iadd(start, lane);
-                self.b
-                    .ins()
-                    .load(types::F64, MemFlags::trusted(), address, 0)
+                self.b.ins().load(
+                    match scalar {
+                        SimdScalar::F64 => types::F64,
+                        SimdScalar::I64 => types::I64,
+                    },
+                    MemFlags::trusted(),
+                    address,
+                    0,
+                )
             }
             SimdExpr::Builtin { name, args } => {
                 let args = args
                     .iter()
-                    .map(|value| self.gen_simd_scalar_expr(loop_index, value, index))
+                    .map(|value| self.gen_simd_scalar_expr(loop_index, scalar, value, index))
                     .collect::<Result<Vec<_>, _>>()?;
                 match name.as_str() {
                     "sqrt" => self.b.ins().sqrt(args[0]),

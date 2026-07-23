@@ -61,9 +61,16 @@ pub enum SimdExpr {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimdScalar {
+    F64,
+    I64,
+}
+
 #[derive(Clone, Debug)]
 pub struct SimdReductionPlan {
     pub accumulator: LocalId,
+    pub scalar: SimdScalar,
     pub value: SimdExpr,
 }
 
@@ -78,12 +85,15 @@ pub fn simd_reduction_plan(
 ) -> Option<SimdReductionPlan> {
     let loop_info = analysis.loops.get(loop_index)?;
     let reduction = loop_info.reduction.as_ref()?;
-    if function.locals[reduction.accumulator as usize].ty != Type::F64 {
-        return None;
-    }
-    let value = simd_expr(function, analysis, loop_index, reduction.value, soa)?;
+    let scalar = match function.locals[reduction.accumulator as usize].ty {
+        Type::F64 => SimdScalar::F64,
+        Type::I64 => SimdScalar::I64,
+        _ => return None,
+    };
+    let value = simd_expr(function, analysis, loop_index, reduction.value, scalar, soa)?;
     Some(SimdReductionPlan {
         accumulator: reduction.accumulator,
+        scalar,
         value,
     })
 }
@@ -93,15 +103,22 @@ fn simd_expr(
     analysis: &CfgAnalysis,
     loop_index: usize,
     value: ValueId,
+    scalar: SimdScalar,
     soa: bool,
 ) -> Option<SimdExpr> {
     let (block, instruction, inst) = cfg_value_definition(function, value)?;
     Some(match &inst.kind {
-        InstKind::Constant(Constant::F64(value)) => SimdExpr::F64(*value),
+        InstKind::Constant(Constant::F64(value)) if scalar == SimdScalar::F64 => {
+            SimdExpr::F64(*value)
+        }
         InstKind::Constant(Constant::I64(value)) => SimdExpr::I64(*value),
         InstKind::Load(local)
             if *local != analysis.loops[loop_index].induction
-                && function.locals[*local as usize].ty == Type::F64
+                && function.locals[*local as usize].ty
+                    == match scalar {
+                        SimdScalar::F64 => Type::F64,
+                        SimdScalar::I64 => Type::I64,
+                    }
                 && cfg_loop_invariant_local(function, analysis, loop_index, *local) =>
         {
             SimdExpr::Invariant(*local)
@@ -110,22 +127,35 @@ fn simd_expr(
             op: crate::ir::UnaryOp::Neg,
             value,
         } => SimdExpr::Neg(Box::new(simd_expr(
-            function, analysis, loop_index, *value, soa,
+            function, analysis, loop_index, *value, scalar, soa,
         )?)),
         InstKind::Binary { op, lhs, rhs }
-            if matches!(
-                op,
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
-            ) =>
+            if match scalar {
+                SimdScalar::F64 => matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+                ),
+                SimdScalar::I64 => {
+                    matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+                }
+            } =>
         {
             SimdExpr::Binary {
                 op: *op,
-                lhs: Box::new(simd_expr(function, analysis, loop_index, *lhs, soa)?),
-                rhs: Box::new(simd_expr(function, analysis, loop_index, *rhs, soa)?),
+                lhs: Box::new(simd_expr(
+                    function, analysis, loop_index, *lhs, scalar, soa,
+                )?),
+                rhs: Box::new(simd_expr(
+                    function, analysis, loop_index, *rhs, scalar, soa,
+                )?),
             }
         }
         InstKind::Index { base, index }
-            if function.values[value as usize] == Type::F64
+            if function.values[value as usize]
+                == match scalar {
+                    SimdScalar::F64 => Type::F64,
+                    SimdScalar::I64 => Type::I64,
+                }
                 && analysis.trusted_accesses.get(&(block, instruction)) == Some(&loop_index)
                 && cfg_value_is_load(function, *index, analysis.loops[loop_index].induction) =>
         {
@@ -142,7 +172,11 @@ fn simd_expr(
             let InstKind::Index { base: array, index } = indexed.kind else {
                 return None;
             };
-            if function.values[value as usize] != Type::F64
+            if function.values[value as usize]
+                != match scalar {
+                    SimdScalar::F64 => Type::F64,
+                    SimdScalar::I64 => Type::I64,
+                }
                 || analysis
                     .trusted_accesses
                     .get(&(base_block, base_instruction))
@@ -161,13 +195,17 @@ fn simd_expr(
             callee: Callee::Builtin(name),
             args,
             ..
-        } if matches!(name.as_str(), "sqrt" | "abs" | "min" | "max") => SimdExpr::Builtin {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|value| simd_expr(function, analysis, loop_index, *value, soa))
-                .collect::<Option<Vec<_>>>()?,
-        },
+        } if scalar == SimdScalar::F64
+            && matches!(name.as_str(), "sqrt" | "abs" | "min" | "max") =>
+        {
+            SimdExpr::Builtin {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|value| simd_expr(function, analysis, loop_index, *value, scalar, soa))
+                    .collect::<Option<Vec<_>>>()?,
+            }
+        }
         _ => return None,
     })
 }
@@ -1226,6 +1264,36 @@ mod cfg_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn proves_exact_integer_array_reductions_for_simd() {
+        let function = lower("main { let a = arr(11, 7) print(sum(i in 0..len(a)) a[i] * 3) }")
+            .main
+            .unwrap();
+        let analysis = analyze_cfg(&function);
+        let plan = simd_reduction_plan(&function, &analysis, 0, true)
+            .expect("wrapping integer arithmetic is lane-wise");
+        assert_eq!(plan.scalar, SimdScalar::I64);
+        assert!(matches!(
+            plan.value,
+            SimdExpr::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn keeps_f32_reductions_scalar_until_arrays_are_packed() {
+        let function = lower("main { let a = arr(11, f32(1)) print(sum(i in 0..len(a)) a[i]) }")
+            .main
+            .unwrap();
+        let analysis = analyze_cfg(&function);
+        assert!(
+            simd_reduction_plan(&function, &analysis, 0, true).is_none(),
+            "f32 array elements currently occupy 8-byte storage slots"
+        );
     }
 
     #[test]

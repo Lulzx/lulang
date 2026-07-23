@@ -1,8 +1,8 @@
 # Known issues (2026-07-23)
 
-State of the JIT regressions found while pre-flighting M8 against the
-workspace-restructure tree. All three are fixed and the selfhost bootstrap is
-back at its stage-1/2/3 byte-identical fixpoint.
+State of the compiler regressions and design constraints found while
+pre-flighting M8 and the shared SIMD middle-end. Fixed regressions retain their
+repros; open constraints document intentional fallbacks.
 
 ## 1. FIXED — JIT assumed topological block order after IR inlining
 
@@ -129,6 +129,22 @@ matching the JIT. A compiled regression covers direct arrays, record-contained
 arrays, and rebinding. Bootstrap again reaches a stage-1/2/3 byte-identical
 fixpoint. Fresh observatory medians put host and selfhost dot AOT at 16.102 ms
 and 15.746 ms respectively, replacing the unsound 64.053/13.677 comparison.
+
+## 6. OPEN — packed f32 SIMD requires an array-layout migration
+
+Scalar array components currently occupy uniform 8-byte storage slots,
+including `f32`. This keeps record flattening, SoA plane offsets, the C
+runtime, and both bootstrapped emitters on one simple addressing contract, but
+adjacent `f32` language elements are not adjacent 4-byte machine values.
+Loading `<4 x float>` from that storage would therefore mix values with slot
+padding and is incorrect.
+
+The shared SIMD plan deliberately accepts f64 and exact wrapping i64
+reductions while leaving f32 scalar. Enabling f32x4 requires a coordinated
+packed-layout change across allocation sizing, element addressing, SoA plane
+offsets, JIT, host LLVM, selfhost LLVM, exported array wrappers, and WASM.
+`keeps_f32_reductions_scalar_until_arrays_are_packed` guards against an unsafe
+partial implementation.
 
 ## Incident note: lost uncommitted jit.rs delta
 

@@ -657,6 +657,19 @@ fn simd_reductions_handle_odd_lengths_with_a_scalar_tail() {
 }
 
 #[test]
+fn integer_simd_reductions_remain_exact_above_f64_precision() {
+    assert_success(
+        "integer_simd_exact_odd_tail",
+        "main {\n\
+           let n = 11\n\
+           let values = arr(n, 9007199254740992 + 1)\n\
+           print(sum(i in 0..n) values[i])\n\
+         }\n",
+        b"99079191802150923\n",
+    );
+}
+
+#[test]
 fn unresolved_ffi_symbols_fail_cleanly_in_every_tier() {
     let source = "extern fn lulang_symbol_that_does_not_exist_7f42(x: i64): i64\n\
          main { print(lulang_symbol_that_does_not_exist_7f42(1)) }\n";

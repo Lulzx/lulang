@@ -2494,7 +2494,49 @@ fn simd_expr_f64(p: P, g: G, e: i64): bool {
   return false
 }
 
-fn emit_simd_load(p: P, inout g: G, array: str, variable: str, index: str, component: i64, vector: bool): str {
+fn simd_i64_expr_ok(p: P, g: G, e: i64, variable: str): bool {
+  if e < 0 { return false }
+  let n = p.en[e]
+  if n.kind == EK.ENum { return n.b == 0 }
+  if n.kind == EK.EIdent {
+    if n.text == variable { return false }
+    let v = glookup(g, n.text)
+    return v >= 0 and g.gty[v] == 0
+  }
+  if n.kind == EK.EUn {
+    return n.text == "-" and simd_i64_expr_ok(p, g, n.a, variable)
+  }
+  if n.kind == EK.EBin {
+    let arithmetic = n.text == "+" or n.text == "-" or n.text == "*"
+    return arithmetic and simd_i64_expr_ok(p, g, n.a, variable) and simd_i64_expr_ok(p, g, n.b, variable)
+  }
+  if n.kind == EK.EIndex {
+    let base = p.en[n.a]
+    let index = p.en[n.b]
+    if base.kind != EK.EIdent or index.kind != EK.EIdent or index.text != variable { return false }
+    let v = glookup(g, base.text)
+    if v < 0 or not is_arrt(g.gty[v]) or elem_of(g.gty[v]) != 0 { return false }
+    return simd_trusted_len(g, base.text, variable) != ""
+  }
+  if n.kind == EK.EField {
+    let indexed = p.en[n.a]
+    if indexed.kind != EK.EIndex { return false }
+    let base = p.en[indexed.a]
+    let index = p.en[indexed.b]
+    if base.kind != EK.EIdent or index.kind != EK.EIdent or index.text != variable { return false }
+    let v = glookup(g, base.text)
+    if v < 0 or not is_arrt(g.gty[v]) { return false }
+    let elem = elem_of(g.gty[v])
+    if not is_rect(elem) { return false }
+    let ti = elem - 64
+    let fi = field_index(p, ti, n.text)
+    if fi < 0 or p.flty[p.tfo[ti] + fi] != 0 { return false }
+    return simd_trusted_len(g, base.text, variable) != ""
+  }
+  return false
+}
+
+fn emit_simd_load(p: P, inout g: G, array: str, variable: str, index: str, component: i64, vector: bool, integer: bool): str {
   let av = gload(p, g, array)
   let data = newt(g)
   eline(c6(data, " = getelementptr i8, ptr ", g.rs[av.o], ", i64 8", "", ""))
@@ -2507,72 +2549,103 @@ fn emit_simd_load(p: P, inout g: G, array: str, variable: str, index: str, compo
     eline(c6(at, " = add i64 ", plane, ", ", index, ""))
   }
   let address = newt(g)
-  eline(c6(address, " = getelementptr double, ptr ", data, ", i64 ", at, ""))
+  var scalar_ty = "double"
+  if integer { scalar_ty = "i64" }
+  eline(c8(address, " = getelementptr ", scalar_ty, ", ptr ", data, ", i64 ", at, ""))
   let value = newt(g)
   if vector {
-    eline(c5(value, " = load <2 x double>, ptr ", address, ", align 8", ""))
+    var vector_ty = "<2 x double>"
+    if integer { vector_ty = "<2 x i64>" }
+    eline(c6(value, " = load ", vector_ty, ", ptr ", address, ", align 8"))
   } else {
-    eline(c5(value, " = load double, ptr ", address, ", align 8", ""))
+    eline(c6(value, " = load ", scalar_ty, ", ptr ", address, ", align 8"))
   }
   return value
 }
 
-fn emit_simd_expr(p: P, inout g: G, e: i64, variable: str, index: str, vector: bool): str {
+fn emit_simd_expr(p: P, inout g: G, e: i64, variable: str, index: str, vector: bool, integer: bool): str {
   let n = p.en[e]
   if n.kind == EK.ENum {
-    let value = f64hex(n.num)
-    if vector { return c5("<double ", value, ", double ", value, ">") }
+    var value = f64hex(n.num)
+    if integer { value = i2s(int(n.num)) }
+    if vector {
+      if integer { return c5("<i64 ", value, ", i64 ", value, ">") }
+      return c5("<double ", value, ", double ", value, ">")
+    }
     return value
   }
   if n.kind == EK.EIdent {
     let v = gload(p, g, n.text)
     if not vector { return g.rs[v.o] }
     let inserted = newt(g)
-    eline(c6(inserted, " = insertelement <2 x double> poison, double ", g.rs[v.o], ", i64 0", "", ""))
+    var vector_ty = "<2 x double>"
+    var scalar_ty = "double"
+    if integer {
+      vector_ty = "<2 x i64>"
+      scalar_ty = "i64"
+    }
+    eline(c9(inserted, " = insertelement ", vector_ty, " poison, ", scalar_ty, " ", g.rs[v.o], ", i64 0", ""))
     let splat = newt(g)
-    eline(c4(splat, " = shufflevector <2 x double> ", inserted, ", <2 x double> poison, <2 x i32> zeroinitializer"))
+    eline(c8(splat, " = shufflevector ", vector_ty, " ", inserted, ", ", vector_ty, " poison, <2 x i32> zeroinitializer"))
     return splat
   }
   if n.kind == EK.EUn {
-    let value = emit_simd_expr(p, g, n.a, variable, index, vector)
+    let value = emit_simd_expr(p, g, n.a, variable, index, vector, integer)
     let out = newt(g)
+    if vector and integer {
+      eline(c4(out, " = sub <2 x i64> zeroinitializer, ", value, ""))
+    } else {
     if vector {
       eline(c4(out, " = fneg fast <2 x double> ", value, ""))
     } else {
-      eline(c4(out, " = fneg fast double ", value, ""))
+      if integer {
+        eline(c4(out, " = sub i64 0, ", value, ""))
+      } else {
+        eline(c4(out, " = fneg fast double ", value, ""))
+      }
+    }
     }
     return out
   }
   if n.kind == EK.EBin {
-    let lhs = emit_simd_expr(p, g, n.a, variable, index, vector)
-    let rhs = emit_simd_expr(p, g, n.b, variable, index, vector)
+    let lhs = emit_simd_expr(p, g, n.a, variable, index, vector, integer)
+    let rhs = emit_simd_expr(p, g, n.b, variable, index, vector, integer)
     var op = "fadd"
+    if integer { op = "add" }
     if n.text == "-" { op = "fsub" }
     if n.text == "*" { op = "fmul" }
     if n.text == "/" { op = "fdiv" }
+    if integer and n.text == "-" { op = "sub" }
+    if integer and n.text == "*" { op = "mul" }
     let out = newt(g)
     var ty = "double"
     if vector { ty = "<2 x double>" }
-    eline(c8(out, " = ", op, " fast ", ty, " ", lhs, c2str(", ", rhs)))
+    if integer {
+      ty = "i64"
+      if vector { ty = "<2 x i64>" }
+      eline(c8(out, " = ", op, " ", ty, " ", lhs, c2str(", ", rhs)))
+    } else {
+      eline(c8(out, " = ", op, " fast ", ty, " ", lhs, c2str(", ", rhs)))
+    }
     return out
   }
   if n.kind == EK.EIndex {
-    return emit_simd_load(p, g, p.en[n.a].text, variable, index, 0, vector)
+    return emit_simd_load(p, g, p.en[n.a].text, variable, index, 0, vector, integer)
   }
   if n.kind == EK.EField {
     let indexed = p.en[n.a]
     let base = p.en[indexed.a]
     let v = glookup(g, base.text)
     let ti = elem_of(g.gty[v]) - 64
-    return emit_simd_load(p, g, base.text, variable, index, foff(p, ti, n.text), vector)
+    return emit_simd_load(p, g, base.text, variable, index, foff(p, ti, n.text), vector, integer)
   }
   if n.kind == EK.ECall {
     let first = p.en[n.a]
-    let a0 = emit_simd_expr(p, g, first.a, variable, index, vector)
+    let a0 = emit_simd_expr(p, g, first.a, variable, index, vector, integer)
     var a1 = ""
     if first.b >= 0 {
       let second = p.en[first.b]
-      a1 = emit_simd_expr(p, g, second.a, variable, index, vector)
+      a1 = emit_simd_expr(p, g, second.a, variable, index, vector, integer)
     }
     var suffix = ".f64"
     var ty = "double"
@@ -2595,19 +2668,29 @@ fn emit_simd_expr(p: P, inout g: G, e: i64, variable: str, index: str, vector: b
   return ""
 }
 
-fn emit_simd_sum(p: P, inout g: G, body: i64, variable: str, lower: str, upper: str): str {
+fn emit_simd_sum(p: P, inout g: G, body: i64, variable: str, lower: str, upper: str, integer: bool): str {
+  var scalar_ty = "double"
+  var vector_ty = "<2 x double>"
+  var add = "fadd fast"
+  var zero = "0.0"
+  if integer {
+    scalar_ty = "i64"
+    vector_ty = "<2 x i64>"
+    add = "add"
+    zero = "0"
+  }
   let indexp = newt(g)
   eline(c2str(indexp, " = alloca i64"))
   eline(c4("store i64 ", lower, ", ptr ", indexp))
   var accs = arr(4, "")
   for i in 0..4 {
     accs[i] = newt(g)
-    eline(c2str(accs[i], " = alloca <2 x double>"))
-    eline(c4("store <2 x double> zeroinitializer, ptr ", accs[i], "", ""))
+    eline(c4(accs[i], " = alloca ", vector_ty, ""))
+    eline(c6("store ", vector_ty, " zeroinitializer, ptr ", accs[i], "", ""))
   }
   let scalarp = newt(g)
-  eline(c2str(scalarp, " = alloca double"))
-  eline(c2str("store double 0.0, ptr ", scalarp))
+  eline(c4(scalarp, " = alloca ", scalar_ty, ""))
+  eline(c6("store ", scalar_ty, " ", zero, ", ptr ", scalarp))
   let vh = newl(g)
   let vb = newl(g)
   let sh = newl(g)
@@ -2629,12 +2712,12 @@ fn emit_simd_sum(p: P, inout g: G, body: i64, variable: str, lower: str, upper: 
       at = newt(g)
       eline(c6(at, " = add i64 ", index, ", ", i2s(lane * 2), ""))
     }
-    let item = emit_simd_expr(p, g, body, variable, at, true)
+    let item = emit_simd_expr(p, g, body, variable, at, true, integer)
     let current = newt(g)
-    eline(c4(current, " = load <2 x double>, ptr ", accs[lane], ""))
+    eline(c6(current, " = load ", vector_ty, ", ptr ", accs[lane], ""))
     let next = newt(g)
-    eline(c6(next, " = fadd fast <2 x double> ", current, ", ", item, ""))
-    eline(c4("store <2 x double> ", next, ", ptr ", accs[lane]))
+    eline(c8(next, " = ", add, " ", vector_ty, " ", current, c2str(", ", item)))
+    eline(c6("store ", vector_ty, " ", next, ", ptr ", accs[lane]))
   }
   eline(c4("store i64 ", after, ", ptr ", indexp))
   eline(c2str("br label %", vh))
@@ -2645,12 +2728,12 @@ fn emit_simd_sum(p: P, inout g: G, body: i64, variable: str, lower: str, upper: 
   eline(c6(more, " = icmp slt i64 ", si, ", ", upper, ""))
   eline(c6("br i1 ", more, ", label %", sb, ", label %", done))
   elabel(sb)
-  let item = emit_simd_expr(p, g, body, variable, si, false)
+  let item = emit_simd_expr(p, g, body, variable, si, false, integer)
   let current = newt(g)
-  eline(c4(current, " = load double, ptr ", scalarp, ""))
+  eline(c6(current, " = load ", scalar_ty, ", ptr ", scalarp, ""))
   let next = newt(g)
-  eline(c6(next, " = fadd fast double ", current, ", ", item, ""))
-  eline(c4("store double ", next, ", ptr ", scalarp))
+  eline(c8(next, " = ", add, " ", scalar_ty, " ", current, c2str(", ", item)))
+  eline(c6("store ", scalar_ty, " ", next, ", ptr ", scalarp))
   let ni = newt(g)
   eline(c4(ni, " = add i64 ", si, ", 1"))
   eline(c4("store i64 ", ni, ", ptr ", indexp))
@@ -2659,24 +2742,24 @@ fn emit_simd_sum(p: P, inout g: G, body: i64, variable: str, lower: str, upper: 
   var vectors = arr(4, "")
   for i in 0..4 {
     vectors[i] = newt(g)
-    eline(c4(vectors[i], " = load <2 x double>, ptr ", accs[i], ""))
+    eline(c6(vectors[i], " = load ", vector_ty, ", ptr ", accs[i], ""))
   }
   let pair0 = newt(g)
-  eline(c6(pair0, " = fadd fast <2 x double> ", vectors[0], ", ", vectors[1], ""))
+  eline(c8(pair0, " = ", add, " ", vector_ty, " ", vectors[0], c2str(", ", vectors[1])))
   let pair1 = newt(g)
-  eline(c6(pair1, " = fadd fast <2 x double> ", vectors[2], ", ", vectors[3], ""))
+  eline(c8(pair1, " = ", add, " ", vector_ty, " ", vectors[2], c2str(", ", vectors[3])))
   let vt = newt(g)
-  eline(c6(vt, " = fadd fast <2 x double> ", pair0, ", ", pair1, ""))
+  eline(c8(vt, " = ", add, " ", vector_ty, " ", pair0, c2str(", ", pair1)))
   let lane0 = newt(g)
-  eline(c4(lane0, " = extractelement <2 x double> ", vt, ", i64 0"))
+  eline(c6(lane0, " = extractelement ", vector_ty, " ", vt, ", i64 0"))
   let lane1 = newt(g)
-  eline(c4(lane1, " = extractelement <2 x double> ", vt, ", i64 1"))
+  eline(c6(lane1, " = extractelement ", vector_ty, " ", vt, ", i64 1"))
   let lanes = newt(g)
-  eline(c6(lanes, " = fadd fast double ", lane0, ", ", lane1, ""))
+  eline(c8(lanes, " = ", add, " ", scalar_ty, " ", lane0, c2str(", ", lane1)))
   let scalar = newt(g)
-  eline(c4(scalar, " = load double, ptr ", scalarp, ""))
+  eline(c6(scalar, " = load ", scalar_ty, ", ptr ", scalarp, ""))
   let total = newt(g)
-  eline(c6(total, " = fadd fast double ", lanes, ", ", scalar, ""))
+  eline(c8(total, " = ", add, " ", scalar_ty, " ", lanes, c2str(", ", scalar)))
   return total
 }
 
@@ -2931,9 +3014,14 @@ fn emit_expr(p: P, inout g: G, e: i64): R {
       pushed = hoist_checks(p, g, ts, nd.text, g.rs[lov.o], g.rs[hiv.o])
     }
     if pushed > 0 and simd_expr_ok(p, g, aux.b, nd.text) and simd_expr_f64(p, g, aux.b) {
-      let total = emit_simd_sum(p, g, aux.b, nd.text, g.rs[lov.o], g.rs[hiv.o])
+      let total = emit_simd_sum(p, g, aux.b, nd.text, g.rs[lov.o], g.rs[hiv.o], false)
       g.ntr = g.ntr - pushed
       return rpush1(g, 1, total)
+    }
+    if pushed > 0 and simd_i64_expr_ok(p, g, aux.b, nd.text) {
+      let total = emit_simd_sum(p, g, aux.b, nd.text, g.rs[lov.o], g.rs[hiv.o], true)
+      g.ntr = g.ntr - pushed
+      return rpush1(g, 0, total)
     }
     let iptr = newt(g)
     eline(c2str(iptr, " = alloca i64"))

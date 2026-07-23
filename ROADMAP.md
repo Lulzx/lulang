@@ -210,8 +210,8 @@ The second backend target after the C ABI — not GPU — now ships as `lu build
 --target wasm32-wasi` and `--target wasm32-web`. WASI produces a command
 module; the web target produces a reactor plus a dependency-free loader with a
 minimal byte-output host. Both are executable integration-tested, including
-SIMD128 f64 reductions with odd-length scalar tails. Native dynamic externs
-fail early because they have no portable wasm meaning.
+SIMD128 f64 and exact wrapping i64 reductions with odd-length scalar tails.
+Native dynamic externs fail early because they have no portable wasm meaning.
 
 This enables browser kernels, serverless, JS embedding, portable benchmark
 artifacts, and sandboxed plugins. The next playground increment is to package

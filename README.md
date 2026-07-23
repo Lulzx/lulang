@@ -466,10 +466,14 @@ oracle that catches a bug codegen.lu would faithfully preserve in itself):
 | M7 — bootstrapping compiler: LLVM AOT backend in lulang ([selfhost/codegen.lu](selfhost/codegen.lu)) | **done — the front end shared with interp.lu plus an IR emitter mirroring `src/llvm.rs` (flattened multi-component values, fast-flagged FP, SoA record arrays, hoisted bounds checks, same C runtime ABI). Compiles the whole ladder and the teaser corpus byte-identically to `lu build`, compiles interp.lu into a native interpreter that reruns the ladder, and **compiles itself to a fixpoint**: stage-1 (interpreted), stage-2, and stage-3 binaries emit byte-identical IR (`selfhost/build.sh --bootstrap`; self-compilation drops from 6.5 s interpreted to 60 ms compiled)** |
 
 The M5 middle-end supplies a target-independent legality proof and expression
-plan for order-free f64 `sum` reductions. Cranelift JIT and LLVM AOT consume
-that plan as explicit f64x2 vector loops with four accumulators and a scalar
-tail; the self-host mirrors the same expression subset, and wasm builds enable
-SIMD128. It also provides branch-free inline sin/cos/acos kernels (musl
+plan for order-free `sum` reductions. Cranelift JIT and LLVM AOT consume that
+plan as explicit four-accumulator vector loops with scalar tails: f64 uses
+f64x2, while wrapping integer arithmetic uses exact i64x2 lanes without
+passing through floating point. The self-host mirrors both expression subsets,
+and wasm builds enable SIMD128. f32 reductions remain scalar because the
+current internal array representation reserves an 8-byte slot per component;
+packed f32 lanes require an array-layout migration first. The middle-end also
+provides branch-free inline sin/cos/acos kernels (musl
 polynomials as pure Cranelift IR), if-conversion of speculation-safe `if`s,
 LICM, and SoA field planes for record arrays. Each is ablatable
 (`LU_MATH=call`, `LU_IFCONV=off`, `LU_LICM=off`, `LU_SIMD=off`,

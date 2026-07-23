@@ -128,6 +128,58 @@ fn host_and_selfhost_emit_correct_explicit_simd_with_scalar_tails() {
         assert!(output.status.success(), "{name} SIMD fixture failed");
         assert_eq!(output.stdout, b"440\n", "{name} scalar tail disagreed");
     }
+
+    let integer_source = directory.join("odd-integer-sum.lu");
+    std::fs::write(
+        &integer_source,
+        "main {\n\
+           let n = 11\n\
+           let values = arr(n, 9007199254740992 + 1)\n\
+           print(sum(i in 0..n) values[i])\n\
+         }\n",
+    )
+    .expect("write integer SIMD fixture");
+    let integer_host_path = directory.join("integer-host.ll");
+    let integer_host = emit_host_ir(&integer_source, &integer_host_path);
+    let integer_selfhost =
+        emit_selfhost_ir(&repository, &integer_source, target_triple(&integer_host));
+    assert!(
+        integer_host.contains("load <2 x i64>") && integer_selfhost.contains("load <2 x i64>"),
+        "host and selfhost should emit exact i64x2 loads"
+    );
+    let integer_scalar_path = directory.join("integer-host-scalar.ll");
+    let integer_scalar_build = run(Command::new(env!("CARGO_BIN_EXE_lu"))
+        .env("LU_SIMD", "off")
+        .args(["build", "--emit-llvm", "-o"])
+        .arg(&integer_scalar_path)
+        .arg(&integer_source));
+    assert!(
+        integer_scalar_build.status.success(),
+        "integer scalar fallback emission failed: {}",
+        String::from_utf8_lossy(&integer_scalar_build.stderr)
+    );
+    assert!(
+        !std::fs::read_to_string(&integer_scalar_path)
+            .expect("read integer scalar fallback IR")
+            .contains("load <2 x i64>"),
+        "LU_SIMD=off must preserve the exact integer scalar fallback"
+    );
+    let integer_selfhost_path = directory.join("integer-selfhost.ll");
+    std::fs::write(&integer_selfhost_path, integer_selfhost)
+        .expect("write integer selfhost SIMD IR");
+    for (name, ir) in [
+        ("integer-host", &integer_host_path),
+        ("integer-selfhost", &integer_selfhost_path),
+    ] {
+        let binary = directory.join(name);
+        compile_ir(&repository, ir, &binary);
+        let output = run(&mut Command::new(binary));
+        assert!(output.status.success(), "{name} SIMD fixture failed");
+        assert_eq!(
+            output.stdout, b"99079191802150923\n",
+            "{name} lost integer precision"
+        );
+    }
 }
 
 #[test]
