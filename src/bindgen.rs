@@ -25,13 +25,21 @@ struct CType {
     base: String,
     pointers: usize,
     is_const: bool,
-    function_pointer: bool,
+    callback: Option<Box<CCallback>>,
+}
+
+#[derive(Clone, Debug)]
+struct CCallback {
+    params: Vec<CParam>,
+    ret: CType,
+    variadic: bool,
 }
 
 #[derive(Clone, Debug)]
 struct CParam {
     name: String,
     ty: CType,
+    bit_width: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +92,9 @@ pub fn generate(
                 .iter()
                 .enumerate()
                 .map(|(index, field)| {
+                    if field.bit_width.is_some() {
+                        return Err("bitfield requires an adapter".to_string());
+                    }
                     map_c_layout_field(&field.ty, &parsed.aliases)
                         .map(|ty| format!("  {}: {},", sanitize_identifier(&field.name, index), ty))
                 })
@@ -188,6 +199,36 @@ pub fn generate(
     let mut shimmed = 0;
     let mut shim_definitions = Vec::new();
     for function in &parsed.functions {
+        if function.variadic {
+            if let Some(shim_library) = shim_library {
+                match render_variadic_functions(function, &parsed, shim_library) {
+                    Ok(variants) => {
+                        let count = variants.len();
+                        for (declaration, definition) in variants {
+                            source.push_str(&declaration);
+                            source.push('\n');
+                            shim_definitions.push(definition);
+                        }
+                        imported += count;
+                        shimmed += count;
+                        parsed.warnings.push(format!(
+                            "variadic function `{}` was emitted as {count} explicit typed wrappers covering zero to three i64/f64 varargs",
+                            function.name
+                        ));
+                    }
+                    Err(reason) => parsed.warnings.push(format!(
+                        "function `{}` was skipped: {}",
+                        function.name, reason
+                    )),
+                }
+            } else {
+                parsed.warnings.push(format!(
+                    "function `{}` was skipped: variadic functions require generated adapter shims",
+                    function.name
+                ));
+            }
+            continue;
+        }
         match render_function(function, &parsed, library) {
             Ok(declaration) => {
                 source.push_str(&declaration);
@@ -229,7 +270,7 @@ pub fn generate(
         source,
         shim_source: (!shim_definitions.is_empty()).then(|| {
             format!(
-                "#include <stdbool.h>\n#include <stdint.h>\n#include \"{}\"\n\n{}\n",
+                "#include <stdbool.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include \"{}\"\n\n{}\n",
                 escape_c_include(input),
                 shim_definitions.join("\n\n")
             )
@@ -242,7 +283,7 @@ pub fn generate(
 
 fn map_shim_record_field(ty: &CType, aliases: &BTreeMap<String, CType>) -> Result<String, String> {
     let resolved = resolve_alias(ty, aliases)?;
-    if resolved.function_pointer {
+    if resolved.callback.is_some() {
         return Err("function pointer field".into());
     }
     if resolved.pointers != 0 {
@@ -275,11 +316,27 @@ fn render_function(function: &CFunction, header: &Header, library: &str) -> Resu
     if is_lulang_builtin(&function.name) {
         return Err("name collides with a lulang builtin".into());
     }
-    let ret = map_type(&function.ret, &header.aliases, true)?;
+    let ret = map_type(&function.ret, &header.aliases, true).or_else(|reason| {
+        direct_record_param(&function.ret, header)
+            .map(|(name, _, _)| name)
+            .map_err(|_| reason)
+    })?;
     let mut params = Vec::new();
     let mut int_classes = 0usize;
     let mut float_classes = 0usize;
-    for (index, parameter) in function.params.iter().enumerate() {
+    let mut index = 0;
+    while index < function.params.len() {
+        let parameter = &function.params[index];
+        if let Some(slice) = direct_slice_pair(function, index, &header.aliases) {
+            int_classes += 2;
+            params.push(format!(
+                "{}: {}",
+                sanitize_identifier(&parameter.name, index),
+                slice
+            ));
+            index += 2;
+            continue;
+        }
         let (ty, ints, floats) = match map_type(&parameter.ty, &header.aliases, false) {
             Ok(ty) => {
                 let (ints, floats) = match ty.as_str() {
@@ -298,6 +355,7 @@ fn render_function(function: &CFunction, header: &Header, library: &str) -> Resu
             sanitize_identifier(&parameter.name, index),
             ty
         ));
+        index += 1;
     }
     if int_classes > 6 || float_classes > 8 {
         return Err(format!(
@@ -317,9 +375,62 @@ fn render_function(function: &CFunction, header: &Header, library: &str) -> Resu
     })
 }
 
+fn direct_slice_pair(
+    function: &CFunction,
+    index: usize,
+    aliases: &BTreeMap<String, CType>,
+) -> Option<String> {
+    let pointer = function.params.get(index)?;
+    let length = function.params.get(index + 1)?;
+    let pointer_ty = resolve_alias(&pointer.ty, aliases).ok()?;
+    let length_ty = resolve_alias(&length.ty, aliases).ok()?;
+    if pointer_ty.callback.is_some()
+        || pointer_ty.pointers != 1
+        || length_ty.callback.is_some()
+        || length_ty.pointers != 0
+    {
+        return None;
+    }
+    let element = match canonical_base(&pointer_ty.base).as_str() {
+        "double" => "f64",
+        "int64_t" | "signed long" | "signed long int" | "long" | "long int" | "intptr_t"
+        | "ptrdiff_t" => "i64",
+        _ => return None,
+    };
+    if !matches!(
+        canonical_base(&length_ty.base).as_str(),
+        "int64_t"
+            | "signed long"
+            | "signed long int"
+            | "long"
+            | "long int"
+            | "intptr_t"
+            | "ptrdiff_t"
+    ) {
+        return None;
+    }
+    let pointer_name = pointer.name.trim_start_matches('_');
+    let length_name = length.name.trim_start_matches('_');
+    let related = matches!(length_name, "n" | "len" | "length" | "count")
+        || ["len", "length", "count", "size"]
+            .iter()
+            .any(|suffix| length_name == format!("{pointer_name}_{suffix}"));
+    if !related {
+        return None;
+    }
+    Some(format!(
+        "{}[{element}]",
+        if pointer_ty.is_const {
+            "c_slice"
+        } else {
+            "c_mut_slice"
+        }
+    ))
+}
+
 fn direct_record_param(ty: &CType, header: &Header) -> Result<(String, usize, usize), String> {
     let resolved = resolve_alias(ty, &header.aliases)?;
-    if resolved.function_pointer || resolved.pointers != 0 {
+    if resolved.callback.is_some() || resolved.pointers != 0 {
         return Err("not a by-value record".into());
     }
     let base = canonical_base(&resolved.base);
@@ -337,8 +448,11 @@ fn direct_record_param(ty: &CType, header: &Header) -> Result<(String, usize, us
     }
     let mut class = None;
     for field in fields {
+        if field.bit_width.is_some() {
+            return Err("record contains a bitfield".into());
+        }
         let field = resolve_alias(&field.ty, &header.aliases)?;
-        if field.function_pointer {
+        if field.callback.is_some() {
             return Err("record contains a callback".into());
         }
         let field_class = if field.pointers != 0 {
@@ -378,7 +492,7 @@ struct ShimParamPlan {
     c_expr: String,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum ShimReturnKind {
     Unit,
     I64,
@@ -386,6 +500,190 @@ enum ShimReturnKind {
     F32,
     Bool,
     Pointer,
+    Record(ShimRecordReturn),
+}
+
+#[derive(Clone, Debug)]
+struct ShimRecordReturn {
+    name: String,
+    c_type: String,
+    fields: Vec<ShimReturnField>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ShimReturnFieldKind {
+    I64,
+    F64,
+    F32,
+    Bool,
+    Pointer,
+}
+
+#[derive(Clone, Debug)]
+struct ShimReturnField {
+    c_name: String,
+    lu_name: String,
+    kind: ShimReturnFieldKind,
+}
+
+fn render_variadic_functions(
+    function: &CFunction,
+    header: &Header,
+    shim_library: &str,
+) -> Result<Vec<(String, String)>, String> {
+    if function.name.starts_with("lu_") || is_lulang_builtin(&function.name) {
+        return Err("function name cannot be wrapped".into());
+    }
+    let return_kind = plan_shim_return(&function.ret, header)?;
+    if matches!(return_kind, ShimReturnKind::Record(_)) {
+        return Err("variadic aggregate returns are not supported".into());
+    }
+
+    let mut fixed_api_params = Vec::new();
+    let mut fixed_boundary = Vec::new();
+    let mut fixed_c_args = Vec::new();
+    for (index, parameter) in function.params.iter().enumerate() {
+        let api_name = sanitize_identifier(&parameter.name, index);
+        let plan = plan_shim_param(
+            &parameter.ty,
+            header,
+            &api_name,
+            &format!("arg{index}"),
+            &api_name,
+        )?;
+        fixed_api_params.push(format!("{api_name}: {}", plan.api_ty));
+        fixed_boundary.extend(plan.boundary);
+        fixed_c_args.push(plan.c_expr);
+    }
+
+    let mut patterns = vec![Vec::<bool>::new()];
+    for arity in 1..=3 {
+        for bits in 0..(1usize << arity) {
+            patterns.push((0..arity).map(|index| bits & (1 << index) != 0).collect());
+        }
+    }
+    let escaped_library = escape_string(shim_library);
+    let mut rendered = Vec::new();
+    for pattern in patterns {
+        let suffix = if pattern.is_empty() {
+            "v0".to_string()
+        } else {
+            format!(
+                "v_{}",
+                pattern
+                    .iter()
+                    .map(|is_float| if *is_float { "f64" } else { "i64" })
+                    .collect::<Vec<_>>()
+                    .join("_")
+            )
+        };
+        let public_name = format!("{}_{}", function.name, suffix);
+        let symbol = format!("__lulang_bindgen_{public_name}");
+        let mut api_params = fixed_api_params.clone();
+        let mut boundary = fixed_boundary.clone();
+        let mut c_args = fixed_c_args.clone();
+        for (index, is_float) in pattern.iter().enumerate() {
+            let name = format!("vararg{index}");
+            let ty = if *is_float { "f64" } else { "i64" };
+            api_params.push(format!("{name}: {ty}"));
+            boundary.push(ShimBoundaryArg {
+                name: name.clone(),
+                lu_ty: ty.into(),
+                c_ty: if *is_float { "double" } else { "int64_t" },
+                lu_expr: name.clone(),
+            });
+            c_args.push(name);
+        }
+        let int_classes = boundary
+            .iter()
+            .filter(|argument| argument.lu_ty != "f64")
+            .count();
+        let float_classes = boundary
+            .iter()
+            .filter(|argument| argument.lu_ty == "f64")
+            .count();
+        if int_classes > 6 || float_classes > 8 {
+            continue;
+        }
+
+        let boundary_params = boundary
+            .iter()
+            .map(|argument| format!("{}: {}", argument.name, argument.lu_ty))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let boundary_args = boundary
+            .iter()
+            .map(|argument| argument.lu_expr.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let boundary_ret = match &return_kind {
+            ShimReturnKind::Unit => "()".into(),
+            ShimReturnKind::I64 | ShimReturnKind::Bool => "i64".into(),
+            ShimReturnKind::F64 | ShimReturnKind::F32 => "f64".into(),
+            ShimReturnKind::Pointer => map_type(&function.ret, &header.aliases, true)?,
+            ShimReturnKind::Record(_) => unreachable!(),
+        };
+        let api_ret = shim_api_return(&return_kind, &function.ret, &header.aliases)?;
+        let mut lu = format!("extern \"{escaped_library}\" fn {symbol}({boundary_params})");
+        if boundary_ret != "()" {
+            let _ = write!(lu, ": {boundary_ret}");
+        }
+        let _ = write!(lu, "\nfn {public_name}({})", api_params.join(", "));
+        if api_ret != "()" {
+            let _ = write!(lu, ": {api_ret}");
+        }
+        lu.push_str(" {\n");
+        let call = format!("{symbol}({boundary_args})");
+        match &return_kind {
+            ShimReturnKind::Unit => {
+                let _ = writeln!(lu, "  {call}");
+            }
+            ShimReturnKind::Bool => {
+                let _ = writeln!(lu, "  return {call} != 0");
+            }
+            ShimReturnKind::F32 => {
+                let _ = writeln!(lu, "  return f32({call})");
+            }
+            _ => {
+                let _ = writeln!(lu, "  return {call}");
+            }
+        }
+        lu.push_str("}\n");
+
+        let c_params = boundary
+            .iter()
+            .map(|argument| format!("{} {}", argument.c_ty, argument.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let original_call = format!("{}({})", function.name, c_args.join(", "));
+        let (c_ret, c_body) = match &return_kind {
+            ShimReturnKind::Unit => ("void", format!("  {original_call};")),
+            ShimReturnKind::I64 => ("int64_t", format!("  return (int64_t){original_call};")),
+            ShimReturnKind::F64 | ShimReturnKind::F32 => {
+                ("double", format!("  return (double){original_call};"))
+            }
+            ShimReturnKind::Bool => (
+                "int64_t",
+                format!("  return {original_call} ? INT64_C(1) : INT64_C(0);"),
+            ),
+            ShimReturnKind::Pointer => ("void *", format!("  return (void *){original_call};")),
+            ShimReturnKind::Record(_) => unreachable!(),
+        };
+        let c = format!(
+            "{c_ret} {symbol}({}) {{\n{c_body}\n}}",
+            if c_params.is_empty() {
+                "void"
+            } else {
+                &c_params
+            }
+        );
+        rendered.push((lu, c));
+    }
+    if rendered.is_empty() {
+        Err("no typed variadic wrapper fits the boundary register limits".into())
+    } else {
+        Ok(rendered)
+    }
 }
 
 fn render_shim_function(
@@ -416,7 +714,7 @@ fn render_shim_function(
         boundary.extend(plan.boundary);
         c_call_args.push(plan.c_expr);
     }
-    let return_kind = plan_shim_return(&function.ret, &header.aliases)?;
+    let return_kind = plan_shim_return(&function.ret, header)?;
 
     let int_classes = boundary
         .iter()
@@ -433,16 +731,28 @@ fn render_shim_function(
     }
 
     let symbol = format!("__lulang_bindgen_{}", function.name);
+    if let ShimReturnKind::Record(record) = &return_kind {
+        return render_shim_record_return(
+            function,
+            record,
+            &api_params,
+            &boundary,
+            &c_call_args,
+            shim_library,
+            &symbol,
+        );
+    }
     let boundary_params = boundary
         .iter()
         .map(|argument| format!("{}: {}", argument.name, argument.lu_ty))
         .collect::<Vec<_>>()
         .join(", ");
-    let boundary_ret = match return_kind {
+    let boundary_ret = match &return_kind {
         ShimReturnKind::Unit => "()".into(),
         ShimReturnKind::F64 | ShimReturnKind::F32 => "f64".into(),
         ShimReturnKind::Pointer => map_type(&function.ret, &header.aliases, true)?,
         ShimReturnKind::I64 | ShimReturnKind::Bool => "i64".into(),
+        ShimReturnKind::Record(_) => unreachable!(),
     };
     let mut lu = format!(
         "extern \"{}\" fn {}({})",
@@ -455,7 +765,7 @@ fn render_shim_function(
     }
     lu.push('\n');
     let _ = write!(lu, "fn {}({})", function.name, api_params.join(", "));
-    let api_ret = shim_api_return(return_kind, &function.ret, &header.aliases)?;
+    let api_ret = shim_api_return(&return_kind, &function.ret, &header.aliases)?;
     if api_ret != "()" {
         let _ = write!(lu, ": {api_ret}");
     }
@@ -469,7 +779,7 @@ fn render_shim_function(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    match return_kind {
+    match &return_kind {
         ShimReturnKind::Unit => {
             let _ = writeln!(lu, "  {call}");
         }
@@ -488,7 +798,7 @@ fn render_shim_function(
         .collect::<Vec<_>>()
         .join(", ");
     let original_call = format!("{}({})", function.name, c_call_args.join(", "));
-    let (c_ret, c_body) = match return_kind {
+    let (c_ret, c_body) = match &return_kind {
         ShimReturnKind::Unit => ("void", format!("  {original_call};")),
         ShimReturnKind::I64 => ("int64_t", format!("  return (int64_t){original_call};")),
         ShimReturnKind::F64 | ShimReturnKind::F32 => {
@@ -499,6 +809,7 @@ fn render_shim_function(
             format!("  return {original_call} ? INT64_C(1) : INT64_C(0);"),
         ),
         ShimReturnKind::Pointer => ("void *", format!("  return (void *){original_call};")),
+        ShimReturnKind::Record(_) => unreachable!(),
     };
     let c = format!(
         "{c_ret} {symbol}({}) {{\n{c_body}\n}}",
@@ -511,6 +822,107 @@ fn render_shim_function(
     Ok((lu, c))
 }
 
+fn render_shim_record_return(
+    function: &CFunction,
+    record: &ShimRecordReturn,
+    api_params: &[String],
+    boundary: &[ShimBoundaryArg],
+    c_call_args: &[String],
+    shim_library: &str,
+    symbol: &str,
+) -> Result<(String, String), String> {
+    let boundary_params = boundary
+        .iter()
+        .map(|argument| format!("{}: {}", argument.name, argument.lu_ty))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let boundary_args = boundary
+        .iter()
+        .map(|argument| argument.lu_expr.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let c_params = boundary
+        .iter()
+        .map(|argument| format!("{} {}", argument.c_ty, argument.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let c_params = if c_params.is_empty() {
+        "void".to_string()
+    } else {
+        c_params
+    };
+    let escaped_library = escape_string(shim_library);
+    let free_symbol = format!("{symbol}_release");
+
+    let mut lu =
+        format!("extern \"{escaped_library}\" fn {symbol}({boundary_params}): c_ptr[()]\n");
+    for field in &record.fields {
+        let getter = format!("{symbol}_get_{}", field.lu_name);
+        let ret = match field.kind {
+            ShimReturnFieldKind::I64 | ShimReturnFieldKind::Bool => "i64",
+            ShimReturnFieldKind::F64 | ShimReturnFieldKind::F32 => "f64",
+            ShimReturnFieldKind::Pointer => "c_ptr[()]",
+        };
+        let _ = writeln!(
+            lu,
+            "extern \"{escaped_library}\" fn {getter}(handle: c_ptr[()]): {ret}"
+        );
+    }
+    let _ = writeln!(
+        lu,
+        "extern \"{escaped_library}\" fn {free_symbol}(handle: c_ptr[()])"
+    );
+    let _ = writeln!(
+        lu,
+        "fn {}({}): {} {{",
+        function.name,
+        api_params.join(", "),
+        record.name
+    );
+    let _ = writeln!(lu, "  let handle = {symbol}({boundary_args})");
+    let _ = writeln!(lu, "  let result = {} {{", record.name);
+    for field in &record.fields {
+        let getter = format!("{symbol}_get_{}", field.lu_name);
+        let call = format!("{getter}(handle)");
+        let expression = match field.kind {
+            ShimReturnFieldKind::F32 => format!("f32({call})"),
+            ShimReturnFieldKind::Bool => format!("{call} != 0"),
+            _ => call,
+        };
+        let _ = writeln!(lu, "    {}: {expression},", field.lu_name);
+    }
+    lu.push_str("  }\n");
+    let _ = writeln!(lu, "  {free_symbol}(handle)");
+    lu.push_str("  return result\n}\n");
+
+    let record_c_type = &record.c_type;
+    let original_call = format!("{}({})", function.name, c_call_args.join(", "));
+    let mut c = format!(
+        "void *{symbol}({c_params}) {{\n  {record_c_type} *result = ({record_c_type} *)malloc(sizeof(*result));\n  if (result == NULL) abort();\n  *result = {original_call};\n  return result;\n}}\n"
+    );
+    for field in &record.fields {
+        let getter = format!("{symbol}_get_{}", field.lu_name);
+        let access = format!("(({record_c_type} *)handle)->{}", field.c_name);
+        let (c_ret, expression) = match field.kind {
+            ShimReturnFieldKind::I64 => ("int64_t", format!("(int64_t){access}")),
+            ShimReturnFieldKind::F64 | ShimReturnFieldKind::F32 => {
+                ("double", format!("(double){access}"))
+            }
+            ShimReturnFieldKind::Bool => ("int64_t", format!("{access} ? INT64_C(1) : INT64_C(0)")),
+            ShimReturnFieldKind::Pointer => ("void *", format!("(void *){access}")),
+        };
+        let _ = writeln!(
+            c,
+            "{c_ret} {getter}(void *handle) {{\n  return {expression};\n}}"
+        );
+    }
+    let _ = write!(
+        c,
+        "void {free_symbol}(void *handle) {{\n  free(handle);\n}}"
+    );
+    Ok((lu, c))
+}
+
 fn plan_shim_param(
     ty: &CType,
     header: &Header,
@@ -519,7 +931,7 @@ fn plan_shim_param(
     lu_expr: &str,
 ) -> Result<ShimParamPlan, String> {
     let resolved = resolve_alias(ty, &header.aliases)?;
-    if resolved.function_pointer {
+    if resolved.callback.is_some() {
         return Err("callbacks are not supported by adapter shims".into());
     }
     if resolved.pointers != 0 {
@@ -561,7 +973,7 @@ fn plan_shim_param(
             boundary,
             c_expr: format!(
                 "({}){{ {} }}",
-                c_type_spelling(&resolved),
+                aggregate_c_spelling(ty, &resolved, &header.aliases),
                 initializers.join(", ")
             ),
         });
@@ -628,12 +1040,9 @@ fn shim_scalar_param(
     }
 }
 
-fn plan_shim_return(
-    ty: &CType,
-    aliases: &BTreeMap<String, CType>,
-) -> Result<ShimReturnKind, String> {
-    let resolved = resolve_alias(ty, aliases)?;
-    if resolved.function_pointer {
+fn plan_shim_return(ty: &CType, header: &Header) -> Result<ShimReturnKind, String> {
+    let resolved = resolve_alias(ty, &header.aliases)?;
+    if resolved.callback.is_some() {
         return Err("function pointer returns are not supported".into());
     }
     if resolved.pointers != 0 {
@@ -649,12 +1058,84 @@ fn plan_shim_return(
             Ok(ShimReturnKind::I64)
         }
         base if base.starts_with("enum ") => Ok(ShimReturnKind::I64),
+        base if base.starts_with("struct ") => {
+            let name = base
+                .split_whitespace()
+                .nth(1)
+                .filter(|name| valid_identifier(name))
+                .ok_or("unnamed struct return")?;
+            let fields = header
+                .structs
+                .get(name)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| format!("struct `{name}` is opaque"))?;
+            let fields = fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let field_ty = resolve_alias(&field.ty, &header.aliases)?;
+                    if field_ty.callback.is_some() {
+                        return Err("callback fields cannot use a result adapter".into());
+                    }
+                    let kind = if field_ty.pointers != 0 {
+                        ShimReturnFieldKind::Pointer
+                    } else {
+                        match canonical_base(&field_ty.base).as_str() {
+                            "double" => ShimReturnFieldKind::F64,
+                            "float" => ShimReturnFieldKind::F32,
+                            "bool" | "_Bool" => ShimReturnFieldKind::Bool,
+                            base if is_signed_c_integer(base)
+                                || is_narrow_unsigned_c_integer(base)
+                                || base.starts_with("enum ") =>
+                            {
+                                ShimReturnFieldKind::I64
+                            }
+                            _ => {
+                                return Err(format!(
+                                "field `{}` in struct `{name}` cannot use a flat result adapter",
+                                field.name
+                            ))
+                            }
+                        }
+                    };
+                    Ok(ShimReturnField {
+                        c_name: field.name.clone(),
+                        lu_name: sanitize_identifier(&field.name, index),
+                        kind,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            if fields.is_empty() {
+                return Err(format!("struct `{name}` has no adaptable fields"));
+            }
+            Ok(ShimReturnKind::Record(ShimRecordReturn {
+                name: name.into(),
+                c_type: aggregate_c_spelling(ty, &resolved, &header.aliases),
+                fields,
+            }))
+        }
         _ => Err(format!("C return type `{base}` cannot use an adapter shim")),
     }
 }
 
+fn aggregate_c_spelling(
+    original: &CType,
+    resolved: &CType,
+    aliases: &BTreeMap<String, CType>,
+) -> String {
+    if original.pointers == 0
+        && original.callback.is_none()
+        && aliases.contains_key(&original.base)
+        && valid_identifier(&original.base)
+    {
+        original.base.clone()
+    } else {
+        c_type_spelling(resolved)
+    }
+}
+
 fn shim_api_return(
-    kind: ShimReturnKind,
+    kind: &ShimReturnKind,
     ty: &CType,
     aliases: &BTreeMap<String, CType>,
 ) -> Result<String, String> {
@@ -665,6 +1146,7 @@ fn shim_api_return(
         ShimReturnKind::F32 => "f32".into(),
         ShimReturnKind::Bool => "bool".into(),
         ShimReturnKind::Pointer => map_type(ty, aliases, true)?,
+        ShimReturnKind::Record(record) => record.name.clone(),
     })
 }
 
@@ -727,8 +1209,20 @@ fn map_type(
     return_position: bool,
 ) -> Result<String, String> {
     let resolved = resolve_alias(ty, aliases)?;
-    if resolved.function_pointer {
-        return Err("function pointers are deferred with callbacks".into());
+    if let Some(callback) = &resolved.callback {
+        if resolved.pointers != 0 {
+            return Err("pointers to function pointers are not supported".into());
+        }
+        if callback.variadic {
+            return Err("variadic callback signatures are not supported".into());
+        }
+        let params = callback
+            .params
+            .iter()
+            .map(|parameter| map_type(&parameter.ty, aliases, false))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ret = map_type(&callback.ret, aliases, true)?;
+        return Ok(format!("c_fn[({})->{ret}]", params.join(",")));
     }
     if resolved.pointers != 0 {
         let mut pointee = match canonical_base(&resolved.base).as_str() {
@@ -774,7 +1268,7 @@ fn map_type(
 
 fn map_c_layout_field(ty: &CType, aliases: &BTreeMap<String, CType>) -> Result<String, String> {
     let resolved = resolve_alias(ty, aliases)?;
-    if resolved.function_pointer {
+    if resolved.callback.is_some() {
         return Err("function pointer field".into());
     }
     if resolved.pointers != 0 {
@@ -808,7 +1302,9 @@ fn resolve_alias(ty: &CType, aliases: &BTreeMap<String, CType>) -> Result<CType,
         let mut next = alias.clone();
         next.pointers += current.pointers;
         next.is_const |= current.is_const;
-        next.function_pointer |= current.function_pointer;
+        if current.callback.is_some() {
+            next.callback = current.callback.clone();
+        }
         current = next;
     }
     Ok(current)
@@ -1118,6 +1614,9 @@ fn parse_typedef(tokens: &[String], header: &mut Header) {
 }
 
 fn parse_alias(tokens: &[String]) -> Option<(String, CType)> {
+    if let Some((name, ty)) = parse_callback_declarator(tokens, 0) {
+        return name.map(|name| (name, ty));
+    }
     if tokens.iter().any(|token| token == "(") {
         return None;
     }
@@ -1125,6 +1624,56 @@ fn parse_alias(tokens: &[String]) -> Option<(String, CType)> {
     let name = tokens[name_index].clone();
     let ty = parse_type_tokens(&tokens[..name_index]);
     (!ty.base.is_empty()).then_some((name, ty))
+}
+
+fn parse_callback_declarator(
+    tokens: &[String],
+    parameter_index: usize,
+) -> Option<(Option<String>, CType)> {
+    // The pointer declarator must be followed immediately by its argument list.
+    let open = (0..tokens.len()).find(|index| {
+        tokens[*index] == "(" && tokens.get(*index + 1).is_some_and(|token| token == "*")
+    })?;
+    let declarator_close = matching_close(tokens, open)?;
+    let args_open = declarator_close + 1;
+    if !tokens.get(args_open).is_some_and(|token| token == "(") {
+        return None;
+    }
+    let args_close = matching_close(tokens, args_open)?;
+    if args_close + 1 != tokens.len() {
+        return None;
+    }
+    let name = tokens[open + 2..declarator_close]
+        .iter()
+        .find(|token| valid_identifier(token))
+        .cloned();
+    let ret = parse_type_tokens(&tokens[..open]);
+    if ret.base.is_empty() {
+        return None;
+    }
+    let mut params = Vec::new();
+    let mut variadic = false;
+    let slices = split_commas(&tokens[args_open + 1..args_close]);
+    if !(slices.len() == 1 && slices[0].len() == 1 && slices[0][0] == "void") {
+        for (index, parameter) in slices.into_iter().enumerate() {
+            if parameter.len() == 1 && parameter[0] == "..." {
+                variadic = true;
+            } else if !parameter.is_empty() {
+                params.push(parse_parameter(parameter, parameter_index + index));
+            }
+        }
+    }
+    Some((
+        name,
+        CType {
+            callback: Some(Box::new(CCallback {
+                params,
+                ret,
+                variadic,
+            })),
+            ..CType::default()
+        },
+    ))
 }
 
 fn parse_enum(tokens: &[String], alias: Option<String>) -> Option<CEnum> {
@@ -1195,7 +1744,6 @@ fn index_struct(tokens: &[String], header: &mut Header) {
                     let declaration = &tokens[start..end];
                     if !declaration.is_empty() {
                         if declaration.iter().any(|token| token == "[")
-                            || declaration.iter().any(|token| token == ":")
                             || declaration.iter().any(|token| token == ",")
                         {
                             valid = false;
@@ -1259,17 +1807,12 @@ fn parse_function(tokens: &[String]) -> Option<CFunction> {
 }
 
 fn parse_parameter(tokens: &[String], index: usize) -> CParam {
-    if let Some(open) = tokens.iter().position(|token| token == "(") {
-        if tokens.get(open + 1).is_some_and(|token| token == "*") {
-            let name = tokens
-                .get(open + 2)
-                .filter(|token| valid_identifier(token))
-                .cloned()
-                .unwrap_or_else(|| format!("arg{index}"));
-            let mut ty = parse_type_tokens(&tokens[..open]);
-            ty.function_pointer = true;
-            return CParam { name, ty };
-        }
+    if let Some((name, ty)) = parse_callback_declarator(tokens, index) {
+        return CParam {
+            name: name.unwrap_or_else(|| format!("arg{index}")),
+            ty,
+            bit_width: None,
+        };
     }
     let name_index = tokens
         .iter()
@@ -1285,7 +1828,15 @@ fn parse_parameter(tokens: &[String], index: usize) -> CParam {
     {
         ty.pointers += 1;
     }
-    CParam { name, ty }
+    let bit_width = tokens
+        .iter()
+        .position(|token| token == ":")
+        .map(|colon| tokens[colon + 1..].join(" "));
+    CParam {
+        name,
+        ty,
+        bit_width,
+    }
 }
 
 fn parse_type_tokens(tokens: &[String]) -> CType {
@@ -1425,7 +1976,7 @@ mod tests {
     }
 
     #[test]
-    fn imports_f32_and_refuses_other_inexact_boundary_representations() {
+    fn imports_f32_callbacks_and_refuses_other_inexact_boundary_representations() {
         let header = r#"
             float narrow(float x);
             int ordinary_int(int x);
@@ -1433,7 +1984,7 @@ mod tests {
             int64_t callback(int64_t (*f)(int64_t));
         "#;
         let generated = generate(header, Path::new("unsafe.h"), "unsafe", None).unwrap();
-        assert_eq!(generated.imported_functions, 1);
+        assert_eq!(generated.imported_functions, 2);
         assert!(generated
             .source
             .contains("extern \"unsafe\" fn narrow(x: f32): f32"));
@@ -1442,8 +1993,51 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("size_t")));
         assert!(generated
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("function pointers")));
+            .source
+            .contains("extern \"unsafe\" fn callback(f: c_fn[(i64)->i64]): i64"));
+    }
+
+    #[test]
+    fn resolves_callback_typedef_parameters_and_returns() {
+        let header = r#"
+            typedef int64_t (*transform_fn)(int64_t, double);
+            transform_fn install_transform(transform_fn callback);
+        "#;
+        let generated = generate(header, Path::new("callbacks.h"), "callbacks", None).unwrap();
+        assert_eq!(generated.imported_functions, 1);
+        assert!(generated.source.contains(
+            "extern \"callbacks\" fn install_transform(callback: c_fn[(i64,f64)->i64]): c_fn[(i64,f64)->i64]"
+        ));
+    }
+
+    #[test]
+    fn imports_portable_returns_union_handles_and_shims_bitfields() {
+        let header = r#"
+            typedef struct pair { int64_t x; int64_t y; } pair;
+            typedef struct flags { unsigned int mode : 3; int enabled : 1; } flags;
+            typedef union value { int64_t integer; double real; } value;
+            pair make_pair(int64_t x, int64_t y);
+            int64_t read_flags(flags value);
+            int64_t inspect_value(const value *value);
+        "#;
+        let generated = generate(
+            header,
+            Path::new("aggregates.h"),
+            "aggregates",
+            Some("shim"),
+        )
+        .unwrap();
+        assert!(generated
+            .source
+            .contains("extern \"aggregates\" fn make_pair(x: i64, y: i64): pair"));
+        assert!(generated.source.contains("type flags"));
+        assert!(!generated.source.contains("@c_layout type flags"));
+        assert!(generated
+            .source
+            .contains("fn read_flags(value: flags): i64"));
+        assert!(generated
+            .source
+            .contains("inspect_value(value: c_ptr[value]): i64"));
+        assert_eq!(generated.shimmed_functions, 1);
     }
 }

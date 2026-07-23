@@ -1,0 +1,11 @@
+main {
+  let width = 80
+  let height = 40
+  var pixels = arr(width * height, 0.0)
+  render_mandelbrot(pixels, width, height, 64)
+  print("luimage")
+  print("size:", width, height)
+  print("checksum:", image_checksum(pixels))
+  print("mean luminance:", mean_luminance(pixels))
+  print("center:", pixels[(height / 2) * width + (2 * width / 3)])
+}

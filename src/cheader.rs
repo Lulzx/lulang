@@ -77,7 +77,19 @@ fn lu_type_name(program: &LoweredProgram, ty: &Type) -> String {
         Type::Unit => "()".into(),
         Type::Arr(element) => format!("[{}]", lu_type_name(program, element)),
         Type::CSlice(element) => format!("c_slice[{}]", lu_type_name(program, element)),
+        Type::CMutSlice(element) => {
+            format!("c_mut_slice[{}]", lu_type_name(program, element))
+        }
         Type::CPtr(element) => format!("c_ptr[{}]", lu_type_name(program, element)),
+        Type::CFn(params, ret) => format!(
+            "c_fn[({})->{}]",
+            params
+                .iter()
+                .map(|ty| lu_type_name(program, ty))
+                .collect::<Vec<_>>()
+                .join(","),
+            lu_type_name(program, ret)
+        ),
         Type::Rec(index) => program.records[*index].name.clone(),
         Type::Enum(index) => program.enums[*index].name.clone(),
     }
@@ -86,6 +98,7 @@ fn lu_type_name(program: &LoweredProgram, ty: &Type) -> String {
 fn c_params(
     program: &LoweredProgram,
     function: &crate::ir::Function,
+    callbacks: &[(Type, String)],
 ) -> Result<Vec<String>, String> {
     let mut params = Vec::new();
     for &local in &function.params {
@@ -105,9 +118,19 @@ fn c_params(
                 params.push(format!("const {} *{}_data", element, local.name));
                 params.push(format!("int64_t {}_len", local.name));
             }
+            Type::CMutSlice(element) => {
+                let element = c_scalar_type(element)?;
+                params.push(format!("{} *{}_data", element, local.name));
+                params.push(format!("int64_t {}_len", local.name));
+            }
             Type::Rec(index) if program.records[*index].c_layout => {
                 params.push(format!("{} {}", program.records[*index].name, local.name))
             }
+            Type::CFn(_, _) => params.push(format!(
+                "{} {}",
+                callback_name(callbacks, &local.ty)?,
+                local.name
+            )),
             ty => params.push(format!("{} {}", c_scalar_type(ty)?, local.name)),
         }
     }
@@ -118,6 +141,48 @@ fn c_params(
         params.push("void".into());
     }
     Ok(params)
+}
+
+fn callback_name<'a>(callbacks: &'a [(Type, String)], ty: &Type) -> Result<&'a str, String> {
+    callbacks
+        .iter()
+        .find_map(|(candidate, name)| (candidate == ty).then_some(name.as_str()))
+        .ok_or_else(|| "missing generated callback typedef".into())
+}
+
+fn collect_callbacks(ty: &Type, callbacks: &mut Vec<(Type, String)>) {
+    if let Type::CFn(params, ret) = ty {
+        for param in params {
+            collect_callbacks(param, callbacks);
+        }
+        collect_callbacks(ret, callbacks);
+        if !callbacks.iter().any(|(candidate, _)| candidate == ty) {
+            callbacks.push((ty.clone(), format!("lu_callback_{}", callbacks.len())));
+        }
+    }
+}
+
+fn callback_typedef_name(type_name: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in type_name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("lu_callback_{hash:016x}")
+}
+
+fn callback_c_type(
+    program: &LoweredProgram,
+    ty: &Type,
+    callbacks: &[(Type, String)],
+) -> Result<String, String> {
+    Ok(match ty {
+        Type::Rec(index) if program.records[*index].c_layout => {
+            program.records[*index].name.clone()
+        }
+        Type::CFn(_, _) => callback_name(callbacks, ty)?.into(),
+        _ => c_scalar_type(ty)?.into(),
+    })
 }
 
 pub fn emit_header(program: &LoweredProgram, guard_name: &str) -> Result<String, String> {
@@ -140,6 +205,65 @@ pub fn emit_header(program: &LoweredProgram, guard_name: &str) -> Result<String,
             emit_c_layout_record(program, index, &mut emitted_records, &mut out)?;
         }
     }
+    let mut callbacks = Vec::new();
+    for function in program
+        .functions
+        .iter()
+        .filter(|function| function.exported)
+    {
+        for &local in &function.params {
+            collect_callbacks(&function.locals[local as usize].ty, &mut callbacks);
+        }
+        collect_callbacks(&function.ret, &mut callbacks);
+    }
+    for (callback, name) in &mut callbacks {
+        *name = callback_typedef_name(&lu_type_name(program, callback));
+    }
+    for (callback, name) in &callbacks {
+        let Type::CFn(params, ret) = callback else {
+            unreachable!()
+        };
+        let mut c_params = Vec::new();
+        for ty in params {
+            match ty {
+                Type::Str => c_params.extend(["const char *".into(), "int64_t".into()]),
+                Type::Arr(element) | Type::CMutSlice(element) => {
+                    c_params.push(format!("{} *", c_scalar_type(element)?));
+                    c_params.push("int64_t".into());
+                }
+                Type::CSlice(element) => {
+                    c_params.push(format!("const {} *", c_scalar_type(element)?));
+                    c_params.push("int64_t".into());
+                }
+                _ => c_params.push(callback_c_type(program, ty, &callbacks)?),
+            }
+        }
+        if ret.as_ref() == &Type::Str {
+            c_params.push("int64_t *".into());
+        }
+        if c_params.is_empty() {
+            c_params.push("void".into());
+        }
+        let ret = if ret.as_ref() == &Type::Str {
+            "const char *".into()
+        } else {
+            callback_c_type(program, ret, &callbacks)?
+        };
+        let _ = writeln!(out, "typedef {ret} (*{name})({});", c_params.join(", "));
+    }
+    if !callbacks.is_empty() {
+        out.push('\n');
+    }
+    if program.records.iter().any(|record| {
+        record.c_layout
+            && record.fields.len() == 2
+            && record.fields[0].0 == "status"
+            && record.fields[0].1 == Type::I64
+            && record.fields[1].0 == "value"
+            && record.fields[1].1 == Type::I64
+    }) {
+        out.push_str("#define LU_STATUS_OK INT64_C(0)\n\n");
+    }
     for definition in &program.enums {
         for (tag, variant) in definition.variants.iter().enumerate() {
             let _ = writeln!(
@@ -151,6 +275,30 @@ pub fn emit_header(program: &LoweredProgram, guard_name: &str) -> Result<String,
         if !definition.variants.is_empty() {
             out.push('\n');
         }
+    }
+    let owned_i64 = program.functions.iter().any(|function| {
+        function.exported
+            && matches!(&function.ret, Type::Arr(element) if element.as_ref() == &Type::I64)
+    });
+    let owned_f64 = program.functions.iter().any(|function| {
+        function.exported
+            && matches!(&function.ret, Type::Arr(element) if element.as_ref() == &Type::F64)
+    });
+    if owned_i64 {
+        out.push_str(
+            "typedef struct lu_owned_i64 lu_owned_i64;\n\
+             int64_t *lu_owned_i64_data(lu_owned_i64 *handle);\n\
+             int64_t lu_owned_i64_len(const lu_owned_i64 *handle);\n\
+             void lu_owned_i64_release(lu_owned_i64 *handle);\n\n",
+        );
+    }
+    if owned_f64 {
+        out.push_str(
+            "typedef struct lu_owned_f64 lu_owned_f64;\n\
+             double *lu_owned_f64_data(lu_owned_f64 *handle);\n\
+             int64_t lu_owned_f64_len(const lu_owned_f64 *handle);\n\
+             void lu_owned_f64_release(lu_owned_f64 *handle);\n\n",
+        );
     }
     for function in program
         .functions
@@ -174,16 +322,30 @@ pub fn emit_header(program: &LoweredProgram, guard_name: &str) -> Result<String,
             lu_type_name(program, &function.ret)
         );
         let return_type = if function.ret == Type::Str {
-            "const char *"
+            "const char *".to_string()
+        } else if let Type::Arr(element) = &function.ret {
+            match element.as_ref() {
+                Type::I64 => "lu_owned_i64 *".into(),
+                Type::F64 => "lu_owned_f64 *".into(),
+                _ => return Err("owned C result arrays require i64 or f64 elements".into()),
+            }
+        } else if let Type::Rec(index) = &function.ret {
+            if program.records[*index].c_layout {
+                program.records[*index].name.clone()
+            } else {
+                return Err("compiler-layout record cannot be returned through C".into());
+            }
+        } else if matches!(&function.ret, Type::CFn(_, _)) {
+            callback_name(&callbacks, &function.ret)?.to_string()
         } else {
-            c_scalar_type(&function.ret)?
+            c_scalar_type(&function.ret)?.to_string()
         };
         let _ = writeln!(
             out,
             "{} {}({});\n",
             return_type,
             function.name,
-            c_params(program, function)?.join(", ")
+            c_params(program, function, &callbacks)?.join(", ")
         );
     }
     out.push_str("#ifdef __cplusplus\n}\n#endif\n\n#endif\n");

@@ -44,7 +44,7 @@
       "patterns": [{"name": "keyword.control.lulang", "match": "\\b(?:main|fn|export|extern|type|enum|property|operator|let|var|inout|return|if|else|for|in|while|and|or|not)\\b"}]
     },
     "types": {
-      "patterns": [{"name": "storage.type.builtin.lulang", "match": "\\b(?:i32|i64|f32|f64|bool|str|c_ptr|c_slice)\\b|\\(\\)"}]
+      "patterns": [{"name": "storage.type.builtin.lulang", "match": "\\b(?:i32|i64|f32|f64|bool|str|c_ptr|c_slice|c_mut_slice|c_fn)\\b|\\(\\)"}]
     },
     "operators": {
       "patterns": [{"name": "keyword.operator.lulang", "match": "(?:==|!=|~=|<=|>=|\\.\\.|[-+*/%=<>])"}]

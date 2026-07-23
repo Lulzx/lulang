@@ -460,7 +460,13 @@ fn inline_calls_unordered(function: &Function, callees: &[Function], budget: usi
                     continue;
                 };
                 let id = id as usize;
-                if id >= callees.len() || callees[id].exported || recursive.contains(&(id as u32)) {
+                if id >= callees.len()
+                    || callees[id].exported
+                    || callees[id].params.iter().any(|param| {
+                        matches!(callees[id].locals[*param as usize].ty, Type::CMutSlice(_))
+                    })
+                    || recursive.contains(&(id as u32))
+                {
                     continue;
                 }
                 let size: usize = callees[id]
@@ -611,6 +617,13 @@ fn inline_site(
                     },
                 });
                 for (index, target) in inout.iter().enumerate() {
+                    // Mutable C slices alias their caller-owned storage, so
+                    // writes are already visible and need no value copy-out.
+                    // The IR target is retained for mutation analysis and the
+                    // reference interpreter's value-backed slice model.
+                    if !callee.inouts[index] {
+                        continue;
+                    }
                     let Some(target) = target else { continue };
                     let param = callee.params[index];
                     let ty = callee.locals[param as usize].ty.clone();

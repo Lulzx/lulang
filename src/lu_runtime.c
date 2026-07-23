@@ -115,6 +115,72 @@ char *lu_arr_clone(const char *source) {
   return copy;
 }
 
+struct lu_owned_i64 {
+  long long *data;
+  long long length;
+  void *allocation;
+};
+
+struct lu_owned_f64 {
+  double *data;
+  long long length;
+  void *allocation;
+};
+
+struct lu_owned_i64 *lu_owned_i64_wrap(void *allocation) {
+  if (!allocation) return 0;
+  struct lu_owned_i64 *handle = malloc(sizeof *handle);
+  if (!handle) {
+    free(allocation);
+    return 0;
+  }
+  handle->data = (long long *)((char *)allocation + 8);
+  handle->length = *(long long *)allocation;
+  handle->allocation = allocation;
+  return handle;
+}
+
+struct lu_owned_f64 *lu_owned_f64_wrap(void *allocation) {
+  if (!allocation) return 0;
+  struct lu_owned_f64 *handle = malloc(sizeof *handle);
+  if (!handle) {
+    free(allocation);
+    return 0;
+  }
+  handle->data = (double *)((char *)allocation + 8);
+  handle->length = *(long long *)allocation;
+  handle->allocation = allocation;
+  return handle;
+}
+
+long long *lu_owned_i64_data(struct lu_owned_i64 *handle) {
+  return handle ? handle->data : 0;
+}
+
+long long lu_owned_i64_len(const struct lu_owned_i64 *handle) {
+  return handle ? handle->length : 0;
+}
+
+void lu_owned_i64_release(struct lu_owned_i64 *handle) {
+  if (!handle) return;
+  free(handle->allocation);
+  free(handle);
+}
+
+double *lu_owned_f64_data(struct lu_owned_f64 *handle) {
+  return handle ? handle->data : 0;
+}
+
+long long lu_owned_f64_len(const struct lu_owned_f64 *handle) {
+  return handle ? handle->length : 0;
+}
+
+void lu_owned_f64_release(struct lu_owned_f64 *handle) {
+  if (!handle) return;
+  free(handle->allocation);
+  free(handle);
+}
+
 long long lu_str_eq(const char *ap, long long al, const char *bp, long long bl) {
   if (al != bl) return 0;
   for (long long i = 0; i < al; i++)
@@ -300,6 +366,14 @@ typedef long long (*lu_ffi_i_fn)(
 typedef double (*lu_ffi_f_fn)(
     long long, long long, long long, long long, long long, long long,
     double, double, double, double, double, double, double, double);
+typedef struct { long long first, second; } lu_ffi_i_pair;
+typedef struct { double first, second; } lu_ffi_f_pair;
+typedef lu_ffi_i_pair (*lu_ffi_i_pair_fn)(
+    long long, long long, long long, long long, long long, long long,
+    double, double, double, double, double, double, double, double);
+typedef lu_ffi_f_pair (*lu_ffi_f_pair_fn)(
+    long long, long long, long long, long long, long long, long long,
+    double, double, double, double, double, double, double, double);
 
 static int lu_ffi_unpack(long long *control, long long control_len,
                          double *floats, long long float_len,
@@ -461,6 +535,46 @@ const char *lu_ffi_call_str(long long *control, long long control_len,
   if (out_length) *out_length = returned_length;
   return lu_str_copy(returned, returned_length);
 }
+
+long long lu_ffi_call_record_i(long long *control, long long control_len,
+                               double *floats, long long float_len,
+                               long long *output, long long output_len) {
+  long long ints[6] = {0};
+  double fp[8] = {0};
+  unsigned char *strings[6] = {0};
+  int string_count = 0;
+  long long integer_count = 0;
+  if (!lu_ffi_prepared || !output || output_len < 2 ||
+      !lu_ffi_unpack(control, control_len, floats, float_len, ints, fp,
+                     strings, &string_count, &integer_count)) return 0;
+  lu_ffi_i_pair result = ((lu_ffi_i_pair_fn)lu_ffi_prepared)(
+      ints[0], ints[1], ints[2], ints[3], ints[4], ints[5],
+      fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7]);
+  output[0] = result.first;
+  output[1] = result.second;
+  for (int i = 0; i < string_count; i++) free(strings[i]);
+  return 1;
+}
+
+long long lu_ffi_call_record_f(long long *control, long long control_len,
+                               double *floats, long long float_len,
+                               double *output, long long output_len) {
+  long long ints[6] = {0};
+  double fp[8] = {0};
+  unsigned char *strings[6] = {0};
+  int string_count = 0;
+  long long integer_count = 0;
+  if (!lu_ffi_prepared || !output || output_len < 2 ||
+      !lu_ffi_unpack(control, control_len, floats, float_len, ints, fp,
+                     strings, &string_count, &integer_count)) return 0;
+  lu_ffi_f_pair result = ((lu_ffi_f_pair_fn)lu_ffi_prepared)(
+      ints[0], ints[1], ints[2], ints[3], ints[4], ints[5],
+      fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7]);
+  output[0] = result.first;
+  output[1] = result.second;
+  for (int i = 0; i < string_count; i++) free(strings[i]);
+  return 1;
+}
 #else
 long long lu_ffi_prepare(const char *lib, long long ll,
                          const char *symbol, long long sl) {
@@ -493,6 +607,22 @@ const char *lu_ffi_call_str(long long *control, long long control_len,
   (void)control; (void)control_len; (void)floats; (void)float_len;
   if (out_length) *out_length = 0;
   return "";
+}
+
+long long lu_ffi_call_record_i(long long *control, long long control_len,
+                               double *floats, long long float_len,
+                               long long *output, long long output_len) {
+  (void)control; (void)control_len; (void)floats; (void)float_len;
+  (void)output; (void)output_len;
+  return 0;
+}
+
+long long lu_ffi_call_record_f(long long *control, long long control_len,
+                               double *floats, long long float_len,
+                               double *output, long long output_len) {
+  (void)control; (void)control_len; (void)floats; (void)float_len;
+  (void)output; (void)output_len;
+  return 0;
 }
 #endif
 

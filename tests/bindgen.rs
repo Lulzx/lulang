@@ -107,7 +107,7 @@ fn generated_imports_call_a_compiled_c_library() {
         String::from_utf8_lossy(&generated.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&generated.stderr).contains("built 3 C adapter shim(s)"),
+        String::from_utf8_lossy(&generated.stderr).contains("built 21 C adapter shim(s)"),
         "missing shim build report:\n{}",
         String::from_utf8_lossy(&generated.stderr)
     );
@@ -117,6 +117,25 @@ fn generated_imports_call_a_compiled_c_library() {
     assert!(generated_source.contains("fn bindgen_is_positive(value: i64): bool"));
     assert!(generated_source.contains("extern"));
     assert!(generated_source.contains("fn bindgen_pair_sum(value: bindgen_pair): f64"));
+    assert!(generated_source.contains("fn bindgen_slice_sum(values: c_slice[f64]): f64"));
+    assert!(generated_source.contains("fn bindgen_slice_bump(values: c_mut_slice[f64]): f64"));
+    assert!(
+        generated_source.contains("fn bindgen_apply(callback: c_fn[(i64)->i64], value: i64): i64")
+    );
+    assert!(generated_source.contains("fn bindgen_incrementer(): c_fn[(i64)->i64]"));
+    assert!(generated_source.contains("fn bindgen_make_pair(x: i64, y: i64): bindgen_pair"));
+    assert!(generated_source.contains("type bindgen_flags"));
+    assert!(!generated_source.contains("@c_layout type bindgen_flags"));
+    assert!(generated_source.contains("c_ptr[bindgen_value]"));
+    assert!(
+        generated_source.contains("fn bindgen_make_mixed(count: i64, scale: f32): bindgen_mixed")
+    );
+    assert!(
+        generated_source.contains("fn bindgen_make_flags(mode: i64, enabled: i64): bindgen_flags")
+    );
+    assert!(generated_source.contains(
+        "fn bindgen_variadic_sum_v_i64_i64_i64(count: i64, vararg0: i64, vararg1: i64, vararg2: i64): i64"
+    ));
     assert!(generated_source.contains("type bindgen_mixed"));
     assert!(generated_source.contains("count: i64"));
     assert!(generated_source.contains("scale: f32"));
@@ -129,7 +148,7 @@ fn generated_imports_call_a_compiled_c_library() {
         .expect("open generated bindings");
     write!(
         bindings_file,
-        "\nmain {{\n  print(bindgen_add(20, 22))\n  print(bindgen_scale(1.5, 2.0))\n  print(bindgen_half(9.0))\n  print(bindgen_increment_i32(41))\n  print(bindgen_is_positive(3))\n  print(bindgen_pair_sum(bindgen_pair {{ x: 1.25, y: 2.75 }}))\n  print(bindgen_mixed_value(bindgen_mixed {{ count: 3, scale: 1.5 }}))\n  let box = bindgen_box_new(99)\n  print(bindgen_box_read(box))\n  bindgen_box_free(box)\n}}\n"
+        "\nmain {{\n  print(bindgen_add(20, 22))\n  print(bindgen_scale(1.5, 2.0))\n  print(bindgen_half(9.0))\n  print(bindgen_increment_i32(41))\n  print(bindgen_is_positive(3))\n  print(bindgen_pair_sum(bindgen_pair {{ x: 1.25, y: 2.75 }}))\n  print(bindgen_mixed_value(bindgen_mixed {{ count: 3, scale: 1.5 }}))\n  let made_mixed = bindgen_make_mixed(8, 0.5)\n  print(made_mixed.count, made_mixed.scale)\n  let box = bindgen_box_new(99)\n  print(bindgen_box_read(box))\n  bindgen_box_free(box)\n  var values = arr(3, 2.0)\n  let snapshot = values\n  print(bindgen_slice_sum(values))\n  print(bindgen_slice_bump(values))\n  print(values[0])\n  print(snapshot[0])\n  print(bindgen_apply(bindgen_incrementer(), 41))\n  let pair = bindgen_make_pair(4, 5)\n  print(pair.x, pair.y)\n  print(bindgen_flags_score(bindgen_flags {{ mode: 3, enabled: 1 }}))\n  let made_flags = bindgen_make_flags(5, 1)\n  print(made_flags.mode, made_flags.enabled)\n  let tagged = bindgen_value_new(77)\n  print(bindgen_value_read(tagged))\n  bindgen_value_free(tagged)\n  print(bindgen_variadic_sum_v_i64_i64_i64(3, 10, 20, 12))\n}}\n"
     )
     .expect("append test program");
 
@@ -146,7 +165,7 @@ fn generated_imports_call_a_compiled_c_library() {
         );
         assert_eq!(
             String::from_utf8_lossy(&executed.stdout),
-            "42\n3\n4.5\n42\ntrue\n4\n4.5\n99\n",
+            "42\n3\n4.5\n42\ntrue\n4\n4.5\n8 0.5\n99\n6\n3\n3\n2\n42\n4 5\n13\n5 -1\n77\n42\n",
             "unexpected {mode} output"
         );
     }
@@ -173,7 +192,7 @@ fn generated_imports_call_a_compiled_c_library() {
     );
     assert_eq!(
         String::from_utf8_lossy(&executed.stdout),
-        "42\n3\n4.5\n42\ntrue\n4\n4.5\n99\n"
+        "42\n3\n4.5\n42\ntrue\n4\n4.5\n8 0.5\n99\n6\n3\n3\n2\n42\n4 5\n13\n5 -1\n77\n42\n"
     );
 
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -190,7 +209,7 @@ fn generated_imports_call_a_compiled_c_library() {
     );
     assert_eq!(
         String::from_utf8_lossy(&selfhost_interp.stdout),
-        "42\n3\n4.5\n42\ntrue\n4\n4.5\n99\n"
+        "42\n3\n4.5\n42\ntrue\n4\n4.5\n8 0.5\n99\n6\n3\n3\n2\n42\n4 5\n13\n5 -1\n77\n42\n"
     );
 
     let selfhost_executable = directory.join("bindgen_runtime_selfhost");
@@ -216,7 +235,7 @@ fn generated_imports_call_a_compiled_c_library() {
     );
     assert_eq!(
         String::from_utf8_lossy(&selfhost_output.stdout),
-        "42\n3\n4.5\n42\ntrue\n4\n4.5\n99\n"
+        "42\n3\n4.5\n42\ntrue\n4\n4.5\n8 0.5\n99\n6\n3\n3\n2\n42\n4 5\n13\n5 -1\n77\n42\n"
     );
 
     let _ = std::fs::remove_file(&bindings);

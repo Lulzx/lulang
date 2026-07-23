@@ -103,7 +103,7 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
         } else {
             if i + 1 < cs.len() {
                 let two: String = [c, cs[i + 1]].iter().collect();
-                if ["==", "!=", "<=", ">=", "~=", "..", "|>"].contains(&two.as_str()) {
+                if ["==", "!=", "<=", ">=", "~=", "..", "|>", "->"].contains(&two.as_str()) {
                     out.push(Tok::Sym(two));
                     i += 2;
                     continue;

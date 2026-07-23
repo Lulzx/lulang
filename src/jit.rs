@@ -578,7 +578,9 @@ impl<'a, 'b> Gen<'a, 'b> {
             }
             (CType::F32, CType::F64) => vec![self.b.ins().fdemote(types::F32, values[0])],
             (CType::F64, CType::F32) => vec![self.b.ins().fpromote(types::F64, values[0])],
-            (CType::CSlice(want), CType::Arr(got)) if want == got => {
+            (CType::CSlice(want), CType::Arr(got)) | (CType::CMutSlice(want), CType::Arr(got))
+                if want == got =>
+            {
                 let slots = self
                     .b
                     .ins()
@@ -1189,7 +1191,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                         self.gen_call(name, types, vals)?
                     }
                     Callee::Function(id) => self.gen_ir_user_call(*id, args, inout)?,
-                    Callee::Extern(id) => self.gen_ir_extern_call(*id, args)?,
+                    Callee::Extern(id) => self.gen_ir_extern_call(*id, args, inout)?,
                 })
             }
             InstKind::Field {
@@ -1248,9 +1250,26 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let base_id = *base;
                 let (base_ty, base) = value(*base)?;
                 let (_, index) = value(*index)?;
-                let (_, stored) = value(*stored)?;
+                let (stored_ty, stored) = value(*stored)?;
+                if let CType::CMutSlice(elem) = &base_ty {
+                    self.check_idx(index[0], base[1]);
+                    let components = comps(self.p, elem)?;
+                    if components.len() != 1 {
+                        return Err("c_mut_slice elements must have one ABI component".into());
+                    }
+                    let stored = self.coerce(elem, &stored_ty, stored)?;
+                    let offset = self
+                        .b
+                        .ins()
+                        .imul_imm(index[0], components[0].bytes() as i64);
+                    let address = self.b.ins().iadd(base[0], offset);
+                    self.b
+                        .ins()
+                        .store(MemFlags::trusted(), stored[0], address, 0);
+                    return Ok(None);
+                }
                 let CType::Arr(elem) = base_ty else {
-                    return Err("IR set-index on non-array".into());
+                    return Err("IR set-index on non-mutable array view".into());
                 };
                 let trusted =
                     self.cfg
@@ -1539,11 +1558,11 @@ impl<'a, 'b> Gen<'a, 'b> {
                 .uload8(types::I64, MemFlags::trusted(), addr, 0);
             return Ok((CType::I64, vec![byte]));
         }
-        if let CType::CSlice(elem) = base_ty {
+        if let CType::CSlice(elem) | CType::CMutSlice(elem) = base_ty {
             self.check_idx(index, base[1]);
             let components = comps(self.p, &elem)?;
             if components.len() != 1 {
-                return Err("c_slice elements must have one ABI component".into());
+                return Err("borrowed C slice elements must have one ABI component".into());
             }
             let offset = self.b.ins().imul_imm(index, components[0].bytes() as i64);
             let address = self.b.ins().iadd(base[0], offset);
@@ -1605,7 +1624,13 @@ impl<'a, 'b> Gen<'a, 'b> {
         let ret = info.ret.clone();
         let params = info.params.clone();
         let mut flat = Vec::new();
-        for ((got, vals), want) in args.into_iter().zip(&params) {
+        for (index, ((got, mut vals), want)) in args.into_iter().zip(&params).enumerate() {
+            if matches!(want, CType::CMutSlice(_)) && matches!(got, CType::Arr(_)) {
+                let unique = self.call_import("lu_arr_cow", &[vals[0]])[0];
+                let target = inout[index].ok_or("missing c_mut_slice borrow target")?;
+                self.define_ir_local(target, &[unique])?;
+                vals[0] = unique;
+            }
             let mut values = self.coerce(want, &got, vals)?;
             if decl.exported && matches!(want, CType::Arr(_)) {
                 values[0] = self.call_import("lu_arr_clone", &[values[0]])[0];
@@ -1644,12 +1669,19 @@ impl<'a, 'b> Gen<'a, 'b> {
         &mut self,
         id: ir::ExternId,
         args: Vec<(CType, Vec<Value>)>,
+        inout: &[Option<ir::LocalId>],
     ) -> Result<(CType, Vec<Value>), String> {
         let info = &self.externs[id as usize];
         let params = info.params.clone();
         let ret = info.ret.clone();
         let mut flat = Vec::new();
-        for ((got, values), want) in args.into_iter().zip(&params) {
+        for (index, ((got, mut values), want)) in args.into_iter().zip(&params).enumerate() {
+            if matches!(want, CType::CMutSlice(_)) && matches!(got, CType::Arr(_)) {
+                let unique = self.call_import("lu_arr_cow", &[values[0]])[0];
+                let target = inout[index].ok_or("missing c_mut_slice borrow target")?;
+                self.define_ir_local(target, &[unique])?;
+                values[0] = unique;
+            }
             let values = self.coerce(want, &got, values)?;
             match want {
                 CType::Arr(element) => {
@@ -1990,7 +2022,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             "len" => {
                 let elem = match &atys[0] {
                     CType::Arr(e) => e.as_ref().clone(),
-                    CType::CSlice(_) => {
+                    CType::CSlice(_) | CType::CMutSlice(_) => {
                         return Ok((CType::I64, vec![avals[0][1]]));
                     }
                     _ => return Err("`len` expects array".into()),

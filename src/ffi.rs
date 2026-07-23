@@ -81,6 +81,8 @@ pub fn resolve(lib: Option<&str>, symbol: &str) -> Result<usize, String> {
         "lu_ffi_call_f" => Some(lu_ffi_call_f as *const () as usize),
         "lu_ffi_call_f32" => Some(lu_ffi_call_f32 as *const () as usize),
         "lu_ffi_call_str" => Some(lu_ffi_call_str as *const () as usize),
+        "lu_ffi_call_record_i" => Some(lu_ffi_call_record_i as *const () as usize),
+        "lu_ffi_call_record_f" => Some(lu_ffi_call_record_f as *const () as usize),
         _ => None,
     };
     if let Some(pointer) = bridge {
@@ -374,6 +376,58 @@ pub unsafe extern "C" fn lu_ffi_call_str(
     }
 }
 
+pub unsafe extern "C" fn lu_ffi_call_record_i(
+    control: *mut i64,
+    control_length: i64,
+    floats: *mut f64,
+    float_length: i64,
+    output: *mut i64,
+    output_length: i64,
+) -> i64 {
+    let pointer = *PREPARED.get_or_init(|| Mutex::new(0)).lock().unwrap();
+    if output.is_null() || output_length < 2 || pointer == 0 {
+        return 0;
+    }
+    match unpack_call(control, control_length, floats, float_length) {
+        Ok((ints, float_registers, _strings, _, _)) => {
+            let pair = call_i64_pair(pointer, ints, float_registers);
+            *output = pair.first;
+            *output.add(1) = pair.second;
+            1
+        }
+        Err(error) => {
+            eprintln!("runtime error: {}", error);
+            0
+        }
+    }
+}
+
+pub unsafe extern "C" fn lu_ffi_call_record_f(
+    control: *mut i64,
+    control_length: i64,
+    floats: *mut f64,
+    float_length: i64,
+    output: *mut f64,
+    output_length: i64,
+) -> i64 {
+    let pointer = *PREPARED.get_or_init(|| Mutex::new(0)).lock().unwrap();
+    if output.is_null() || output_length < 2 || pointer == 0 {
+        return 0;
+    }
+    match unpack_call(control, control_length, floats, float_length) {
+        Ok((ints, float_registers, _strings, _, _)) => {
+            let pair = call_f64_pair(pointer, ints, float_registers);
+            *output = pair.first;
+            *output.add(1) = pair.second;
+            1
+        }
+        Err(error) => {
+            eprintln!("runtime error: {}", error);
+            0
+        }
+    }
+}
+
 type I64Call = unsafe extern "C" fn(
     i64,
     i64,
@@ -407,6 +461,53 @@ type F64Call = unsafe extern "C" fn(
     f64,
 ) -> f64;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct I64Pair {
+    pub first: i64,
+    pub second: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct F64Pair {
+    pub first: f64,
+    pub second: f64,
+}
+
+type I64PairCall = unsafe extern "C" fn(
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+) -> I64Pair;
+type F64PairCall = unsafe extern "C" fn(
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+) -> F64Pair;
+
 pub unsafe fn call_i64(pointer: usize, ints: [i64; 6], floats: [f64; 8]) -> i64 {
     let function: I64Call = std::mem::transmute(pointer);
     function(
@@ -430,4 +531,20 @@ pub unsafe fn call_f32(pointer: usize, ints: [i64; 6], floats: [f64; 8]) -> f32 
     // A scalar f32 return likewise arrives in the low 32 bits of the FP result.
     let raw = call_f64(pointer, ints, floats).to_bits();
     f32::from_bits(raw as u32)
+}
+
+pub unsafe fn call_i64_pair(pointer: usize, ints: [i64; 6], floats: [f64; 8]) -> I64Pair {
+    let function: I64PairCall = std::mem::transmute(pointer);
+    function(
+        ints[0], ints[1], ints[2], ints[3], ints[4], ints[5], floats[0], floats[1], floats[2],
+        floats[3], floats[4], floats[5], floats[6], floats[7],
+    )
+}
+
+pub unsafe fn call_f64_pair(pointer: usize, ints: [i64; 6], floats: [f64; 8]) -> F64Pair {
+    let function: F64PairCall = std::mem::transmute(pointer);
+    function(
+        ints[0], ints[1], ints[2], ints[3], ints[4], ints[5], floats[0], floats[1], floats[2],
+        floats[3], floats[4], floats[5], floats[6], floats[7],
+    )
 }

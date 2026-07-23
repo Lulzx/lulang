@@ -196,14 +196,38 @@ impl Parser {
     }
 
     fn parse_type_str(&mut self) -> Result<String, String> {
-        if self.is_sym("[") {
+        if self.is_sym("(") {
+            self.next();
+            self.eat_sym(")")?;
+            Ok("()".into())
+        } else if self.is_sym("[") {
             self.next();
             let inner = self.parse_type_str()?;
             self.eat_sym("]")?;
             Ok(format!("[{}]", inner))
         } else {
             let name = self.ident()?;
-            if (name == "c_ptr" || name == "c_slice") && self.is_sym("[") {
+            if name == "c_fn" && self.is_sym("[") {
+                self.next();
+                self.eat_sym("(")?;
+                let mut params = Vec::new();
+                if !self.is_sym(")") {
+                    loop {
+                        params.push(self.parse_type_str()?);
+                        if !self.is_sym(",") {
+                            break;
+                        }
+                        self.next();
+                    }
+                }
+                self.eat_sym(")")?;
+                self.eat_sym("->")?;
+                let ret = self.parse_type_str()?;
+                self.eat_sym("]")?;
+                Ok(format!("c_fn[({})->{}]", params.join(","), ret))
+            } else if (name == "c_ptr" || name == "c_slice" || name == "c_mut_slice")
+                && self.is_sym("[")
+            {
                 self.next();
                 let inner = if name == "c_ptr" && self.is_sym("(") {
                     self.next();

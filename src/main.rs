@@ -4,10 +4,12 @@ use lu_llvm::llvm;
 use lu_syntax::{fmt, lexer, parser};
 use lu_test::{interp, runtime as test_runtime};
 
+mod abi;
 mod benchmark;
 mod bindgen;
 mod docgen;
 mod package;
+mod sdk;
 
 use std::process::ExitCode;
 
@@ -23,6 +25,8 @@ fn usage() -> ExitCode {
          \x20      lu build --lib [--shared] [-o name] <file.lu>\n\
          \x20      lu build --target <wasm32-wasi|wasm32-web> [-o file.wasm] <file.lu>\n\
          \x20      lu build --emit-llvm [-o file.ll] <file.lu>\n\
+         \x20      lu abi check <old.json> <new.json>\n\
+         \x20      lu sdk <rust|cpp|julia|node|go|swift|r> [-o path] <manifest.json>\n\
          \x20      lu bindgen [--lib name] [--no-shims] [-o file.lu] <header.h>\n\
          \x20      lu test [--runs N] [--property name] <file.lu>\n\
          \x20      lu fmt [--check] <file.lu>"
@@ -48,6 +52,8 @@ fn main() -> ExitCode {
                 | "bench"
                 | "doc"
                 | "lsp"
+                | "abi"
+                | "sdk"
         )
     });
     let mode = match args.get(1) {
@@ -69,6 +75,25 @@ fn main() -> ExitCode {
     }
     if mode == "bench" {
         return package_result(benchmark::run(&args[2..]));
+    }
+    if mode == "abi" {
+        if args.get(2).map(String::as_str) != Some("check") || args.len() != 5 {
+            return usage();
+        }
+        return match abi::check(
+            std::path::Path::new(&args[3]),
+            std::path::Path::new(&args[4]),
+        ) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if mode == "sdk" {
+        return package_result(sdk::run(&args[2..]));
     }
     if mode == "lsp" {
         if args.len() != 2 {

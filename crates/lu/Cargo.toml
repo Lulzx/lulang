@@ -63,6 +63,18 @@ path = "../../tests/ludiff.rs"
 name = "selfhost_sync"
 path = "../../tests/selfhost_sync.rs"
 
+[[test]]
+name = "abi"
+path = "../../tests/abi.rs"
+
+[[test]]
+name = "sdk"
+path = "../../tests/sdk.rs"
+
+[[test]]
+name = "luimage"
+path = "../../tests/luimage.rs"
+
 [dependencies]
 lu_syntax.workspace = true
 lu_ir.workspace = true

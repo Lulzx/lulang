@@ -228,6 +228,33 @@ fn borrowed_c_slice_is_read_only_and_indexable_in_all_tiers() {
 }
 
 #[test]
+fn mutable_c_slice_updates_the_borrowed_array_in_all_host_tiers() {
+    assert_success(
+        "c_mut_slice",
+        "fn saxpy(a: f64, x: c_slice[f64], y: c_mut_slice[f64]) {\n\
+           for i in 0..len(y) {\n\
+             y[i] = a * x[i] + y[i]\n\
+           }\n\
+         }\n\
+         fn set_count(values: c_mut_slice[i64]) {\n\
+           values[1] = values[0] + 4\n\
+         }\n\
+         main {\n\
+           let x = [1.0, 2.0, 3.0]\n\
+           var y = [10.0, 20.0, 30.0]\n\
+           let snapshot = y\n\
+           saxpy(2.0, x, y)\n\
+           print(y[0], y[1], y[2])\n\
+           print(snapshot[0], snapshot[1], snapshot[2])\n\
+           var counts = arr(2, 3)\n\
+           set_count(counts)\n\
+           print(counts[0], counts[1])\n\
+         }\n",
+        b"12 24 36\n10 20 30\n3 7\n",
+    );
+}
+
+#[test]
 fn borrowed_c_slice_imports_cross_all_tiers() {
     let dir = CaseDir::new("ffi_c_slice", "");
     let library = dir.0.join(if cfg!(target_os = "macos") {
@@ -291,6 +318,71 @@ fn borrowed_c_slice_imports_cross_all_tiers() {
 }
 
 #[test]
+fn mutable_c_slice_imports_copy_writes_back_in_all_tiers() {
+    let dir = CaseDir::new("ffi_c_mut_slice", "");
+    let library = dir.0.join(if cfg!(target_os = "macos") {
+        "libc_mut_slice_fixture.dylib"
+    } else {
+        "libc_mut_slice_fixture.so"
+    });
+    let c_source = dir.0.join("c_mut_slice_fixture.c");
+    fs::write(
+        &c_source,
+        "#include <stdint.h>\n\
+         double c_mut_slice_bump(double *values, int64_t length) {\n\
+           for (int64_t i = 0; i < length; i++) values[i] += 1.0;\n\
+           return values[0];\n\
+         }\n",
+    )
+    .expect("write C fixture");
+    let mut compiler = Command::new("cc");
+    if cfg!(target_os = "macos") {
+        compiler.arg("-dynamiclib");
+    } else {
+        compiler.args(["-shared", "-fPIC"]);
+    }
+    let compiled = run(compiler.arg(&c_source).arg("-o").arg(&library));
+    assert!(
+        compiled.status.success(),
+        "compile c_mut_slice fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::write(
+        dir.source(),
+        format!(
+            "extern {:?} fn c_mut_slice_bump(values: c_mut_slice[f64]): f64\n\
+             main {{\n\
+               var values = arr(3, 2.0)\n\
+               let snapshot = values\n\
+               print(c_mut_slice_bump(values))\n\
+               print(values[0], values[1], values[2])\n\
+               print(snapshot[0], snapshot[1], snapshot[2])\n\
+             }}\n",
+            library.to_string_lossy()
+        ),
+    )
+    .expect("write lulang fixture");
+
+    let outputs = [
+        ("interpreter", host("interp", &dir.source())),
+        ("JIT", host("run", &dir.source())),
+        ("AOT", aot(&dir)),
+        ("self-hosted", selfhost(&dir.source())),
+    ];
+    for (backend, output) in outputs {
+        assert!(
+            output.status.success(),
+            "c_mut_slice import failed in {backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout, b"3\n3 3 3\n2 2 2\n",
+            "c_mut_slice import disagreed in {backend}"
+        );
+    }
+}
+
+#[test]
 fn by_value_c_layout_imports_use_the_portable_register_subset() {
     let dir = CaseDir::new("ffi_c_layout_value", "");
     let library = dir.0.join(if cfg!(target_os = "macos") {
@@ -305,7 +397,9 @@ fn by_value_c_layout_imports_use_the_portable_register_subset() {
          typedef struct Vec2 { double x; double y; } Vec2;\n\
          typedef struct Span { int64_t start; int64_t length; } Span;\n\
          double vec2_sum(Vec2 value) { return value.x + value.y; }\n\
-         int64_t span_end(Span value) { return value.start + value.length; }\n",
+         int64_t span_end(Span value) { return value.start + value.length; }\n\
+         Vec2 vec2_make(double x, double y) { Vec2 value = {x, y}; return value; }\n\
+         Span span_make(int64_t start, int64_t length) { Span value = {start, length}; return value; }\n",
     )
     .expect("write C fixture");
     let mut compiler = Command::new("cc");
@@ -327,9 +421,16 @@ fn by_value_c_layout_imports_use_the_portable_register_subset() {
              @c_layout type Span {{ start: i64, length: i64 }}\n\
              extern {:?} fn vec2_sum(value: Vec2): f64\n\
              extern {:?} fn span_end(value: Span): i64\n\
+             extern {:?} fn vec2_make(x: f64, y: f64): Vec2\n\
+             extern {:?} fn span_make(start: i64, length: i64): Span\n\
              main {{\n\
                print(vec2_sum(Vec2 {{ 2.5, 4.5 }}), span_end(Span {{ 7, 8 }}))\n\
+               let point = vec2_make(1.25, 3.75)\n\
+               let span = span_make(11, 9)\n\
+               print(point.x, point.y, span.start, span.length)\n\
              }}\n",
+            library.to_string_lossy(),
+            library.to_string_lossy(),
             library.to_string_lossy(),
             library.to_string_lossy()
         ),
@@ -349,9 +450,71 @@ fn by_value_c_layout_imports_use_the_portable_register_subset() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(
-            output.stdout, b"7 15\n",
+            output.stdout, b"7 15\n1.25 3.75 11 9\n",
             "c_layout value import disagreed in {backend}"
         );
+    }
+}
+
+#[test]
+fn typed_c_function_pointers_cross_imports() {
+    let dir = CaseDir::new("ffi_callback", "");
+    let library = dir.0.join(if cfg!(target_os = "macos") {
+        "libcallback_fixture.dylib"
+    } else {
+        "libcallback_fixture.so"
+    });
+    let c_source = dir.0.join("callback_fixture.c");
+    fs::write(
+        &c_source,
+        "#include <stdint.h>\n\
+         typedef int64_t (*unary_i64)(int64_t);\n\
+         static int64_t increment(int64_t value) { return value + 1; }\n\
+         unary_i64 get_increment(void) { return increment; }\n\
+         int64_t apply_callback(unary_i64 callback, int64_t value) {\n\
+           return callback(value);\n\
+         }\n",
+    )
+    .expect("write callback C fixture");
+    let mut compiler = Command::new("cc");
+    if cfg!(target_os = "macos") {
+        compiler.arg("-dynamiclib");
+    } else {
+        compiler.args(["-shared", "-fPIC"]);
+    }
+    let compiled = run(compiler.arg(&c_source).arg("-o").arg(&library));
+    assert!(
+        compiled.status.success(),
+        "compile callback fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::write(
+        dir.source(),
+        format!(
+            "extern {:?} fn get_increment(): c_fn[(i64) -> i64]\n\
+             extern {:?} fn apply_callback(callback: c_fn[(i64) -> i64], value: i64): i64\n\
+             main {{\n\
+               let callback = get_increment()\n\
+               print(apply_callback(callback, 41))\n\
+             }}\n",
+            library.to_string_lossy(),
+            library.to_string_lossy()
+        ),
+    )
+    .expect("write callback Lulang fixture");
+
+    for (backend, output) in [
+        ("interpreter", host("interp", &dir.source())),
+        ("JIT", host("run", &dir.source())),
+        ("AOT", aot(&dir)),
+        ("self-hosted", selfhost(&dir.source())),
+    ] {
+        assert!(
+            output.status.success(),
+            "callback import failed in {backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"42\n", "callback disagreed in {backend}");
     }
 }
 

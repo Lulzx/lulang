@@ -31,6 +31,7 @@ fn is_two_sym(a: i64, b: i64): bool {
   if b != '=' {
     if a == '.' and b == '.' { return true }
     if a == '|' and b == '>' { return true }
+    if a == '-' and b == '>' { return true }
     return false
   }
   return a == '=' or a == '!' or a == '<' or a == '>' or a == '~'
@@ -420,6 +421,11 @@ fn parse_stmt(inout p: P): i64 {
 // ---------- declarations ----------
 
 fn parse_type(inout p: P): i64 {
+  if cur_is_sym(p, "(") {
+    p.pos = p.pos + 1
+    expect_sym(p, ")")
+    return 4
+  }
   if cur_is_sym(p, "[") {
     p.pos = p.pos + 1
     let t = parse_type(p)
@@ -433,6 +439,12 @@ fn parse_type(inout p: P): i64 {
     expect_sym(p, "]")
     return inner + 48
   }
+  if t == "c_mut_slice" {
+    expect_sym(p, "[")
+    let inner = parse_type(p)
+    expect_sym(p, "]")
+    return inner + 64
+  }
   if t == "c_ptr" {
     expect_sym(p, "[")
     var inner = 4
@@ -444,6 +456,27 @@ fn parse_type(inout p: P): i64 {
     }
     expect_sym(p, "]")
     return inner + 32
+  }
+  if t == "c_fn" {
+    expect_sym(p, "[")
+    expect_sym(p, "(")
+    var signature = 17
+    if not cur_is_sym(p, ")") {
+      var more = true
+      while more {
+        signature = (signature * 257 + parse_type(p)) % 1000000007
+        if cur_is_sym(p, ",") {
+          p.pos = p.pos + 1
+        } else {
+          more = false
+        }
+      }
+    }
+    expect_sym(p, ")")
+    expect_sym(p, "->")
+    signature = (signature * 263 + parse_type(p)) % 1000000007
+    expect_sym(p, "]")
+    return 5120 + signature
   }
   if t == "i64" or t == "i32" { return 0 }
   if t == "f64" { return 1 }
@@ -580,6 +613,7 @@ fn tname(t: i64): str {
   if t == 9 { return "[f64]" }
   if t == 10 { return "[bool]" }
   if t == 11 { return "[str]" }
+  if t >= 64 { return "c_mut_slice[..]" }
   if t >= 48 { return "c_slice[..]" }
   if t >= 32 { return "c_ptr[..]" }
   if t >= 16 { return "[[..]]" }
@@ -587,7 +621,7 @@ fn tname(t: i64): str {
 }
 
 fn compat(expect: i64, actual: i64): bool {
-  return expect == actual or ((expect == 1 or expect == 5) and (actual == 0 or actual == 1 or actual == 5))
+  return expect == actual or ((expect == 1 or expect == 5) and (actual == 0 or actual == 1 or actual == 5)) or (expect >= 48 and expect < 64 and actual >= 8 and actual < 32 and expect - 48 == actual - 8) or (expect >= 64 and expect < 80 and actual >= 8 and actual < 32 and expect - 64 == actual - 8)
 }
 
 fn is_num(t: i64): bool { return t == 0 or t == 1 or t == 5 }
@@ -714,7 +748,7 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
   for i in 0..na {
     if c.err == 0 {
       let pt = p.ptype[p.fpo[f] + i]
-      if p.pmut[p.fpo[f] + i] == 1 {
+      if p.pmut[p.fpo[f] + i] == 1 or (pt >= 64 and pt < 80) {
         // inout: the arg must be a mutable variable of the exact type
         let an = p.en[argv[i]]
         if an.kind == EK.EIdent {
@@ -727,7 +761,7 @@ fn check_call(p: P, inout c: C, e: i64): i64 {
               print("type error: inout arg", i + 1, "of", name, "needs a var,", an.text, "is immutable")
               c.err = 1
             } else {
-              if c.stype[si] != pt {
+              if (p.pmut[p.fpo[f] + i] == 1 and c.stype[si] != pt) or (pt >= 64 and pt < 80 and not compat(pt, c.stype[si])) {
                 print("type error: inout arg", i + 1, "of", name, "must be exactly", tname(pt), "got", tname(c.stype[si]))
                 c.err = 1
               }
@@ -824,7 +858,8 @@ fn check_expr(p: P, inout c: C, e: i64): i64 {
       c.err = 1
       return 5
     }
-    if bt >= 48 { return bt - 48 }
+    if bt >= 64 and bt < 80 { return bt - 64 }
+    if bt >= 48 and bt < 64 { return bt - 48 }
     if bt >= 8 and bt < 32 { return bt - 8 }
     if bt == 3 { return 0 }
     print("type error: cannot index into", tname(bt))
@@ -889,12 +924,19 @@ fn check_stmt(p: P, inout c: C, s: i64, ret: i64): i64 {
         c.err = 1
         return 4
       }
-      if bt < 8 {
+      if bt >= 48 and bt < 64 {
+        print("type error: borrowed c_slice values are read-only")
+        c.err = 1
+        return 4
+      }
+      if not (bt >= 8 and bt < 32) and not (bt >= 64 and bt < 80) {
         print("type error: cannot index into", tname(bt))
         c.err = 1
         return 4
       }
-      if not compat(bt - 8, vt) {
+      var et = bt - 8
+      if bt >= 64 { et = bt - 64 }
+      if not compat(et, vt) {
         print("type error: cannot store", tname(vt), "in", tname(bt))
         c.err = 1
         return 4
@@ -981,6 +1023,7 @@ fn check_fn(p: P, inout c: C, f: i64) {
   for i in 0..p.fnp[f] {
     var mutable = p.pmut[p.fpo[f] + i]
     if p.fexported[f] == 1 and p.ptype[p.fpo[f] + i] >= 8 { mutable = 1 }
+    if p.ptype[p.fpo[f] + i] >= 64 and p.ptype[p.fpo[f] + i] < 80 { mutable = 1 }
     define(c, p.pname[p.fpo[f] + i], p.ptype[p.fpo[f] + i], mutable)
   }
   let ret = p.fret[f]

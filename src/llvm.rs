@@ -214,6 +214,17 @@ fn emit_export_wrapper(
              \x20 store i64 %wrapper_str_len, ptr {length_out}\n\
              \x20 ret ptr %wrapper_str_ptr\n}}\n"
         );
+    } else if let CType::Arr(element) = &function.ret {
+        let wrapper = match element.as_ref() {
+            CType::I64 => "lu_owned_i64_wrap",
+            CType::F64 => "lu_owned_f64_wrap",
+            _ => return Err("owned export results require i64 or f64 arrays".into()),
+        };
+        let _ = writeln!(
+            out,
+            "  %wrapper_owned_result = call ptr @{wrapper}(ptr %wrapper_result)\n\
+             \x20 ret ptr %wrapper_owned_result\n}}\n"
+        );
     } else if ret_components.is_empty() {
         out.push_str("  ret void\n}\n\n");
     } else {
@@ -497,6 +508,8 @@ fn build_output(
          declare void @lu_print_sep()\ndeclare void @lu_print_nl()\n\
          declare ptr @lu_arr_new_raw(i64, i64)\n\
          declare ptr @lu_arr_clone(ptr)\n\
+         declare ptr @lu_owned_i64_wrap(ptr)\n\
+         declare ptr @lu_owned_f64_wrap(ptr)\n\
          declare i64 @lu_str_eq(ptr, i64, ptr, i64) #0\n\
          declare ptr @lu_str_copy(ptr, i64)\n\
          declare ptr @lu_arr_new_f64(i64, double)\ndeclare ptr @lu_arr_new_i64(i64, i64)\n\
@@ -1177,9 +1190,41 @@ impl<'a> Emit<'a> {
                 let base_id = *base;
                 let base = value(*base)?;
                 let index = value(*index)?;
-                let stored = value(*stored)?;
+                let mut stored = value(*stored)?;
+                if let CType::CMutSlice(elem) = &base.ty {
+                    stored = self.coerce_ev(stored, elem)?;
+                    let bad = self.t();
+                    self.line(format!(
+                        "{} = icmp uge i64 {}, {}",
+                        bad, index.regs[0], base.regs[1]
+                    ));
+                    let fail = self.l();
+                    let ok = self.l();
+                    self.line(format!("br i1 {}, label %{}, label %{}", bad, fail, ok));
+                    self.label(&fail);
+                    self.line(format!(
+                        "call void @lu_oob(i64 {}, i64 {})",
+                        index.regs[0], base.regs[1]
+                    ));
+                    self.line("unreachable".into());
+                    self.label(&ok);
+                    let components = lty(self.p, elem)?;
+                    if components.len() != 1 {
+                        return Err("c_mut_slice elements must have one ABI component".into());
+                    }
+                    let address = self.t();
+                    self.line(format!(
+                        "{} = getelementptr {}, ptr {}, i64 {}",
+                        address, components[0], base.regs[0], index.regs[0]
+                    ));
+                    self.line(format!(
+                        "store {} {}, ptr {}",
+                        components[0], stored.regs[0], address
+                    ));
+                    return Ok(None);
+                }
                 let CType::Arr(elem) = &base.ty else {
-                    return Err("IR set-index on non-array".into());
+                    return Err("IR set-index on non-mutable array view".into());
                 };
                 let trusted =
                     self.cfg
@@ -1419,7 +1464,7 @@ impl<'a> Emit<'a> {
                 regs: vec![out],
             });
         }
-        if let CType::CSlice(elem) = base.ty {
+        if let CType::CSlice(elem) | CType::CMutSlice(elem) = base.ty {
             let bad = self.t();
             self.line(format!(
                 "{} = icmp uge i64 {}, {}",
@@ -1437,7 +1482,7 @@ impl<'a> Emit<'a> {
             self.label(&ok);
             let components = lty(self.p, &elem)?;
             if components.len() != 1 {
-                return Err("c_slice elements must have one ABI component".into());
+                return Err("borrowed C slice elements must have one ABI component".into());
             }
             let address = self.t();
             self.line(format!(
@@ -1660,9 +1705,25 @@ impl<'a> Emit<'a> {
             declaration.name,
             parts.join(", ")
         ));
+        let registers = if components.len() <= 1 {
+            vec![result]
+        } else {
+            let aggregate = comps_ty(&components);
+            let mut registers = Vec::new();
+            for (index, component) in components.iter().enumerate() {
+                let register = self.t();
+                self.line(format!(
+                    "{} = extractvalue {} {}, {}",
+                    register, aggregate, result, index
+                ));
+                let _ = component;
+                registers.push(register);
+            }
+            registers
+        };
         Ok(EV {
             ty: declaration.ret.clone(),
-            regs: vec![result],
+            regs: registers,
         })
     }
 
@@ -1762,6 +1823,7 @@ impl<'a> Emit<'a> {
             }
             (CType::F64, CType::F32) => self.to_f64(&value)?,
             (CType::CSlice(want_element), CType::Arr(got_element))
+            | (CType::CMutSlice(want_element), CType::Arr(got_element))
                 if want_element == got_element =>
             {
                 let slots = self.t();
@@ -1780,7 +1842,7 @@ impl<'a> Emit<'a> {
                     data, value.regs[0]
                 ));
                 return Ok(EV {
-                    ty: CType::CSlice(want_element.clone()),
+                    ty: want.clone(),
                     regs: vec![data, length],
                 });
             }
@@ -2172,7 +2234,7 @@ impl<'a> Emit<'a> {
             "len" => {
                 let elem = match &args[0].ty {
                     CType::Arr(e) => e.as_ref().clone(),
-                    CType::CSlice(_) => {
+                    CType::CSlice(_) | CType::CMutSlice(_) => {
                         return Ok(EV {
                             ty: CType::I64,
                             regs: vec![args[0].regs[1].clone()],

@@ -12,7 +12,9 @@ pub enum Type {
     Unit,
     Arr(Box<Type>),
     CSlice(Box<Type>),
+    CMutSlice(Box<Type>),
     CPtr(Box<Type>),
+    CFn(Vec<Type>, Box<Type>),
     Rec(usize),
     Enum(usize),
 }
@@ -26,12 +28,29 @@ fn writes_var(p: &Program, e: ExprId, name: &str) -> bool {
         Expr::Call(fname, args) => {
             if let Some(f) = p.find_fn(fname) {
                 for (j, &a) in args.iter().enumerate() {
-                    if f.inouts.get(j).copied().unwrap_or(false) {
+                    let mutable_borrow = f.inouts.get(j).copied().unwrap_or(false)
+                        || f.params
+                            .get(j)
+                            .and_then(|(_, ty)| resolve_type(p, ty).ok())
+                            .is_some_and(|ty| matches!(ty, Type::CMutSlice(_)));
+                    if mutable_borrow {
                         if let Expr::Ident(n) = p.expr(a) {
                             if n == name {
                                 return true;
                             }
                         }
+                    }
+                }
+            }
+            if let Some(f) = p.externs.iter().find(|f| f.name == *fname) {
+                for (j, &a) in args.iter().enumerate() {
+                    let mutable_borrow = f
+                        .params
+                        .get(j)
+                        .and_then(|(_, ty)| resolve_type(p, ty).ok())
+                        .is_some_and(|ty| matches!(ty, Type::Arr(_) | Type::CMutSlice(_)));
+                    if mutable_borrow && matches!(p.expr(a), Expr::Ident(n) if n == name) {
+                        return true;
                     }
                 }
             }
@@ -67,10 +86,20 @@ pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
             {
                 Ok(Type::CSlice(Box::new(resolve_type(p, inner)?)))
             } else if let Some(inner) = s
+                .strip_prefix("c_mut_slice[")
+                .and_then(|inner| inner.strip_suffix(']'))
+            {
+                Ok(Type::CMutSlice(Box::new(resolve_type(p, inner)?)))
+            } else if let Some(inner) = s
                 .strip_prefix("c_ptr[")
                 .and_then(|inner| inner.strip_suffix(']'))
             {
                 Ok(Type::CPtr(Box::new(resolve_type(p, inner)?)))
+            } else if let Some(inner) = s
+                .strip_prefix("c_fn[(")
+                .and_then(|inner| inner.strip_suffix(']'))
+            {
+                parse_c_fn_type(p, inner)
             } else if let Some(ei) = p.enums.iter().position(|e| e.name == s) {
                 Ok(Type::Enum(ei))
             } else {
@@ -82,6 +111,43 @@ pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
             }
         }
     }
+}
+
+fn parse_c_fn_type(p: &Program, inner: &str) -> Result<Type, String> {
+    let close = inner
+        .find(")->")
+        .ok_or_else(|| format!("invalid callback type `c_fn[({inner}]`"))?;
+    let params = &inner[..close];
+    let ret = &inner[close + 3..];
+    let params = if params.is_empty() {
+        Vec::new()
+    } else {
+        split_type_list(params)
+            .into_iter()
+            .map(|ty| resolve_type(p, ty))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let ret = resolve_type(p, ret)?;
+    Ok(Type::CFn(params, Box::new(ret)))
+}
+
+fn split_type_list(source: &str) -> Vec<&str> {
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut values = Vec::new();
+    for (index, byte) in source.bytes().enumerate() {
+        match byte {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth -= 1,
+            b',' if depth == 0 => {
+                values.push(&source[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    values.push(&source[start..]);
+    values
 }
 
 pub struct Checker<'a> {
@@ -142,11 +208,20 @@ impl<'a> Checker<'a> {
         };
         for (record_index, record) in p.types.iter().enumerate() {
             for (field, source) in &record.fields {
-                if matches!(c.resolve(source)?, Type::CSlice(_)) {
-                    return Err(format!(
-                        "record field `{}.{}` cannot store a borrowed c_slice",
-                        record.name, field
-                    ));
+                match c.resolve(source)? {
+                    Type::CSlice(_) => {
+                        return Err(format!(
+                            "record field `{}.{}` cannot store a borrowed c_slice",
+                            record.name, field
+                        ))
+                    }
+                    Type::CMutSlice(_) => {
+                        return Err(format!(
+                            "record field `{}.{}` cannot store a borrowed c_mut_slice",
+                            record.name, field
+                        ))
+                    }
+                    _ => {}
                 }
             }
             if record.c_layout {
@@ -161,6 +236,8 @@ impl<'a> Checker<'a> {
                     | "lu_ffi_call_f"
                     | "lu_ffi_call_f32"
                     | "lu_ffi_call_str"
+                    | "lu_ffi_call_record_i"
+                    | "lu_ffi_call_record_f"
             );
             if e.name.starts_with("lu_") && !selfhost_bridge {
                 return Err(format!(
@@ -186,7 +263,7 @@ impl<'a> Checker<'a> {
                 .map(|(_, t)| c.resolve(t))
                 .collect::<Result<Vec<_>, _>>()?;
             let ret = c.resolve(&e.ret)?;
-            c.validate_ffi_signature(&e.name, &params, &ret)?;
+            c.validate_ffi_signature(&e.name, &params, &ret, false)?;
             if c.sigs
                 .insert(e.name.clone(), (params, e.inouts.clone(), ret))
                 .is_some()
@@ -200,21 +277,30 @@ impl<'a> Checker<'a> {
             let params = params?;
             let ret = c.resolve(&f.ret)?;
             for param in &params {
-                if let Type::CSlice(element) = param {
+                if let Type::CSlice(element) | Type::CMutSlice(element) = param {
                     if !matches!(element.as_ref(), Type::I64 | Type::F64) {
                         return Err(format!(
-                            "function `{}` has unsupported c_slice element {}; allowed elements are i64 and f64",
+                            "function `{}` has unsupported borrowed C slice element {}; allowed elements are i64 and f64",
                             f.name,
                             c.name(element)
                         ));
                     }
                 }
             }
-            if matches!(ret, Type::CSlice(_)) {
-                return Err(format!(
-                    "function `{}` cannot return a borrowed c_slice",
-                    f.name
-                ));
+            match ret {
+                Type::CSlice(_) => {
+                    return Err(format!(
+                        "function `{}` cannot return a borrowed c_slice",
+                        f.name
+                    ))
+                }
+                Type::CMutSlice(_) => {
+                    return Err(format!(
+                        "function `{}` cannot return a borrowed c_mut_slice",
+                        f.name
+                    ))
+                }
+                _ => {}
             }
             if f.exported {
                 if f.has_inout() {
@@ -223,7 +309,7 @@ impl<'a> Checker<'a> {
                         f.name
                     ));
                 }
-                c.validate_ffi_signature(&f.name, &params, &ret)?;
+                c.validate_ffi_signature(&f.name, &params, &ret, true)?;
             }
             if c.sigs
                 .insert(f.name.clone(), (params, f.inouts.clone(), ret))
@@ -277,10 +363,34 @@ impl<'a> Checker<'a> {
                 {
                     Ok(Type::CSlice(Box::new(self.resolve(inner)?)))
                 } else if let Some(inner) = s
+                    .strip_prefix("c_mut_slice[")
+                    .and_then(|inner| inner.strip_suffix(']'))
+                {
+                    Ok(Type::CMutSlice(Box::new(self.resolve(inner)?)))
+                } else if let Some(inner) = s
                     .strip_prefix("c_ptr[")
                     .and_then(|inner| inner.strip_suffix(']'))
                 {
                     Ok(Type::CPtr(Box::new(self.resolve(inner)?)))
+                } else if let Some(inner) = s
+                    .strip_prefix("c_fn[(")
+                    .and_then(|inner| inner.strip_suffix(']'))
+                {
+                    let close = inner
+                        .find(")->")
+                        .ok_or_else(|| format!("invalid callback type `{s}`"))?;
+                    let params = if close == 0 {
+                        Vec::new()
+                    } else {
+                        split_type_list(&inner[..close])
+                            .into_iter()
+                            .map(|ty| self.resolve(ty))
+                            .collect::<Result<Vec<_>, _>>()?
+                    };
+                    Ok(Type::CFn(
+                        params,
+                        Box::new(self.resolve(&inner[close + 3..])?),
+                    ))
                 } else if let Some(ei) = self.p.enums.iter().position(|e| e.name == s) {
                     Ok(Type::Enum(ei))
                 } else {
@@ -298,8 +408,10 @@ impl<'a> Checker<'a> {
         name: &str,
         params: &[Type],
         ret: &Type,
+        exported: bool,
     ) -> Result<(), String> {
         for param in params {
+            self.validate_callback_types(name, param)?;
             self.ffi_param_classes(param).map_err(|why| {
                 format!(
                     "FFI signature `{}` has unsupported parameter: {}",
@@ -307,7 +419,19 @@ impl<'a> Checker<'a> {
                 )
             })?;
         }
-        if !matches!(
+        self.validate_callback_types(name, ret)?;
+        if exported
+            && matches!(
+                ret,
+                Type::Arr(element) if matches!(element.as_ref(), Type::I64 | Type::F64)
+            )
+        {
+            // Export-only owned result handles. The generated C wrapper owns
+            // the returned allocation and never exposes compiler array layout.
+        } else if matches!(ret, Type::Rec(record) if self.ffi_record_classes(*record).is_ok()) {
+            // The same homogeneous one/two-register aggregate subset is
+            // portable in both argument and result position.
+        } else if !matches!(
             ret,
             Type::Unit
                 | Type::I64
@@ -316,10 +440,11 @@ impl<'a> Checker<'a> {
                 | Type::Bool
                 | Type::Enum(_)
                 | Type::CPtr(_)
+                | Type::CFn(_, _)
                 | Type::Str
         ) {
             return Err(format!(
-                "FFI signature `{}` has unsupported return type; returns are limited to (), i64, f32, f64, bool, enums, c_ptr[T], and str",
+                "FFI signature `{}` has unsupported return type; returns are limited to (), scalars, enums, c_ptr[T], c_fn[(...) -> T], str, supported @c_layout records, and exported [i64]/[f64] owned results",
                 name
             ));
         }
@@ -339,19 +464,34 @@ impl<'a> Checker<'a> {
         Ok(())
     }
 
+    fn validate_callback_types(&self, owner: &str, ty: &Type) -> Result<(), String> {
+        if let Type::CFn(params, ret) = ty {
+            self.validate_ffi_signature(
+                &format!("callback nested in `{owner}`"),
+                params,
+                ret,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
     fn ffi_param_classes(&self, ty: &Type) -> Result<(usize, usize), String> {
         match ty {
-            Type::I64 | Type::Bool | Type::Enum(_) | Type::CPtr(_) => Ok((1, 0)),
+            Type::I64 | Type::Bool | Type::Enum(_) | Type::CPtr(_) | Type::CFn(_, _) => Ok((1, 0)),
             Type::F32 | Type::F64 => Ok((0, 1)),
             Type::Str => Ok((2, 0)),
             Type::CSlice(element) if matches!(element.as_ref(), Type::I64 | Type::F64) =>
             {
                 Ok((2, 0))
             }
+            Type::CMutSlice(element) if matches!(element.as_ref(), Type::I64 | Type::F64) => {
+                Ok((2, 0))
+            }
             Type::Arr(element) if matches!(element.as_ref(), Type::I64 | Type::F64) => Ok((2, 0)),
             Type::Rec(record) => self.ffi_record_classes(*record),
             _ => Err(
-                "allowed boundary types are i64, f32, f64, bool, enums, c_ptr[T], c_slice[i64|f64], str, [i64], [f64], and supported @c_layout records"
+                "allowed boundary types are i64, f32, f64, bool, enums, c_ptr[T], c_slice[i64|f64], c_mut_slice[i64|f64], str, [i64], [f64], and supported @c_layout records"
                     .into(),
             ),
         }
@@ -372,7 +512,9 @@ impl<'a> Checker<'a> {
         ) -> Result<(), String> {
             for (_, source) in &checker.p.types[record_index].fields {
                 match checker.resolve(source)? {
-                    Type::I64 | Type::Bool | Type::CPtr(_) => classes.push(false),
+                    Type::I64 | Type::Bool | Type::CPtr(_) | Type::CFn(_, _) => {
+                        classes.push(false)
+                    }
                     Type::F64 => classes.push(true),
                     _ => {
                         return Err(
@@ -462,7 +604,17 @@ impl<'a> Checker<'a> {
             Type::Unit => "()".into(),
             Type::Arr(t) => format!("[{}]", self.name(t)),
             Type::CSlice(t) => format!("c_slice[{}]", self.name(t)),
+            Type::CMutSlice(t) => format!("c_mut_slice[{}]", self.name(t)),
             Type::CPtr(t) => format!("c_ptr[{}]", self.name(t)),
+            Type::CFn(params, ret) => format!(
+                "c_fn[({})->{}]",
+                params
+                    .iter()
+                    .map(|ty| self.name(ty))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                self.name(ret)
+            ),
             Type::Rec(i) => self.p.types[*i].name.clone(),
             Type::Enum(i) => self.p.enums[*i].name.clone(),
         }
@@ -476,6 +628,10 @@ impl<'a> Checker<'a> {
             || matches!(
                 (expected, actual),
                 (Type::CSlice(expected), Type::Arr(actual)) if expected == actual
+            )
+            || matches!(
+                (expected, actual),
+                (Type::CMutSlice(expected), Type::Arr(actual)) if expected == actual
             )
     }
 
@@ -498,7 +654,8 @@ impl<'a> Checker<'a> {
         for (i, (n, t)) in f.params.iter().enumerate() {
             let ty = self.resolve(t)?;
             let mutable = f.inouts.get(i).copied().unwrap_or(false)
-                || (f.exported && matches!(&ty, Type::Arr(_)));
+                || (f.exported && matches!(&ty, Type::Arr(_)))
+                || matches!(&ty, Type::CMutSlice(_));
             scope.insert(n.clone(), (ty, mutable));
         }
         let mut scopes = vec![scope];
@@ -573,6 +730,15 @@ impl<'a> Checker<'a> {
                             }
                             Type::CSlice(_) => {
                                 return Err("borrowed c_slice values are read-only".into())
+                            }
+                            Type::CMutSlice(el) => {
+                                if !Self::compat(&el, &vt) {
+                                    return Err(format!(
+                                        "cannot store {} in c_mut_slice[{}]",
+                                        self.name(&vt),
+                                        self.name(&el)
+                                    ));
+                                }
                             }
                             t => return Err(format!("cannot index into {}", self.name(&t))),
                         }
@@ -831,7 +997,7 @@ impl<'a> Checker<'a> {
                     return Err("array index must be i64".into());
                 }
                 match self.check_expr(*a, scopes)? {
-                    Type::Arr(el) | Type::CSlice(el) => Ok(*el),
+                    Type::Arr(el) | Type::CSlice(el) | Type::CMutSlice(el) => Ok(*el),
                     Type::Str => Ok(Type::I64), // byte access
                     t => Err(format!("cannot index into {}", self.name(&t))),
                 }
@@ -1054,7 +1220,9 @@ impl<'a> Checker<'a> {
                     "len" => {
                         need(1)?;
                         match &ats[0] {
-                            Type::Arr(_) | Type::CSlice(_) | Type::Str => Ok(Type::I64),
+                            Type::Arr(_) | Type::CSlice(_) | Type::CMutSlice(_) | Type::Str => {
+                                Ok(Type::I64)
+                            }
                             t => Err(format!(
                                 "`len` expects an array or str, got {}",
                                 self.name(t)
@@ -1140,6 +1308,56 @@ impl<'a> Checker<'a> {
                                     _ => {
                                         return Err(format!(
                                             "inout arg {} of `{}` must be a variable",
+                                            i + 1,
+                                            name
+                                        ))
+                                    }
+                                }
+                            } else if matches!(p, Type::CMutSlice(_)) {
+                                match self.p.expr(args[i]) {
+                                    Expr::Ident(n) => {
+                                        let (actual, mutable) = self
+                                            .lookup(scopes, n)
+                                            .ok_or(format!("unknown variable `{}`", n))?;
+                                        if !mutable {
+                                            return Err(format!(
+                                                "c_mut_slice arg {} of `{}` needs a `var`, `{}` is immutable",
+                                                i + 1,
+                                                name,
+                                                n
+                                            ));
+                                        }
+                                        if !Self::compat(p, &actual) {
+                                            return Err(format!(
+                                                "c_mut_slice arg {} of `{}` expects {}, got {}",
+                                                i + 1,
+                                                name,
+                                                self.name(p),
+                                                self.name(&actual)
+                                            ));
+                                        }
+                                        for (j, &other) in args.iter().enumerate() {
+                                            if j == i {
+                                                continue;
+                                            }
+                                            let direct = matches!(
+                                                self.p.expr(other),
+                                                Expr::Ident(other_name) if other_name == n
+                                            );
+                                            if direct || writes_var(self.p, other, n) {
+                                                return Err(format!(
+                                                    "c_mut_slice arg {} of `{}` aliases `{}` in arg {}",
+                                                    i + 1,
+                                                    name,
+                                                    n,
+                                                    j + 1
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(format!(
+                                            "c_mut_slice arg {} of `{}` must be a variable",
                                             i + 1,
                                             name
                                         ))

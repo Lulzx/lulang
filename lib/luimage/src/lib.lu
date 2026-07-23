@@ -1,0 +1,72 @@
+// luimage — dependency-free image kernels over borrowed luminance planes.
+
+/// Restricts a normalized luminance value to the closed unit interval.
+fn clamp01(value: f64): f64 {
+  if value < 0.0 { return 0.0 }
+  if value > 1.0 { return 1.0 }
+  return value
+}
+
+/// Renders a normalized Mandelbrot luminance plane into caller-owned memory.
+export fn render_mandelbrot(
+  pixels: c_mut_slice[f64],
+  width: i64,
+  height: i64,
+  max_iterations: i64,
+) {
+  for pixel in 0..width * height {
+    let column = pixel % width
+    let row = pixel / width
+    let cx = -2.0 + 3.0 * float(column) / float(width - 1)
+    let cy = -1.0 + 2.0 * float(row) / float(height - 1)
+    var zx = 0.0
+    var zy = 0.0
+    var escaped = false
+    var escaped_at = max_iterations
+    for step in 0..max_iterations {
+      if escaped == false {
+        let next_x = zx * zx - zy * zy + cx
+        let next_y = 2.0 * zx * zy + cy
+        zx = next_x
+        zy = next_y
+        if zx * zx + zy * zy > 4.0 {
+          escaped = true
+          escaped_at = step
+        }
+      }
+    }
+    if escaped {
+      pixels[pixel] = 1.0 - float(escaped_at) / float(max_iterations)
+    } else {
+      pixels[pixel] = 0.0
+    }
+  }
+}
+
+/// Inverts a normalized image in place without allocating.
+export fn invert_image(pixels: c_mut_slice[f64]) {
+  for pixel in 0..len(pixels) {
+    pixels[pixel] = 1.0 - clamp01(pixels[pixel])
+  }
+}
+
+/// Applies a linear exposure multiplier and clamps the image in place.
+export fn apply_exposure(pixels: c_mut_slice[f64], exposure: f64) {
+  for pixel in 0..len(pixels) {
+    pixels[pixel] = clamp01(pixels[pixel] * exposure)
+  }
+}
+
+/// Computes the sum of a borrowed image without copying its pixels.
+export fn image_checksum(pixels: c_slice[f64]): f64 {
+  var total = 0.0
+  for pixel in 0..len(pixels) {
+    total = total + pixels[pixel]
+  }
+  return total
+}
+
+/// Computes mean luminance for a non-empty borrowed image.
+fn mean_luminance(pixels: c_slice[f64]): f64 {
+  return image_checksum(pixels) / float(len(pixels))
+}

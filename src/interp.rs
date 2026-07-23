@@ -348,7 +348,17 @@ impl<'a> Interp<'a> {
             Unit => "()".into(),
             Arr(t) => format!("[{}]", self.type_name(t)),
             CSlice(t) => format!("c_slice[{}]", self.type_name(t)),
+            CMutSlice(t) => format!("c_mut_slice[{}]", self.type_name(t)),
             CPtr(t) => format!("c_ptr[{}]", self.type_name(t)),
+            CFn(params, ret) => format!(
+                "c_fn[({})->{}]",
+                params
+                    .iter()
+                    .map(|ty| self.type_name(ty))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                self.type_name(ret)
+            ),
             Rec(i) => self.ir.records[*i].name.clone(),
             Enum(i) => self.ir.enums[*i].name.clone(),
         }
@@ -890,6 +900,10 @@ impl<'a> Interp<'a> {
                     ints[int_index] = *pointer as i64;
                     int_index += 1;
                 }
+                (Type::CFn(_, _), Value::CPtr(pointer)) => {
+                    ints[int_index] = *pointer as i64;
+                    int_index += 1;
+                }
                 (Type::F64, value) => {
                     floats[float_index] = as_f64(value)?;
                     float_index += 1;
@@ -951,6 +965,30 @@ impl<'a> Interp<'a> {
                     }
                     int_index += 2;
                 }
+                (Type::CMutSlice(element), Value::Arr(cells)) => {
+                    let native = match element.as_ref() {
+                        Type::I64 => NativeArray::I64(
+                            cells.iter().map(as_i64).collect::<Result<Vec<_>, _>>()?,
+                        ),
+                        Type::F64 => NativeArray::F64(
+                            cells.iter().map(as_f64).collect::<Result<Vec<_>, _>>()?,
+                        ),
+                        _ => return Err("unsupported FFI c_mut_slice element type".into()),
+                    };
+                    arrays.push((argument_index, true, native));
+                    let array = &arrays.last().unwrap().2;
+                    match array {
+                        NativeArray::I64(values) => {
+                            ints[int_index] = values.as_ptr() as i64;
+                            ints[int_index + 1] = values.len() as i64;
+                        }
+                        NativeArray::F64(values) => {
+                            ints[int_index] = values.as_ptr() as i64;
+                            ints[int_index + 1] = values.len() as i64;
+                        }
+                    }
+                    int_index += 2;
+                }
                 (Type::Rec(expected), Value::Rec(actual, fields)) if expected == actual => {
                     marshal_record(
                         self.ir,
@@ -988,6 +1026,9 @@ impl<'a> Interp<'a> {
                     Value::Enum(*enumeration, crate::ffi::call_i64(pointer, ints, floats))
                 }
                 Type::CPtr(_) => Value::CPtr(crate::ffi::call_i64(pointer, ints, floats) as usize),
+                Type::CFn(_, _) => {
+                    Value::CPtr(crate::ffi::call_i64(pointer, ints, floats) as usize)
+                }
                 Type::Str => {
                     let returned = crate::ffi::call_i64(pointer, ints, floats) as *const u8;
                     if returned_length < 0 || (returned.is_null() && returned_length != 0) {
@@ -999,6 +1040,42 @@ impl<'a> Interp<'a> {
                         std::slice::from_raw_parts(returned, returned_length as usize).to_vec()
                     };
                     Value::Str(Rc::new(bytes))
+                }
+                Type::Rec(record) => {
+                    let definition = &self.ir.records[*record];
+                    let float_class = matches!(definition.fields[0].1, Type::F64);
+                    let integer_values;
+                    let float_values;
+                    if float_class {
+                        float_values = if definition.fields.len() == 1 {
+                            [crate::ffi::call_f64(pointer, ints, floats), 0.0]
+                        } else {
+                            let pair = crate::ffi::call_f64_pair(pointer, ints, floats);
+                            [pair.first, pair.second]
+                        };
+                        integer_values = [0, 0];
+                    } else {
+                        integer_values = if definition.fields.len() == 1 {
+                            [crate::ffi::call_i64(pointer, ints, floats), 0]
+                        } else {
+                            let pair = crate::ffi::call_i64_pair(pointer, ints, floats);
+                            [pair.first, pair.second]
+                        };
+                        float_values = [0.0, 0.0];
+                    }
+                    let fields = definition
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (_, ty))| match ty {
+                            Type::I64 => Ok(Value::Int(integer_values[index])),
+                            Type::Bool => Ok(Value::Bool(integer_values[index] != 0)),
+                            Type::CPtr(_) => Ok(Value::CPtr(integer_values[index] as usize)),
+                            Type::F64 => Ok(Value::Float(float_values[index])),
+                            _ => Err("cannot unmarshal @c_layout record return".into()),
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    Value::Rec(*record, Rc::new(fields))
                 }
                 ty => return Err(format!("cannot return FFI type {:?}", ty)),
             }

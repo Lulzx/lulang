@@ -256,6 +256,91 @@ fn borrowed_c_slices_are_read_only_and_cannot_escape() {
 }
 
 #[test]
+fn owned_array_results_are_export_only_and_scalar() {
+    let cases = [
+        (
+            "extern fn foreign_values(): [f64]\nmain {}\n",
+            "exported [i64]/[f64] owned results",
+        ),
+        (
+            "export fn bad(): [bool] { return [true] }\nmain {}\n",
+            "exported [i64]/[f64] owned results",
+        ),
+    ];
+    for (source, message) in cases {
+        let output = run("check", source);
+        assert!(!output.status.success(), "accepted invalid owned result");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "unexpected error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn callback_signatures_are_typed_and_boundary_checked() {
+    let valid = run("check", "extern fn install(cb: c_fn[() -> ()])\nmain {}\n");
+    assert!(
+        valid.status.success(),
+        "rejected unit callback: {}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+
+    for source in [
+        "extern fn apply(cb: c_fn[(i64) -> i64], x: i64): i64\n\
+         extern fn get(): c_fn[(f64) -> f64]\n\
+         main { print(apply(get(), 1)) }\n",
+        "extern fn bad(cb: c_fn[() -> [i64]])\nmain {}\n",
+    ] {
+        let output = run("check", source);
+        assert!(
+            !output.status.success(),
+            "accepted invalid callback signature: {source}"
+        );
+    }
+}
+
+#[test]
+fn mutable_c_slices_require_unique_mutable_variables_and_cannot_escape() {
+    let cases = [
+        (
+            "fn write(values: c_mut_slice[f64]) { values[0] = 1.0 }\n\
+             main { let values = [0.0]\n write(values) }\n",
+            "needs a `var`",
+        ),
+        (
+            "fn write(a: c_mut_slice[f64], b: c_slice[f64]) { a[0] = b[0] }\n\
+             main { var values = [0.0]\n write(values, values) }\n",
+            "aliases `values`",
+        ),
+        (
+            "fn touch(values: c_mut_slice[f64]): f64 { values[0] = 1.0\n return values[0] }\n\
+             fn combine(values: c_mut_slice[f64], amount: f64) { values[0] = amount }\n\
+             main { var values = [0.0]\n combine(values, touch(values)) }\n",
+            "aliases `values`",
+        ),
+        (
+            "fn bad(values: c_mut_slice[f64]): c_mut_slice[f64] { return values }\nmain {}\n",
+            "cannot return a borrowed c_mut_slice",
+        ),
+        (
+            "type Bad { values: c_mut_slice[f64] }\nmain {}\n",
+            "cannot store a borrowed c_mut_slice",
+        ),
+    ];
+    for (source, message) in cases {
+        let output = run("check", source);
+        assert!(!output.status.success(), "accepted invalid c_mut_slice use");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "unexpected error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn ffi_names_cannot_collide_or_use_the_runtime_namespace() {
     let cases = [
         (

@@ -28,6 +28,7 @@ fn is_two_sym(a: i64, b: i64): bool {
   if b != '=' {
     if a == '.' and b == '.' { return true }
     if a == '|' and b == '>' { return true }
+    if a == '-' and b == '>' { return true }
     return false
   }
   return a == '=' or a == '!' or a == '<' or a == '>' or a == '~'
@@ -412,14 +413,36 @@ fn parse_stmt(inout p: P): i64 {
 
 fn parse_type(inout p: P) {
   // parsed and discarded for now (the checker-in-lulang comes later)
-  if cur_is_sym(p, "[") {
+  if cur_is_sym(p, "(") {
+    p.pos = p.pos + 1
+    expect_sym(p, ")")
+  } else if cur_is_sym(p, "[") {
     p.pos = p.pos + 1
     parse_type(p)
     expect_sym(p, "]")
   } else {
     let t = take_ident(p)
     if t == "" { fail(p, "type") }
-    if t == "c_ptr" or t == "c_slice" {
+    if t == "c_fn" {
+      expect_sym(p, "[")
+      expect_sym(p, "(")
+      if not cur_is_sym(p, ")") {
+        var more = true
+        while more {
+          parse_type(p)
+          if cur_is_sym(p, ",") {
+            p.pos = p.pos + 1
+          } else {
+            more = false
+          }
+        }
+      }
+      expect_sym(p, ")")
+      expect_sym(p, "->")
+      parse_type(p)
+      expect_sym(p, "]")
+    } else {
+    if t == "c_ptr" or t == "c_slice" or t == "c_mut_slice" {
       expect_sym(p, "[")
       if t == "c_ptr" and cur_is_sym(p, "(") {
         p.pos = p.pos + 1
@@ -428,6 +451,7 @@ fn parse_type(inout p: P) {
         parse_type(p)
       }
       expect_sym(p, "]")
+    }
     }
   }
 }

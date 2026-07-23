@@ -1,0 +1,49 @@
+property mandelbrot_pixels_are_normalized(seed: i64) {
+  let iterations = seed % 24 + 32
+  var pixels = arr(48, 0.0)
+  render_mandelbrot(pixels, 8, 6, iterations)
+  var valid = true
+  for pixel in 0..len(pixels) {
+    if pixels[pixel] < 0.0 or pixels[pixel] > 1.0 {
+      valid = false
+    }
+  }
+  return valid
+}
+
+property inversion_is_an_involution(seed: i64) {
+  let value = abs(float(seed % 101)) / 100.0
+  var pixels = [value, 0.25, 0.75, 1.0]
+  invert_image(pixels)
+  invert_image(pixels)
+  return pixels[0] ~= value and pixels[1] ~= 0.25 and pixels[2] ~= 0.75 and pixels[3] ~= 1.0
+}
+
+property mandelbrot_is_symmetric_across_the_real_axis(seed: i64) {
+  let iterations = seed % 24 + 32
+  let width = 9
+  let height = 7
+  var pixels = arr(width * height, 0.0)
+  render_mandelbrot(pixels, width, height, iterations)
+  var symmetric = true
+  for row in 0..height {
+    for column in 0..width {
+      let reflected = (height - row - 1) * width + column
+      if (pixels[row * width + column] ~= pixels[reflected]) == false {
+        symmetric = false
+      }
+    }
+  }
+  return symmetric
+}
+
+property zero_exposure_produces_black(seed: i64) {
+  var pixels = [
+    abs(float(seed % 101)) / 100.0,
+    0.25,
+    0.75,
+    1.0,
+  ]
+  apply_exposure(pixels, 0.0)
+  return image_checksum(pixels) ~= 0.0
+}

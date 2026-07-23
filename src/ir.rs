@@ -409,7 +409,9 @@ impl LoweredProgram {
                                         f.name
                                     ));
                                 }
-                                if target.is_some() != callee.inouts[i] {
+                                if target.is_some()
+                                    != (callee.inouts[i] || matches!(want, Type::CMutSlice(_)))
+                                {
                                     return Err(format!("IR `{}` call inout mismatch", f.name));
                                 }
                             }
@@ -435,7 +437,9 @@ impl LoweredProgram {
                                         f.name
                                     ));
                                 }
-                                if target.is_some() != matches!(want, Type::Arr(_)) {
+                                if target.is_some()
+                                    != matches!(want, Type::Arr(_) | Type::CMutSlice(_))
+                                {
                                     return Err(format!(
                                         "IR `{}` extern array copy-out mismatch",
                                         f.name
@@ -583,6 +587,10 @@ fn compatible(expected: &Type, actual: &Type) -> bool {
         || matches!(
             (expected, actual),
             (Type::CSlice(expected), Type::Arr(actual)) if expected == actual
+        )
+        || matches!(
+            (expected, actual),
+            (Type::CMutSlice(expected), Type::Arr(actual)) if expected == actual
         )
 }
 
@@ -1125,16 +1133,20 @@ impl<'a> Builder<'a> {
                 let mut inout = vec![None; args.len()];
                 for (i, e) in args.iter().enumerate() {
                     values.push(self.expr(*e)?);
-                    let copy_out =
-                        self.functions.get(name).is_some_and(|fid| {
-                            self.p.fns[*fid as usize].inouts.get(i) == Some(&true)
-                        }) || self.externs.get(name).is_some_and(|id| {
-                            self.p.externs[*id as usize]
+                    let copy_out = self.functions.get(name).is_some_and(|fid| {
+                        self.p.fns[*fid as usize].inouts.get(i) == Some(&true)
+                            || self.p.fns[*fid as usize]
                                 .params
                                 .get(i)
                                 .and_then(|(_, ty)| crate::check::resolve_type(self.p, ty).ok())
-                                .is_some_and(|ty| matches!(ty, Type::Arr(_)))
-                        });
+                                .is_some_and(|ty| matches!(ty, Type::CMutSlice(_)))
+                    }) || self.externs.get(name).is_some_and(|id| {
+                        self.p.externs[*id as usize]
+                            .params
+                            .get(i)
+                            .and_then(|(_, ty)| crate::check::resolve_type(self.p, ty).ok())
+                            .is_some_and(|ty| matches!(ty, Type::Arr(_) | Type::CMutSlice(_)))
+                    });
                     if copy_out {
                         let ast::Expr::Ident(n) = self.p.expr(*e) else {
                             return Err("lowering: copy-out argument is not a local".into());

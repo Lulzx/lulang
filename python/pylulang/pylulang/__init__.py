@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 from typing import Any
 
-__all__ = ["compile", "Module", "LulangError"]
+__all__ = ["compile", "Module", "OwnedArray", "LulangError"]
 
 
 class LulangError(RuntimeError):
@@ -41,6 +41,52 @@ def _scalar_ctype(type_name: str, enums: set[str]) -> type[ctypes._SimpleCData]:
     if type_name in {"i64", "bool"} or type_name in enums:
         return ctypes.c_int64
     raise LulangError(f"unsupported manifest type {type_name!r}")
+
+
+def _split_types(source: str) -> list[str]:
+    values: list[str] = []
+    depth = 0
+    start = 0
+    for index, character in enumerate(source):
+        if character in "[(":
+            depth += 1
+        elif character in "])":
+            depth -= 1
+        elif character == "," and depth == 0:
+            values.append(source[start:index])
+            start = index + 1
+    values.append(source[start:])
+    return values
+
+
+def _callback_signature(type_name: str) -> tuple[list[str], str]:
+    if not type_name.startswith("c_fn[(") or not type_name.endswith("]"):
+        raise LulangError(f"invalid callback type {type_name!r}")
+    inner = type_name[len("c_fn[("):-1]
+    marker = inner.find(")->")
+    if marker < 0:
+        raise LulangError(f"invalid callback type {type_name!r}")
+    params = [] if marker == 0 else _split_types(inner[:marker])
+    return params, inner[marker + 3:]
+
+
+def _callback_ctype(type_name: str, enums: set[str]) -> type[ctypes._CFuncPtr]:
+    params, ret = _callback_signature(type_name)
+    raw_params: list[Any] = []
+    for parameter in params:
+        if parameter == "str":
+            raw_params.extend([ctypes.c_void_p, ctypes.c_int64])
+        elif parameter.startswith("c_ptr[") or parameter.startswith("c_fn["):
+            raw_params.append(ctypes.c_void_p)
+        else:
+            raw_params.append(_scalar_ctype(parameter, enums))
+    if ret == "()":
+        raw_ret = None
+    elif ret.startswith("c_ptr[") or ret.startswith("c_fn["):
+        raw_ret = ctypes.c_void_p
+    else:
+        raw_ret = _scalar_ctype(ret, enums)
+    return ctypes.CFUNCTYPE(raw_ret, *raw_params)
 
 
 def _array_argument(
@@ -89,6 +135,59 @@ def _array_argument(
     return ctypes.cast(storage, ctypes.POINTER(ctype)), len(storage), storage
 
 
+class OwnedArray:
+    """A zero-copy scalar array result whose native allocation is explicitly owned."""
+
+    def __init__(self, library: ctypes.CDLL, handle: int, element: str):
+        self._library = library
+        self._handle = ctypes.c_void_p(handle)
+        self._ctype = _scalar_ctype(element, set())
+        self._data = getattr(library, f"lu_owned_{element}_data")
+        self._length = getattr(library, f"lu_owned_{element}_len")
+        self._release = getattr(library, f"lu_owned_{element}_release")
+        self._data.argtypes = [ctypes.c_void_p]
+        self._data.restype = ctypes.POINTER(self._ctype)
+        self._length.argtypes = [ctypes.c_void_p]
+        self._length.restype = ctypes.c_int64
+        self._release.argtypes = [ctypes.c_void_p]
+        self._release.restype = None
+
+    def __len__(self) -> int:
+        return int(self._length(self._handle)) if self._handle else 0
+
+    def __getitem__(self, index: int) -> Any:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return self._data(self._handle)[index]
+
+    def __setitem__(self, index: int, value: Any) -> None:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        self._data(self._handle)[index] = value
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+    def close(self) -> None:
+        if self._handle:
+            self._release(self._handle)
+            self._handle = ctypes.c_void_p()
+
+    def __enter__(self) -> "OwnedArray":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+
 class _Function:
     def __init__(
         self,
@@ -96,6 +195,7 @@ class _Function:
         spec: dict[str, Any],
         enums: set[str],
         records: dict[str, type[ctypes.Structure]],
+        error_results: set[str],
     ):
         self.__name__ = spec["name"]
         self.__doc__ = (
@@ -106,6 +206,8 @@ class _Function:
         self._spec = spec
         self._enums = enums
         self._records = records
+        self._error_results = error_results
+        self._library = library
         self._function = getattr(library, self.__name__)
         argtypes: list[Any] = []
         for parameter in spec["params"]:
@@ -122,6 +224,13 @@ class _Function:
                 argtypes.extend(
                     [ctypes.POINTER(_scalar_ctype(element, enums)), ctypes.c_int64]
                 )
+            elif type_name.startswith("c_mut_slice["):
+                element = type_name[len("c_mut_slice["):-1]
+                argtypes.extend(
+                    [ctypes.POINTER(_scalar_ctype(element, enums)), ctypes.c_int64]
+                )
+            elif type_name.startswith("c_fn["):
+                argtypes.append(_callback_ctype(type_name, enums))
             elif type_name in records:
                 argtypes.append(records[type_name])
             else:
@@ -134,6 +243,12 @@ class _Function:
             self._function.restype = None
         elif ret == "str":
             self._function.restype = ctypes.c_void_p
+        elif ret.startswith("["):
+            self._function.restype = ctypes.c_void_p
+        elif ret.startswith("c_fn["):
+            self._function.restype = _callback_ctype(ret, enums)
+        elif ret in records:
+            self._function.restype = records[ret]
         else:
             self._function.restype = _scalar_ctype(ret, enums)
 
@@ -166,6 +281,14 @@ class _Function:
                 )
                 flattened.extend([pointer, length])
                 keepalive.append(owner)
+            elif type_name.startswith("c_mut_slice["):
+                pointer, length, owner = _array_argument(
+                    value, type_name[len("c_mut_slice["):-1], writable=True
+                )
+                flattened.extend([pointer, length])
+                keepalive.append(owner)
+                if isinstance(owner, tuple):
+                    copy_backs.append(owner[1])
             elif type_name in self._records:
                 record_type = self._records[type_name]
                 if isinstance(value, record_type):
@@ -176,6 +299,11 @@ class _Function:
                     record = record_type(*value)
                 flattened.append(record)
                 keepalive.append(record)
+            elif type_name.startswith("c_fn["):
+                callback_type = _callback_ctype(type_name, self._enums)
+                callback = value if isinstance(value, callback_type) else callback_type(value)
+                flattened.append(callback)
+                keepalive.append(callback)
             elif type_name == "bool":
                 flattened.append(int(bool(value)))
             else:
@@ -188,6 +316,25 @@ class _Function:
             copy_back()
         if self._spec["ret"] == "str":
             return ctypes.string_at(result, returned_length.value)
+        if self._spec["ret"].startswith("["):
+            return OwnedArray(self._library, result, self._spec["ret"][1:-1])
+        if self._spec["ret"] in self._error_results:
+            if result.status != 0:
+                raise LulangError(f"Lulang error status {result.status}")
+            return result.value
+        if self._spec["ret"].startswith("c_fn["):
+            # ctypes creates a fresh function-pointer object for the returned
+            # address. Keep both it and any Python callbacks supplied to this
+            # call alive for as long as the returned callable is reachable.
+            returned_callback = result
+            callback_owners = tuple(keepalive)
+
+            def retained_callback(*callback_args: Any) -> Any:
+                return returned_callback(*callback_args)
+
+            retained_callback._lulang_callback = returned_callback
+            retained_callback._lulang_keepalive = callback_owners
+            return retained_callback
         return bool(result) if self._spec["ret"] == "bool" else result
 
 
@@ -226,8 +373,19 @@ class Module:
 
         for record_name in records:
             define_record(record_name)
+        error_results = {
+            record_name
+            for record_name, fields in record_specs.items()
+            if fields
+            == [
+                {"name": "status", "type": "i64"},
+                {"name": "value", "type": "i64"},
+            ]
+        }
         self._exports = {
-            spec["name"]: _Function(self._library, spec, enums, records)
+            spec["name"]: _Function(
+                self._library, spec, enums, records, error_results
+            )
             for spec in manifest["exports"]
         }
 
