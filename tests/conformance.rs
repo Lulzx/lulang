@@ -322,6 +322,75 @@ fn ffi_arrays_and_strings_match_across_all_tiers() {
 }
 
 #[test]
+fn opaque_c_pointers_match_across_all_tiers() {
+    let dir = CaseDir::new("ffi_opaque_pointer", "");
+    let extension = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let library = dir.0.join(format!("libpointer_fixture.{}", extension));
+    let fixture = dir.0.join("pointer_fixture.c");
+    fs::write(
+        &fixture,
+        "#include <stdint.h>\n\
+         #include <stdlib.h>\n\
+         typedef struct Box { int64_t value; } Box;\n\
+         Box *box_new(int64_t value) {\n\
+           Box *box = malloc(sizeof(*box));\n\
+           if (box) box->value = value;\n\
+           return box;\n\
+         }\n\
+         int64_t box_read(const Box *box) { return box ? box->value : -1; }\n\
+         void box_free(Box *box) { free(box); }\n",
+    )
+    .expect("write pointer FFI fixture");
+    let compiled = run(Command::new("clang")
+        .args(["-shared", "-o"])
+        .arg(&library)
+        .arg(&fixture));
+    assert!(
+        compiled.status.success(),
+        "compile pointer FFI fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::write(
+        dir.source(),
+        format!(
+            "type Box {{}}\n\
+             extern \"{}\" fn box_new(value: i64): c_ptr[Box]\n\
+             extern \"{}\" fn box_read(box: c_ptr[Box]): i64\n\
+             extern \"{}\" fn box_free(box: c_ptr[Box])\n\
+             main {{\n\
+               let box = box_new(73)\n\
+               print(box == box, box_read(box))\n\
+               box_free(box)\n\
+             }}\n",
+            library.display(),
+            library.display(),
+            library.display()
+        ),
+    )
+    .expect("write pointer FFI case");
+    for (backend, output) in [
+        ("interpreter", host("interp", &dir.source())),
+        ("JIT", host("run", &dir.source())),
+        ("AOT", aot(&dir)),
+        ("self-hosted", selfhost(&dir.source())),
+    ] {
+        assert!(
+            output.status.success(),
+            "opaque pointer case failed in {backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout, b"true 73\n",
+            "opaque pointer mismatch in {backend}"
+        );
+    }
+}
+
+#[test]
 fn exported_array_body_is_mutable_without_changing_lulang_value_semantics() {
     assert_success(
         "exported_array_value_semantics",

@@ -15,6 +15,7 @@ pub enum Value {
     Arr(Rc<Vec<Value>>),
     Rec(usize, Rc<Vec<Value>>),
     Enum(usize, i64),
+    CPtr(usize),
     Unit,
 }
 
@@ -281,6 +282,7 @@ impl<'a> Interp<'a> {
             Str => "str".into(),
             Unit => "()".into(),
             Arr(t) => format!("[{}]", self.type_name(t)),
+            CPtr(t) => format!("c_ptr[{}]", self.type_name(t)),
             Rec(i) => self.ir.records[*i].name.clone(),
             Enum(i) => self.ir.enums[*i].name.clone(),
         }
@@ -540,6 +542,7 @@ impl<'a> Interp<'a> {
                     (Value::Bool(a), Value::Bool(b)) => a == b,
                     (Value::Str(a), Value::Str(b)) => a == b,
                     (Value::Enum(ae, a), Value::Enum(be, b)) => ae == be && a == b,
+                    (Value::CPtr(a), Value::CPtr(b)) => a == b,
                     _ => as_f64(lhs)? == as_f64(rhs)?,
                 };
                 Ok(Value::Bool(if op == Eq { eq } else { !eq }))
@@ -736,6 +739,7 @@ impl<'a> Interp<'a> {
                 let decl = &self.ir.enums[*ei];
                 format!("{}.{}", decl.name, decl.variants[*tag as usize])
             }
+            Value::CPtr(pointer) => format!("c_ptr(0x{pointer:x})"),
         }
     }
 
@@ -770,6 +774,10 @@ impl<'a> Interp<'a> {
                 }
                 (Type::Enum(expected), Value::Enum(actual, tag)) if expected == actual => {
                     ints[int_index] = *tag;
+                    int_index += 1;
+                }
+                (Type::CPtr(_), Value::CPtr(pointer)) => {
+                    ints[int_index] = *pointer as i64;
                     int_index += 1;
                 }
                 (Type::F64, value) => {
@@ -825,6 +833,7 @@ impl<'a> Interp<'a> {
                 Type::Enum(enumeration) => {
                     Value::Enum(*enumeration, crate::ffi::call_i64(pointer, ints, floats))
                 }
+                Type::CPtr(_) => Value::CPtr(crate::ffi::call_i64(pointer, ints, floats) as usize),
                 ty => return Err(format!("cannot return FFI type {:?}", ty)),
             }
         };

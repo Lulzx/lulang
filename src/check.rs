@@ -11,6 +11,7 @@ pub enum Type {
     Str,
     Unit,
     Arr(Box<Type>),
+    CPtr(Box<Type>),
     Rec(usize),
     Enum(usize),
 }
@@ -59,6 +60,11 @@ pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
         _ => {
             if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
                 Ok(Type::Arr(Box::new(resolve_type(p, inner)?)))
+            } else if let Some(inner) = s
+                .strip_prefix("c_ptr[")
+                .and_then(|inner| inner.strip_suffix(']'))
+            {
+                Ok(Type::CPtr(Box::new(resolve_type(p, inner)?)))
             } else if let Some(ei) = p.enums.iter().position(|e| e.name == s) {
                 Ok(Type::Enum(ei))
             } else {
@@ -128,6 +134,11 @@ impl<'a> Checker<'a> {
             sigs: HashMap::new(),
             expr_types: RefCell::new(vec![None; p.exprs.len()]),
         };
+        for (record_index, record) in p.types.iter().enumerate() {
+            if record.c_layout {
+                c.validate_c_layout_record(record_index, &mut Vec::new())?;
+            }
+        }
         for e in &p.externs {
             let selfhost_bridge = matches!(
                 e.name.as_str(),
@@ -225,6 +236,11 @@ impl<'a> Checker<'a> {
             _ => {
                 if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
                     Ok(Type::Arr(Box::new(self.resolve(inner)?)))
+                } else if let Some(inner) = s
+                    .strip_prefix("c_ptr[")
+                    .and_then(|inner| inner.strip_suffix(']'))
+                {
+                    Ok(Type::CPtr(Box::new(self.resolve(inner)?)))
                 } else if let Some(ei) = self.p.enums.iter().position(|e| e.name == s) {
                     Ok(Type::Enum(ei))
                 } else {
@@ -243,22 +259,8 @@ impl<'a> Checker<'a> {
         params: &[Type],
         ret: &Type,
     ) -> Result<(), String> {
-        fn param_classes(ty: &Type) -> Result<(usize, usize), String> {
-            match ty {
-                Type::I64 | Type::Bool | Type::Enum(_) => Ok((1, 0)),
-                Type::F64 => Ok((0, 1)),
-                Type::Str => Ok((2, 0)),
-                Type::Arr(element) if matches!(element.as_ref(), Type::I64 | Type::F64) => {
-                    Ok((2, 0))
-                }
-                _ => Err(
-                    "allowed boundary types are i64, f64, bool, enums, str, [i64], and [f64]"
-                        .into(),
-                ),
-            }
-        }
         for param in params {
-            param_classes(param).map_err(|why| {
+            self.ffi_param_classes(param).map_err(|why| {
                 format!(
                     "FFI signature `{}` has unsupported parameter: {}",
                     name, why
@@ -267,15 +269,15 @@ impl<'a> Checker<'a> {
         }
         if !matches!(
             ret,
-            Type::Unit | Type::I64 | Type::F64 | Type::Bool | Type::Enum(_)
+            Type::Unit | Type::I64 | Type::F64 | Type::Bool | Type::Enum(_) | Type::CPtr(_)
         ) {
             return Err(format!(
-                "FFI signature `{}` has unsupported return type; returns are limited to (), i64, f64, bool, and enums",
+                "FFI signature `{}` has unsupported return type; returns are limited to (), i64, f64, bool, enums, and c_ptr[T]",
                 name
             ));
         }
         let (ints, floats) = params.iter().try_fold((0usize, 0usize), |acc, ty| {
-            let classes = param_classes(ty)?;
+            let classes = self.ffi_param_classes(ty)?;
             Ok::<_, String>((acc.0 + classes.0, acc.1 + classes.1))
         })?;
         if ints > 6 || floats > 8 {
@@ -284,6 +286,66 @@ impl<'a> Checker<'a> {
                 name, ints, floats
             ));
         }
+        Ok(())
+    }
+
+    fn ffi_param_classes(&self, ty: &Type) -> Result<(usize, usize), String> {
+        match ty {
+            Type::I64 | Type::Bool | Type::Enum(_) | Type::CPtr(_) => Ok((1, 0)),
+            Type::F64 => Ok((0, 1)),
+            Type::Str => Ok((2, 0)),
+            Type::Arr(element) if matches!(element.as_ref(), Type::I64 | Type::F64) => Ok((2, 0)),
+            _ => Err(
+                "allowed boundary types are i64, f64, bool, enums, c_ptr[T], str, [i64], and [f64]; @c_layout by-value calls are not enabled yet"
+                    .into(),
+            ),
+        }
+    }
+
+    fn validate_c_layout_record(
+        &self,
+        record_index: usize,
+        stack: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        let record = &self.p.types[record_index];
+        if record.fields.is_empty() {
+            return Err(format!(
+                "`@c_layout` type `{}` must contain at least one field",
+                record.name
+            ));
+        }
+        if stack.contains(&record_index) {
+            return Err(format!(
+                "`@c_layout` type `{}` contains a by-value layout cycle",
+                record.name
+            ));
+        }
+        stack.push(record_index);
+        let mut field_names = HashMap::new();
+        for (field_name, field_source) in &record.fields {
+            if field_names.insert(field_name, ()).is_some() {
+                return Err(format!(
+                    "`@c_layout` type `{}` repeats field `{}`",
+                    record.name, field_name
+                ));
+            }
+            let field = self.resolve(field_source)?;
+            match field {
+                Type::I64 | Type::F32 | Type::F64 | Type::Bool | Type::CPtr(_) => {}
+                Type::Rec(nested) if self.p.types[nested].c_layout => {
+                    self.validate_c_layout_record(nested, stack)?;
+                }
+                _ => {
+                    return Err(format!(
+                        "`@c_layout` field `{}.{}` has unsupported type {}; allowed fields are i64, f32, f64, bool, c_ptr[T], and nested @c_layout records",
+                        record.name,
+                        field_name,
+                        self.name(&field)
+                    ))
+                }
+            }
+        }
+        stack.pop();
         Ok(())
     }
 
@@ -296,6 +358,7 @@ impl<'a> Checker<'a> {
             Type::Str => "str".into(),
             Type::Unit => "()".into(),
             Type::Arr(t) => format!("[{}]", self.name(t)),
+            Type::CPtr(t) => format!("c_ptr[{}]", self.name(t)),
             Type::Rec(i) => self.p.types[*i].name.clone(),
             Type::Enum(i) => self.p.enums[*i].name.clone(),
         }

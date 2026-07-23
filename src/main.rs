@@ -5,14 +5,19 @@ use lu_syntax::{fmt, lexer, parser};
 use lu_test::{interp, runtime as test_runtime};
 
 mod bindgen;
+mod package;
 
 use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
         "usage: lu <run|build|check|interp> <file.lu> [program args...]\n\
+         \x20      lu init [package-name]\n\
+         \x20      lu add <name> --git <url> --rev <revision>\n\
+         \x20      lu fetch\n\
          \x20      lu build --lib [--shared] [-o name] <file.lu>\n\
-         \x20      lu bindgen [--lib name] [-o file.lu] <header.h>\n\
+         \x20      lu build --target <wasm32-wasi|wasm32-web> [-o file.wasm] <file.lu>\n\
+         \x20      lu bindgen [--lib name] [--no-shims] [-o file.lu] <header.h>\n\
          \x20      lu test [--runs N] <file.lu>\n\
          \x20      lu fmt [--check] <file.lu>"
     );
@@ -21,19 +26,48 @@ fn usage() -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    let explicit_mode = args.get(1).is_some_and(|argument| {
+        matches!(
+            argument.as_str(),
+            "run"
+                | "build"
+                | "check"
+                | "interp"
+                | "test"
+                | "fmt"
+                | "bindgen"
+                | "init"
+                | "add"
+                | "fetch"
+        )
+    });
     let mode = match args.get(1) {
         None => return usage(),
-        Some(arg) if args.len() == 2 => "run",
+        Some(_) if !explicit_mode => "run",
         Some(arg) => arg.as_str(),
     };
+    if mode == "init" {
+        return package_result(package::init(&args[2..]));
+    }
+    if mode == "add" {
+        return package_result(package::add(&args[2..]));
+    }
+    if mode == "fetch" {
+        if args.len() != 2 {
+            return usage();
+        }
+        return package_result(package::fetch());
+    }
     let mut runs = 100u32;
     let mut check_format = false;
     let mut build_library = false;
     let mut build_shared = false;
+    let mut build_target = None;
     let mut output_name = None;
     let mut bindgen_library = None;
+    let mut bindgen_shims = true;
     let mut positionals = Vec::new();
-    let mut i = if args.len() == 2 { 1 } else { 2 };
+    let mut i = if explicit_mode { 2 } else { 1 };
     while i < args.len() {
         match args[i].as_str() {
             "--runs" if mode == "test" => {
@@ -65,9 +99,21 @@ fn main() -> ExitCode {
                 bindgen_library = Some(value.clone());
                 i += 2;
             }
+            "--no-shims" if mode == "bindgen" => {
+                bindgen_shims = false;
+                i += 1;
+            }
             "--shared" if mode == "build" => {
                 build_shared = true;
                 i += 1;
+            }
+            "--target" if mode == "build" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("error: --target needs a value");
+                    return ExitCode::FAILURE;
+                };
+                build_target = Some(value.clone());
+                i += 2;
             }
             "-o" if matches!(mode, "build" | "bindgen") => {
                 let Some(value) = args.get(i + 1) else {
@@ -87,26 +133,55 @@ fn main() -> ExitCode {
             }
         }
     }
-    let Some(path) = positionals.first() else {
-        return usage();
-    };
     if mode == "bindgen" {
+        let Some(path) = positionals.first() else {
+            return usage();
+        };
         if positionals.len() != 1 {
             return usage();
         }
-        return run_bindgen(path, output_name.as_deref(), bindgen_library.as_deref());
+        return run_bindgen(
+            path,
+            output_name.as_deref(),
+            bindgen_library.as_deref(),
+            bindgen_shims,
+        );
     }
-    if !matches!(mode, "test" | "fmt") && positionals.len() > 1 {
+    let package_input = if positionals.is_empty()
+        && matches!(mode, "run" | "build" | "check" | "interp" | "test")
+    {
+        match package::load_workspace(mode) {
+            Ok(program) => Some(program),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let path_owned = package_input
+        .as_ref()
+        .map(|program| program.label.clone())
+        .or_else(|| positionals.first().cloned());
+    let Some(path_owned) = path_owned else {
+        return usage();
+    };
+    let path = path_owned.as_str();
+    if package_input.is_none() && !matches!(mode, "test" | "fmt") && positionals.len() > 1 {
         let program_args = positionals[1..].to_vec();
         jit_runtime::set_args(program_args.clone());
         test_runtime::set_args(program_args);
     }
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read {}: {}", path, e);
-            return ExitCode::FAILURE;
-        }
+    let src = match package_input {
+        Some(program) => program.source,
+        None => match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read {}: {}", path, e);
+                return ExitCode::FAILURE;
+            }
+        },
     };
     if mode == "fmt" {
         let formatted = fmt::format_source(&src);
@@ -143,6 +218,7 @@ fn main() -> ExitCode {
     let mode_owned = mode.to_string();
     let path_owned = path.to_string();
     let output_name_owned = output_name.clone();
+    let build_target_owned = build_target.clone();
     let result = std::thread::Builder::new()
         .stack_size(512 << 20)
         .spawn(move || {
@@ -153,6 +229,7 @@ fn main() -> ExitCode {
                 runs,
                 build_library,
                 build_shared,
+                build_target_owned.as_deref(),
                 output_name_owned.as_deref(),
             )
         })
@@ -169,7 +246,25 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_bindgen(path: &str, output: Option<&str>, library: Option<&str>) -> ExitCode {
+fn package_result(result: Result<String, String>) -> ExitCode {
+    match result {
+        Ok(message) => {
+            eprintln!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_bindgen(
+    path: &str,
+    output: Option<&str>,
+    library: Option<&str>,
+    build_shims: bool,
+) -> ExitCode {
     let header = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) => {
@@ -190,17 +285,57 @@ fn run_bindgen(path: &str, output: Option<&str>, library: Option<&str>) -> ExitC
                 .unwrap_or("c")
         });
     let library = library.unwrap_or(inferred_library);
-    let generated = match bindgen::generate(&header, input, library) {
+    let default_output = input.with_extension("lu");
+    let output = output
+        .map(std::path::PathBuf::from)
+        .unwrap_or(default_output);
+    let shim_output = (build_shims && output.as_os_str() != "-").then(|| {
+        output.with_extension(if cfg!(target_os = "macos") {
+            "bindgen.dylib"
+        } else {
+            "bindgen.so"
+        })
+    });
+    let shim_reference = shim_output.as_ref().map(|path| {
+        if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(path)
+        }
+    });
+    let include_path = std::fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
+    let generated = match bindgen::generate(
+        &header,
+        &include_path,
+        library,
+        shim_reference.as_deref().and_then(std::path::Path::to_str),
+    ) {
         Ok(generated) => generated,
         Err(error) => {
             eprintln!("error: cannot parse {}: {}", path, error);
             return ExitCode::FAILURE;
         }
     };
-    let default_output = input.with_extension("lu");
-    let output = output
-        .map(std::path::PathBuf::from)
-        .unwrap_or(default_output);
+    if let (Some(shim_source), Some(shim_output)) =
+        (generated.shim_source.as_deref(), shim_output.as_deref())
+    {
+        let shim_c = output.with_extension("bindgen.c");
+        if let Err(error) = std::fs::write(&shim_c, shim_source) {
+            eprintln!("error: cannot write {}: {}", shim_c.display(), error);
+            return ExitCode::FAILURE;
+        }
+        if let Err(error) = compile_bindgen_shim(&shim_c, shim_output, library) {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "built {} C adapter shim(s) in {}",
+            generated.shimmed_functions,
+            shim_output.display()
+        );
+    }
     if output.as_os_str() == "-" {
         print!("{}", generated.source);
     } else if let Err(error) = std::fs::write(&output, &generated.source) {
@@ -222,6 +357,40 @@ fn run_bindgen(path: &str, output: Option<&str>, library: Option<&str>) -> ExitC
     ExitCode::SUCCESS
 }
 
+fn compile_bindgen_shim(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    library: &str,
+) -> Result<(), String> {
+    let mut command = std::process::Command::new("cc");
+    if cfg!(target_os = "macos") {
+        command.arg("-dynamiclib");
+    } else {
+        command.args(["-shared", "-fPIC"]);
+    }
+    command
+        .args(["-O2", "-std=c11"])
+        .arg(source)
+        .arg("-o")
+        .arg(output);
+    if library.contains('/') || library.ends_with(".so") || library.ends_with(".dylib") {
+        command.arg(library);
+    } else if !library.is_empty() && library != "c" {
+        command.arg(format!("-l{library}"));
+    }
+    let result = command
+        .output()
+        .map_err(|error| format!("cannot start C compiler for bindgen shim: {error}"))?;
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "C adapter shim compilation failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        ))
+    }
+}
+
 fn run_pipeline(
     mode: &str,
     path: &str,
@@ -229,6 +398,7 @@ fn run_pipeline(
     property_runs: u32,
     build_library: bool,
     build_shared: bool,
+    build_target: Option<&str>,
     output_name: Option<&str>,
 ) -> Result<bool, String> {
     (|| -> Result<bool, String> {
@@ -246,10 +416,26 @@ fn run_pipeline(
                 Ok(true)
             }
             "build" => {
+                if build_target.is_some() && (build_library || build_shared) {
+                    return Err("`--target` cannot be combined with `--lib` or `--shared`".into());
+                }
                 if build_shared && !build_library {
                     return Err("`--shared` requires `--lib`".into());
                 }
-                if build_library {
+                if let Some(target) = build_target {
+                    let target = match target {
+                        "wasm32-wasi" => llvm::WasmTarget::Wasi,
+                        "wasm32-web" => llvm::WasmTarget::Web,
+                        target => {
+                            return Err(format!(
+                                "unsupported target `{target}`; expected wasm32-wasi or wasm32-web"
+                            ))
+                        }
+                    };
+                    for out in llvm::build_wasm(&ir, path, output_name, target)? {
+                        eprintln!("built {}", out);
+                    }
+                } else if build_library {
                     for out in llvm::build_library(&ir, path, output_name, build_shared)? {
                         eprintln!("built {}", out);
                     }

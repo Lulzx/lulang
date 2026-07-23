@@ -1,0 +1,30 @@
+extern "raylib_luphysics" fn lp_init_window(width: i64, height: i64, title: str)
+extern "raylib_luphysics" fn lp_window_should_close(): i64
+extern "raylib_luphysics" fn lp_begin_frame()
+extern "raylib_luphysics" fn lp_draw_circle(x: f64, y: f64, radius: f64, rgba: i64)
+extern "raylib_luphysics" fn lp_end_frame()
+extern "raylib_luphysics" fn lp_close_window()
+
+main {
+  let count = 3
+  var x = [-1.0, 1.0, 0.0]
+  var y = [0.0, 0.0, 1.5]
+  var vx = [0.0, 0.0, 0.18]
+  var vy = [-0.12, 0.12, 0.0]
+  let mass = [1.0, 1.0, 0.25]
+  lp_init_window(960, 640, "luphysics")
+  var frame = 0
+  while lp_window_should_close() == 0 and frame < 36000 {
+    step_velocity_x(vx, x, y, mass, count, 1.0, 0.05, 0.004)
+    step_velocity_y(vy, x, y, mass, count, 1.0, 0.05, 0.004)
+    advance_axis(x, vx, 0.004, count)
+    advance_axis(y, vy, 0.004, count)
+    lp_begin_frame()
+    lp_draw_circle(480.0 + x[0] * 120.0, 320.0 + y[0] * 120.0, 18.0, 4283215871)
+    lp_draw_circle(480.0 + x[1] * 120.0, 320.0 + y[1] * 120.0, 18.0, 4289379327)
+    lp_draw_circle(480.0 + x[2] * 120.0, 320.0 + y[2] * 120.0, 10.0, 4294934783)
+    lp_end_frame()
+    frame = frame + 1
+  }
+  lp_close_window()
+}

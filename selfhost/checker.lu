@@ -427,6 +427,18 @@ fn parse_type(inout p: P): i64 {
     return t + 8
   }
   let t = take_ident(p)
+  if t == "c_ptr" {
+    expect_sym(p, "[")
+    var inner = 4
+    if cur_is_sym(p, "(") {
+      p.pos = p.pos + 1
+      expect_sym(p, ")")
+    } else {
+      inner = parse_type(p)
+    }
+    expect_sym(p, "]")
+    return inner + 32
+  }
   if t == "i64" or t == "i32" { return 0 }
   if t == "f64" or t == "f32" { return 1 }
   if t == "bool" { return 2 }
@@ -560,6 +572,7 @@ fn tname(t: i64): str {
   if t == 9 { return "[f64]" }
   if t == 10 { return "[bool]" }
   if t == 11 { return "[str]" }
+  if t >= 32 { return "c_ptr[..]" }
   if t >= 16 { return "[[..]]" }
   return "<error>"
 }

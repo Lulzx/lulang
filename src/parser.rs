@@ -114,7 +114,18 @@ impl Parser {
                     self.prog.fns.push(f);
                 }
                 Tok::Ident(k) if k == "extern" => self.parse_extern()?,
-                Tok::Ident(k) if k == "type" => self.parse_type()?,
+                Tok::Ident(k) if k == "type" => self.parse_type(false)?,
+                Tok::Sym(symbol) if symbol == "@" => {
+                    self.next();
+                    let attribute = self.ident()?;
+                    if attribute != "c_layout" {
+                        return Err(format!("unknown top-level attribute `@{attribute}`"));
+                    }
+                    if !matches!(self.peek(), Tok::Ident(keyword) if keyword == "type") {
+                        return Err("`@c_layout` must be followed by `type`".into());
+                    }
+                    self.parse_type(true)?;
+                }
                 Tok::Ident(k) if k == "enum" => self.parse_enum()?,
                 Tok::Ident(k) if k == "operator" => self.parse_operator()?,
                 Tok::Ident(k) if k == "property" => {
@@ -136,7 +147,7 @@ impl Parser {
         }
     }
 
-    fn parse_type(&mut self) -> Result<(), String> {
+    fn parse_type(&mut self, c_layout: bool) -> Result<(), String> {
         self.eat_kw("type")?;
         let name = self.ident()?;
         self.eat_sym("{")?;
@@ -154,7 +165,11 @@ impl Parser {
         }
         self.eat_sym("}")?;
         self.type_names.insert(name.clone());
-        self.prog.types.push(TypeDecl { name, fields });
+        self.prog.types.push(TypeDecl {
+            name,
+            fields,
+            c_layout,
+        });
         Ok(())
     }
 
@@ -187,7 +202,22 @@ impl Parser {
             self.eat_sym("]")?;
             Ok(format!("[{}]", inner))
         } else {
-            self.ident()
+            let name = self.ident()?;
+            if name == "c_ptr" && self.is_sym("[") {
+                self.next();
+                let inner = if self.is_sym("(") {
+                    self.next();
+                    self.eat_sym(")")?;
+                    self.eat_sym("]")?;
+                    return Ok("c_ptr[()]".into());
+                } else {
+                    self.parse_type_str()?
+                };
+                self.eat_sym("]")?;
+                Ok(format!("c_ptr[{}]", inner))
+            } else {
+                Ok(name)
+            }
         }
     }
 

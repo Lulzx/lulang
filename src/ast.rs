@@ -69,6 +69,9 @@ pub struct ExternDecl {
 pub struct TypeDecl {
     pub name: String,
     pub fields: Vec<(String, String)>,
+    /// Stable C field order/layout at an FFI boundary. Ordinary records keep
+    /// compiler-owned layout and must never acquire an implicit C ABI.
+    pub c_layout: bool,
 }
 
 #[derive(Debug, Clone)]

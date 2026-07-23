@@ -22,7 +22,9 @@ evidence.*
 
 ## 2. Files & entry
 
-- Extension: `.lu`. One file = one module. `use math` imports (stdlib only in v0.1).
+- Extension: `.lu`. A standalone file is one compilation unit. In a
+  `lu.toml` package, `use name` names a declared Git dependency whose
+  `src/lib.lu` is composed into the same whole-program compilation.
 - Entry point: a bare `main { … }` block.
 
 ## 3. Types
@@ -164,13 +166,52 @@ single arena per module, spans everywhere, target <10ms frontend for 1k-line fil
 ## 10. Explicitly deferred (v0.2+)
 
 Strings beyond literals in `print`, enums/matching, generics beyond array sizes,
-modules beyond stdlib, closures, heap collections (growable arrays), FFI, `exact`
+namespaced/separately compiled modules, closures, heap collections (growable arrays), FFI, `exact`
 FP mode, property-driven optimizer assumptions, AI/LLM-call runtime, self-hosting.
 
 **Committed for v0.2** (per DESIGN.md Revision 3): `inout` parameters (mutable value
 semantics, law of exclusivity) — required for growable collections, and eventually
 self-hosting; and the first middle-end passes (SoA layout selection, reduction
 vectorization) as lulang IR transforms rather than clang flags.
+
+---
+
+## 11. C boundary pointers
+
+`c_ptr[T]` is an opaque, boundary-only C pointer. It may be received from or
+returned to an `extern` function, stored in a local, passed unchanged, returned
+from an exported function, and compared for equality with the same pointer
+type. `c_ptr[()]` is the deliberately untyped handle used when the pointee is
+unknown.
+
+There is no pointer literal, address-of operator, dereference, arithmetic, or
+conversion to an integer. `T` documents and checks the boundary contract; it
+does not give lulang access to C layout. The JIT and AOT represent `c_ptr[T]`
+as a native pointer. The interpreters carry the same pointer bits through the
+FFI bridge without inspecting the pointee.
+
+`@c_layout type Name { ... }` opts a record into stable C field order and
+layout metadata. Its fields are restricted to exact-width boundary scalars,
+`c_ptr[T]`, and nested `@c_layout` records; empty records, layout cycles,
+strings, and arrays are rejected. The annotation does not change ordinary
+lulang records, which retain compiler-owned layout. C headers and ABI
+manifests describe annotated records. By-value aggregate calls remain rejected
+until the backend implements the target C ABI's aggregate classification;
+using an annotated record behind `c_ptr[Name]` is already supported.
+
+Generated bindgen adapters may expose a record-valued lulang parameter without
+passing that record through the boundary. The generated lulang wrapper
+flattens its logical fields into supported scalar arguments, and generated C
+code reconstructs the C value before the real call. Narrow integer, C `float`,
+and C `_Bool` conversions follow the same rule. This is an adapter contract,
+not a relaxation of the boundary type set or a promise about internal record
+layout.
+
+`lu build --target wasm32-wasi` emits a WASI command module.
+`--target wasm32-web` emits a reactor module and JavaScript host loader.
+WebAssembly uses the same checked program and LLVM lowering as native AOT, but
+dynamic native `extern` declarations are rejected. The target does not weaken
+the C-boundary rules or imply native SIMD parity.
 
 ---
 

@@ -53,6 +53,8 @@ cargo build --release
 ./target/release/lu run  corpus/slerp.lu   # execute main
 ./target/release/lu test --runs 1000 corpus/slerp.lu # property tests, configurable runs
 ./target/release/lu build corpus/slerp.lu  # AOT-compile via LLVM
+./target/release/lu build --target wasm32-wasi corpus/slerp.lu
+./target/release/lu build --target wasm32-web corpus/slerp.lu
 ./target/release/lu build --lib -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu build --lib --shared -o kernel corpus/kernel_saxpy.lu
 ./target/release/lu bindgen --lib m -o math.lu /usr/include/math.h
@@ -98,11 +100,18 @@ lu check math.lu
 
 The importer emits constants, sequential enums, typedef-resolved parameters,
 and functions whose C types have an exact lulang boundary representation.
-Declarations involving narrower C integers, `float`, C `bool`, pointers,
-callbacks, or by-value aggregates are parsed but reported as explicit
-diagnostics. They are not silently widened or reinterpreted. Pointer and
-fixed-layout declarations will become emit-capable with the planned
-boundary-only `c_ptr[T]` and `@c_layout` types.
+Raw pointers and opaque structs are emitted as boundary-only `c_ptr[T]`
+handles: they may cross an `extern` boundary, be stored, passed, and compared,
+but cannot be dereferenced or used to expose C layout. Declarations involving
+narrower C integers, `float`, C `bool`, or by-value struct parameters use a
+generated C adapter shared library. The public lulang wrapper keeps the useful
+logical type while the private adapter crosses only the stable scalar ABI.
+This works in the interpreter, JIT, LLVM AOT, and self-hosted compiler without
+making compiler-owned record layout part of the C ABI. The reproducible
+adapter source is written beside the bindings as `*.bindgen.c`; use
+`--no-shims` to emit only declarations that need no adapter. Variadic
+functions, callbacks, unions, bitfields, and by-value aggregate returns remain
+explicit diagnostics.
 
 ### Editor tooling
 
@@ -111,6 +120,52 @@ diagnostics, formatting, symbols, completion, hover, and go-to-definition.
 Set `LULANG_BIN` if `lu` is not on `PATH`. A VS Code extension with syntax
 highlighting and native editor providers lives in `editors/vscode`; the
 tree-sitter grammar and highlight query live in `editors/tree-sitter-lulang`.
+
+### WebAssembly targets
+
+With [Zig](https://ziglang.org/) on `PATH`, `lu build --target wasm32-wasi`
+produces a command module for a preview1 WASI host. The `wasm32-web` target
+produces a reactor module plus a small dependency-free JavaScript loader:
+
+```javascript
+import { instantiateLulang } from "./slerp.js";
+
+const program = await instantiateLulang("./slerp.wasm", console.log);
+program.run();
+```
+
+Both targets consume the same validated CFG and runtime as native AOT.
+Native dynamic `extern` declarations are rejected for wasm builds rather than
+becoming unresolved imports.
+
+### Git packages
+
+Packages are deliberately registry-free and source-based:
+
+```bash
+mkdir orbit && cd orbit
+lu init orbit
+lu add numerics --git https://github.com/example/lu-numerics --rev v0.1.0
+lu run
+lu test --runs 1000
+lu build
+```
+
+`lu add` resolves the requested Git revision to an immutable commit and tree,
+writes `lu.lock`, and stores the checkout by commit ID in the content-addressed
+cache. Later builds use the lock even if a branch or tag moves. Dependencies
+provide `src/lib.lu`; the root provides `src/main.lu`, and `use name` must
+refer to a declared dependency. Resolution composes the dependency graph
+before one whole-program typecheck and optimization pipeline. Set
+`LULANG_CACHE` to override the cache location.
+
+### Flagship: luphysics
+
+[`lib/luphysics`](lib/luphysics) is the end-to-end showcase: value-semantic
+vectors and bodies, softened N-body integration, rigid-circle impulses,
+executable conservation laws, native/WASI builds, an exported SoA integration
+kernel with a generated C header, and an optional raylib visualizer. Run
+`lu run` or `lu test --runs 1000` from that directory.
 
 ## Architecture
 

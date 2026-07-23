@@ -34,9 +34,9 @@ than exposing internals.
 | 5 | `lu-numerics` first-party library corpus — **foundation shipped** | Very high | Continuous |
 | 6 | Web playground (interpreter → wasm32) — **v0.1 shipped** | High | Medium |
 | 7 | `lu bindgen` C-header importer — **foundation shipped** | Very high | Medium–high |
-| 8 | `wasm32-wasi` / `wasm32-web` target | High | Medium |
-| 9 | Git-based package manager (`lu.toml`) | High once libraries exist | Medium |
-| 10 | Flagship demo (`luphysics`) | High visibility | Medium |
+| 8 | `wasm32-wasi` / `wasm32-web` target — **shipped** | High | Medium |
+| 9 | Git-based package manager (`lu.toml`) — **foundation shipped** | High once libraries exist | Medium |
+| 10 | Flagship demo (`luphysics`) — **shipped** | High visibility | Medium |
 | 11 | `lu doc` + benchmark observatory | High credibility | Medium |
 | 12 | Autodiff (`ludiff`, forward-mode duals first) | High technical value | High |
 
@@ -69,9 +69,10 @@ M8 boundary subset: `i64`, `f64`, `bool` (0/1 as `int64_t`), enums (i64 tag),
 `str` as `(const char*, int64_t)` parameters, `[i64]`/`[f64]` as
 `(T* data, int64_t n)`. Signatures capped at 6 integer-class + 8 float-class
 components (a language rule that keeps every argument in registers on both
-SysV x86-64 and AArch64). Deferred follow-ups: `f32` at the boundary,
-`c_ptr[T]`/`c_slice[T]`, `@c_layout` records, `str` returns, callbacks,
-zero-copy array export handles.
+SysV x86-64 and AArch64). The first follow-up, boundary-only `c_ptr[T]` opaque
+handles, now works in all four tiers and in generated headers. Remaining
+follow-ups: `f32` at the boundary, `c_slice[T]`, `@c_layout` records, `str`
+returns, callbacks, and zero-copy array export handles.
 
 ### 3. `pylulang`
 
@@ -137,23 +138,32 @@ identity; raylib produces visible demos.
 
 The first slice ships a dependency-free C lexer/parser, typedef resolution,
 numeric macros, sequential enums, function prototypes, register-cap checking,
-and checker-valid `extern` generation. It deliberately emits only exact
-boundary matches (`int64_t`/LP64 `long`, `double`, and `void`); narrower
-integers, `float`, C `bool`, pointers, callbacks, and by-value aggregates are
-diagnosed instead of unsafely widened. A macOS `math.h` preflight currently
-produces 41 checker-valid imports. The remaining work for the full promised
-subset is therefore language work, not parser work: add `c_ptr[T]`, opaque
-handles, `@c_layout` records, and conversion shims for C-width scalars before
-turning those indexed declarations into bindings.
+and checker-valid `extern` generation. The second adds boundary-only
+`c_ptr[T]`, opaque C structs, and end-to-end pointer calls in the interpreter,
+JIT, AOT, and self-hosted compiler. Unsupported pointees degrade to the
+explicit untyped handle `c_ptr[()]`; no C layout is inferred. Narrower
+integers, `float`, C `bool`, and by-value struct parameters now use generated
+C adapter shims: public wrappers retain their logical types, while private
+externs use only the proven scalar boundary ABI. Exact records carry
+`@c_layout`; records containing narrow fields become logical adapter records,
+never false layout claims. The adapters run through all four tiers and avoid
+duplicating platform aggregate classification in each backend. A macOS
+`math.h` preflight currently produces 41 direct checker-valid imports.
+Remaining explicit diagnostics are aggregate returns, unions, bitfields,
+variadics, and callbacks.
 
 ### 8. WASM target
 
-The second backend target after the C ABI — not GPU. `lu build --target
-wasm32-wasi` (and `wasm32-web`). Enables playground execution, browser
-kernels, serverless, JS embedding, portable benchmark artifacts, sandboxed
-plugins. Because every tier already consumes one validated CFG IR, another
-backend is architecturally cheap here. Treat WASM as distribution leverage;
-don't promise native SIMD parity immediately.
+The second backend target after the C ABI — not GPU — now ships as `lu build
+--target wasm32-wasi` and `--target wasm32-web`. WASI produces a command
+module; the web target produces a reactor plus a dependency-free loader with a
+minimal byte-output host. Both are executable integration-tested. Native
+dynamic externs fail early because they have no portable wasm meaning.
+
+This enables browser kernels, serverless, JS embedding, portable benchmark
+artifacts, and sandboxed plugins. The next playground increment is to package
+its editable evaluator with this target; native SIMD parity remains an
+explicit non-promise.
 
 ### 9. Package manager — deliberately minimal
 
@@ -169,21 +179,29 @@ version = "0.1.0"
 numerics = { git = "https://github.com/lulang/lu-numerics", rev = "..." }
 ```
 
-Commands: `lu init | add | build | test | bench | doc`. Content-addressed
-lockfiles, immutable commit pins, reproducible builds, whole-program
-compilation after resolution. (Prerequisite: a module/import story beyond the
-stdlib — currently deferred in SPEC §deferred.)
+The foundation now provides `lu init`, `lu add --git --rev`, `lu fetch`, and
+package-default `run`, `check`, `build`, and `test`. `lu.lock` records the
+resolved commit and Git tree; checkouts are content-addressed by commit, and a
+moving branch does not change a locked build. Dependency `src/lib.lu` files
+are composed in graph order before the root and enter one whole-program
+frontend/optimizer. `use name` is checked against declared dependencies.
+
+`bench` and `doc` become package-aware with the observatory item below. There
+is intentionally no registry until roughly 20–30 meaningful packages exist.
 
 ### 10. Flagship showcase: `luphysics`
 
 Infrastructure alone doesn't create an ecosystem; applications prove why the
-language exists. Strongest flagship: a small rigid-body/particle physics
-engine — vectors, quaternions, collision kernels, integration, constraints,
-property tests for invariants, C ABI embedding, raylib visualizer. The
-language's teaser is already quaternion operators and `slerp`; this is that
-teaser grown up. Other candidates as the ecosystem matures: `luspice`
-(circuit simulation), `lurocket` (orbital mechanics), `luquant` (Monte Carlo
-pricing), `luimage` (kernels with visible output).
+language exists. `lib/luphysics` now supplies value-semantic vectors and
+bodies, softened N-body gravity, semi-implicit integration, rigid-circle
+impulses, conservation property tests, a WASI build, a C-embeddable SoA
+kernel, and an optional raylib visualizer with an explicit C boundary adapter.
+Its integration test exercises interpreter, JIT, AOT, properties, WASM
+production, generated headers, and a real C caller.
+
+Other candidates as the ecosystem matures: `luspice` (circuit simulation),
+`lurocket` (orbital mechanics), `luquant` (Monte Carlo pricing), and `luimage`
+(kernels with visible output).
 
 ### 11. `lu doc` + benchmark observatory
 

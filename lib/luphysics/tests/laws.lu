@@ -1,0 +1,67 @@
+property stationary_body_does_not_move(seed: i64) {
+  let body = Body {
+    position: vec2(float(seed), float(seed) * 0.5),
+    velocity: vec2(0.0, 0.0),
+    force: vec2(0.0, 0.0),
+    inv_mass: 1.0,
+    radius: 1.0,
+  }
+  let moved = integrated_position(body, 0.25)
+  return moved.x ~= body.position.x and moved.y ~= body.position.y
+}
+
+property elastic_circle_collision_preserves_momentum(left: i64, right: i64) {
+  let first = Body {
+    position: vec2(-0.5, 0.0),
+    velocity: vec2(abs(float(left % 17)) + 0.25, 0.0),
+    force: vec2(0.0, 0.0),
+    inv_mass: 1.0,
+    radius: 1.0,
+  }
+  let second = Body {
+    position: vec2(0.5, 0.0),
+    velocity: vec2(-(abs(float(right % 17)) + 0.25), 0.0),
+    force: vec2(0.0, 0.0),
+    inv_mass: 1.0,
+    radius: 1.0,
+  }
+  let before = first.velocity.x + second.velocity.x
+  let first_after = collision_velocity_first(first, second, 1.0)
+  let second_after = collision_velocity_second(first, second, 1.0)
+  let after = first_after.x + second_after.x
+  return before ~= after
+}
+
+property elastic_circle_collision_preserves_energy(left: i64, right: i64) {
+  let first = Body {
+    position: vec2(-0.5, 0.0),
+    velocity: vec2(abs(float(left % 11)) + 0.5, 0.0),
+    force: vec2(0.0, 0.0),
+    inv_mass: 1.0,
+    radius: 1.0,
+  }
+  let second = Body {
+    position: vec2(0.5, 0.0),
+    velocity: vec2(-(abs(float(right % 11)) + 0.5), 0.0),
+    force: vec2(0.0, 0.0),
+    inv_mass: 1.0,
+    radius: 1.0,
+  }
+  let before = length_squared(first.velocity) + length_squared(second.velocity)
+  let first_after = collision_velocity_first(first, second, 1.0)
+  let second_after = collision_velocity_second(first, second, 1.0)
+  let after = length_squared(first_after) + length_squared(second_after)
+  return before ~= after
+}
+
+property zero_timestep_is_identity(seed: i64) {
+  let body = Body {
+    position: vec2(float(seed), -float(seed)),
+    velocity: vec2(3.0, -2.0),
+    force: vec2(8.0, 4.0),
+    inv_mass: 0.5,
+    radius: 0.75,
+  }
+  let moved = integrated_position(body, 0.0)
+  return moved.x ~= body.position.x and moved.y ~= body.position.y
+}

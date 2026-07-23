@@ -1,0 +1,10 @@
+// Boundary-only pointer handles are opaque values: they can cross FFI calls,
+// be stored, and be compared, but cannot expose compiler-owned memory layout.
+extern fn malloc(size: i64): c_ptr[()]
+extern fn free(pointer: c_ptr[()])
+
+main {
+  let pointer = malloc(8)
+  print(pointer == pointer)
+  free(pointer)
+}

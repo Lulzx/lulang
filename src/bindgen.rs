@@ -48,17 +48,24 @@ struct Header {
     enums: Vec<CEnum>,
     functions: Vec<CFunction>,
     aliases: BTreeMap<String, CType>,
-    structs: BTreeSet<String>,
+    structs: BTreeMap<String, Option<Vec<CParam>>>,
     warnings: Vec<String>,
 }
 
 pub struct Generated {
     pub source: String,
+    pub shim_source: Option<String>,
     pub warnings: Vec<String>,
     pub imported_functions: usize,
+    pub shimmed_functions: usize,
 }
 
-pub fn generate(header: &str, input: &Path, library: &str) -> Result<Generated, String> {
+pub fn generate(
+    header: &str,
+    input: &Path,
+    library: &str,
+    shim_library: Option<&str>,
+) -> Result<Generated, String> {
     let mut parsed = parse_header(header)?;
     let mut source = String::new();
     let _ = writeln!(
@@ -70,6 +77,59 @@ pub fn generate(header: &str, input: &Path, library: &str) -> Result<Generated, 
         "// Only declarations with an exact lulang boundary representation are emitted.\n",
     );
     let _ = writeln!(source, "// C library: {}\n", library);
+
+    for (structure, fields) in &parsed.structs {
+        let rendered_fields = fields.as_ref().and_then(|fields| {
+            fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    map_c_layout_field(&field.ty, &parsed.aliases)
+                        .map(|ty| format!("  {}: {},", sanitize_identifier(&field.name, index), ty))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        });
+        if let Some(fields) = rendered_fields {
+            let _ = writeln!(source, "@c_layout type {} {{", structure);
+            for field in fields {
+                let _ = writeln!(source, "{field}");
+            }
+            source.push_str("}\n\n");
+        } else if let Some(fields) = fields.as_ref().and_then(|fields| {
+            fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    map_shim_record_field(&field.ty, &parsed.aliases)
+                        .map(|ty| format!("  {}: {},", sanitize_identifier(&field.name, index), ty))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        }) {
+            let _ = writeln!(
+                source,
+                "// Logical adapter record; C storage is constructed only inside the shim."
+            );
+            let _ = writeln!(source, "type {} {{", structure);
+            for field in fields {
+                let _ = writeln!(source, "{field}");
+            }
+            source.push_str("}\n\n");
+        } else {
+            let _ = writeln!(
+                source,
+                "// Opaque C aggregate; usable only behind c_ptr[{}].",
+                structure
+            );
+            let _ = writeln!(source, "type {} {{}}\n", structure);
+            if fields.is_some() {
+                parsed.warnings.push(format!(
+                    "struct `{structure}` has fields without exact @c_layout representations and remains opaque"
+                ));
+            }
+        }
+    }
 
     for declaration in &parsed.enums {
         if declaration
@@ -125,6 +185,8 @@ pub fn generate(header: &str, input: &Path, library: &str) -> Result<Generated, 
     }
 
     let mut imported = 0;
+    let mut shimmed = 0;
+    let mut shim_definitions = Vec::new();
     for function in &parsed.functions {
         match render_function(function, &parsed.aliases, library) {
             Ok(declaration) => {
@@ -132,10 +194,23 @@ pub fn generate(header: &str, input: &Path, library: &str) -> Result<Generated, 
                 source.push('\n');
                 imported += 1;
             }
-            Err(reason) => parsed.warnings.push(format!(
-                "function `{}` was skipped: {}",
-                function.name, reason
-            )),
+            Err(direct_reason) => {
+                let shim = shim_library.and_then(|shim_library| {
+                    render_shim_function(function, &parsed, shim_library).ok()
+                });
+                if let Some((declaration, definition)) = shim {
+                    source.push_str(&declaration);
+                    source.push('\n');
+                    shim_definitions.push(definition);
+                    imported += 1;
+                    shimmed += 1;
+                } else {
+                    parsed.warnings.push(format!(
+                        "function `{}` was skipped: {}",
+                        function.name, direct_reason
+                    ));
+                }
+            }
         }
     }
     if imported == 0 {
@@ -144,12 +219,6 @@ pub fn generate(header: &str, input: &Path, library: &str) -> Result<Generated, 
             .push("no directly ABI-safe C functions were found".into());
     }
 
-    if !parsed.structs.is_empty() {
-        parsed.warnings.push(format!(
-            "{} struct declaration(s) were indexed but not emitted; fixed-layout boundary records require `@c_layout` support",
-            parsed.structs.len()
-        ));
-    }
     if !parsed.warnings.is_empty() {
         source.push_str("// Bindgen diagnostics:\n");
         for warning in &parsed.warnings {
@@ -158,9 +227,42 @@ pub fn generate(header: &str, input: &Path, library: &str) -> Result<Generated, 
     }
     Ok(Generated {
         source,
+        shim_source: (!shim_definitions.is_empty()).then(|| {
+            format!(
+                "#include <stdbool.h>\n#include <stdint.h>\n#include \"{}\"\n\n{}\n",
+                escape_c_include(input),
+                shim_definitions.join("\n\n")
+            )
+        }),
         warnings: parsed.warnings,
         imported_functions: imported,
+        shimmed_functions: shimmed,
     })
+}
+
+fn map_shim_record_field(ty: &CType, aliases: &BTreeMap<String, CType>) -> Result<String, String> {
+    let resolved = resolve_alias(ty, aliases)?;
+    if resolved.function_pointer {
+        return Err("function pointer field".into());
+    }
+    if resolved.pointers != 0 {
+        return map_type(&resolved, aliases, false);
+    }
+    let base = canonical_base(&resolved.base);
+    match base.as_str() {
+        "double" => Ok("f64".into()),
+        "float" => Ok("f32".into()),
+        "bool" | "_Bool" => Ok("bool".into()),
+        base if is_signed_c_integer(base) || is_narrow_unsigned_c_integer(base) => Ok("i64".into()),
+        base if base.starts_with("enum ") => Ok("i64".into()),
+        base if base.starts_with("struct ") => base
+            .split_whitespace()
+            .nth(1)
+            .filter(|name| valid_identifier(name))
+            .map(String::from)
+            .ok_or_else(|| "unnamed struct field".into()),
+        _ => Err(format!("field type `{base}` has no adapter representation")),
+    }
 }
 
 fn render_function(
@@ -183,7 +285,7 @@ fn render_function(
     let mut float_classes = 0usize;
     for (index, parameter) in function.params.iter().enumerate() {
         let ty = map_type(&parameter.ty, aliases, false)?;
-        match ty {
+        match ty.as_str() {
             "f64" => float_classes += 1,
             "str" => int_classes += 2,
             _ => int_classes += 1,
@@ -199,35 +301,410 @@ fn render_function(
             "signature needs {int_classes} integer-class and {float_classes} float-class registers; maximum is 6 and 8"
         ));
     }
-    Ok(format!(
-        "extern \"{}\" fn {}({}): {}\n",
+    let declaration = format!(
+        "extern \"{}\" fn {}({})",
         escape_string(library),
         function.name,
-        params.join(", "),
-        ret
-    ))
+        params.join(", ")
+    );
+    Ok(if ret == "()" {
+        format!("{declaration}\n")
+    } else {
+        format!("{declaration}: {ret}\n")
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ShimBoundaryArg {
+    name: String,
+    lu_ty: String,
+    c_ty: &'static str,
+    lu_expr: String,
+}
+
+#[derive(Clone, Debug)]
+struct ShimParamPlan {
+    api_ty: String,
+    boundary: Vec<ShimBoundaryArg>,
+    c_expr: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ShimReturnKind {
+    Unit,
+    I64,
+    F64,
+    F32,
+    Bool,
+    Pointer,
+}
+
+fn render_shim_function(
+    function: &CFunction,
+    header: &Header,
+    shim_library: &str,
+) -> Result<(String, String), String> {
+    if function.variadic {
+        return Err("variadic functions cannot use adapter shims".into());
+    }
+    if function.name.starts_with("lu_") || is_lulang_builtin(&function.name) {
+        return Err("function name cannot be wrapped".into());
+    }
+
+    let mut api_params = Vec::new();
+    let mut boundary = Vec::new();
+    let mut c_call_args = Vec::new();
+    for (index, parameter) in function.params.iter().enumerate() {
+        let api_name = sanitize_identifier(&parameter.name, index);
+        let plan = plan_shim_param(
+            &parameter.ty,
+            header,
+            &api_name,
+            &format!("arg{index}"),
+            &api_name,
+        )?;
+        api_params.push(format!("{api_name}: {}", plan.api_ty));
+        boundary.extend(plan.boundary);
+        c_call_args.push(plan.c_expr);
+    }
+    let return_kind = plan_shim_return(&function.ret, &header.aliases)?;
+
+    let int_classes = boundary
+        .iter()
+        .filter(|argument| argument.lu_ty != "f64")
+        .count();
+    let float_classes = boundary
+        .iter()
+        .filter(|argument| argument.lu_ty == "f64")
+        .count();
+    if int_classes > 6 || float_classes > 8 {
+        return Err(format!(
+            "adapter signature needs {int_classes} integer-class and {float_classes} float-class registers"
+        ));
+    }
+
+    let symbol = format!("__lulang_bindgen_{}", function.name);
+    let boundary_params = boundary
+        .iter()
+        .map(|argument| format!("{}: {}", argument.name, argument.lu_ty))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let boundary_ret = match return_kind {
+        ShimReturnKind::Unit => "()".into(),
+        ShimReturnKind::F64 | ShimReturnKind::F32 => "f64".into(),
+        ShimReturnKind::Pointer => map_type(&function.ret, &header.aliases, true)?,
+        ShimReturnKind::I64 | ShimReturnKind::Bool => "i64".into(),
+    };
+    let mut lu = format!(
+        "extern \"{}\" fn {}({})",
+        escape_string(shim_library),
+        symbol,
+        boundary_params
+    );
+    if boundary_ret != "()" {
+        let _ = write!(lu, ": {boundary_ret}");
+    }
+    lu.push('\n');
+    let _ = write!(lu, "fn {}({})", function.name, api_params.join(", "));
+    let api_ret = shim_api_return(return_kind, &function.ret, &header.aliases)?;
+    if api_ret != "()" {
+        let _ = write!(lu, ": {api_ret}");
+    }
+    lu.push_str(" {\n");
+    let call = format!(
+        "{}({})",
+        symbol,
+        boundary
+            .iter()
+            .map(|argument| argument.lu_expr.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    match return_kind {
+        ShimReturnKind::Unit => {
+            let _ = writeln!(lu, "  {call}");
+        }
+        ShimReturnKind::Bool => {
+            let _ = writeln!(lu, "  return {call} != 0");
+        }
+        _ => {
+            let _ = writeln!(lu, "  return {call}");
+        }
+    }
+    lu.push_str("}\n");
+
+    let c_params = boundary
+        .iter()
+        .map(|argument| format!("{} {}", argument.c_ty, argument.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let original_call = format!("{}({})", function.name, c_call_args.join(", "));
+    let (c_ret, c_body) = match return_kind {
+        ShimReturnKind::Unit => ("void", format!("  {original_call};")),
+        ShimReturnKind::I64 => ("int64_t", format!("  return (int64_t){original_call};")),
+        ShimReturnKind::F64 | ShimReturnKind::F32 => {
+            ("double", format!("  return (double){original_call};"))
+        }
+        ShimReturnKind::Bool => (
+            "int64_t",
+            format!("  return {original_call} ? INT64_C(1) : INT64_C(0);"),
+        ),
+        ShimReturnKind::Pointer => ("void *", format!("  return (void *){original_call};")),
+    };
+    let c = format!(
+        "{c_ret} {symbol}({}) {{\n{c_body}\n}}",
+        if c_params.is_empty() {
+            "void"
+        } else {
+            &c_params
+        }
+    );
+    Ok((lu, c))
+}
+
+fn plan_shim_param(
+    ty: &CType,
+    header: &Header,
+    api_name: &str,
+    boundary_name: &str,
+    lu_expr: &str,
+) -> Result<ShimParamPlan, String> {
+    let resolved = resolve_alias(ty, &header.aliases)?;
+    if resolved.function_pointer {
+        return Err("callbacks are not supported by adapter shims".into());
+    }
+    if resolved.pointers != 0 {
+        let api_ty = map_type(&resolved, &header.aliases, false)?;
+        return Ok(ShimParamPlan {
+            api_ty: api_ty.clone(),
+            boundary: vec![ShimBoundaryArg {
+                name: boundary_name.into(),
+                lu_ty: api_ty,
+                c_ty: "void *",
+                lu_expr: lu_expr.into(),
+            }],
+            c_expr: format!("({}){boundary_name}", c_type_spelling(ty)),
+        });
+    }
+    let base = canonical_base(&resolved.base);
+    if let Some(structure) = base.strip_prefix("struct ") {
+        let fields = header
+            .structs
+            .get(structure)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("struct `{structure}` is opaque"))?;
+        let mut boundary = Vec::new();
+        let mut initializers = Vec::new();
+        for (field_index, field) in fields.iter().enumerate() {
+            let lu_field = sanitize_identifier(&field.name, field_index);
+            let child = plan_shim_param(
+                &field.ty,
+                header,
+                &lu_field,
+                &format!("{boundary_name}_{lu_field}"),
+                &format!("{lu_expr}.{lu_field}"),
+            )?;
+            boundary.extend(child.boundary);
+            initializers.push(format!(".{} = {}", field.name, child.c_expr));
+        }
+        return Ok(ShimParamPlan {
+            api_ty: structure.into(),
+            boundary,
+            c_expr: format!(
+                "({}){{ {} }}",
+                c_type_spelling(&resolved),
+                initializers.join(", ")
+            ),
+        });
+    }
+    let (api_ty, boundary_ty, c_ty, c_expr, lu_boundary_expr) =
+        shim_scalar_param(&base, ty, boundary_name, lu_expr)?;
+    let _ = api_name;
+    Ok(ShimParamPlan {
+        api_ty,
+        boundary: vec![ShimBoundaryArg {
+            name: boundary_name.into(),
+            lu_ty: boundary_ty,
+            c_ty,
+            lu_expr: lu_boundary_expr,
+        }],
+        c_expr,
+    })
+}
+
+fn shim_scalar_param(
+    base: &str,
+    original: &CType,
+    boundary_name: &str,
+    lu_expr: &str,
+) -> Result<(String, String, &'static str, String, String), String> {
+    let cast = c_type_spelling(original);
+    match base {
+        "double" => Ok((
+            "f64".into(),
+            "f64".into(),
+            "double",
+            boundary_name.into(),
+            lu_expr.into(),
+        )),
+        "float" => Ok((
+            "f32".into(),
+            "f64".into(),
+            "double",
+            format!("({cast}){boundary_name}"),
+            format!("float({lu_expr})"),
+        )),
+        "bool" | "_Bool" => Ok((
+            "bool".into(),
+            "i64".into(),
+            "int64_t",
+            format!("({cast})({boundary_name} != 0)"),
+            format!("int({lu_expr})"),
+        )),
+        base if is_signed_c_integer(base) || is_narrow_unsigned_c_integer(base) => Ok((
+            "i64".into(),
+            "i64".into(),
+            "int64_t",
+            format!("({cast}){boundary_name}"),
+            lu_expr.into(),
+        )),
+        base if base.starts_with("enum ") => Ok((
+            "i64".into(),
+            "i64".into(),
+            "int64_t",
+            format!("({cast}){boundary_name}"),
+            lu_expr.into(),
+        )),
+        _ => Err(format!("C scalar `{base}` cannot use an adapter shim")),
+    }
+}
+
+fn plan_shim_return(
+    ty: &CType,
+    aliases: &BTreeMap<String, CType>,
+) -> Result<ShimReturnKind, String> {
+    let resolved = resolve_alias(ty, aliases)?;
+    if resolved.function_pointer {
+        return Err("function pointer returns are not supported".into());
+    }
+    if resolved.pointers != 0 {
+        return Ok(ShimReturnKind::Pointer);
+    }
+    let base = canonical_base(&resolved.base);
+    match base.as_str() {
+        "void" => Ok(ShimReturnKind::Unit),
+        "double" => Ok(ShimReturnKind::F64),
+        "float" => Ok(ShimReturnKind::F32),
+        "bool" | "_Bool" => Ok(ShimReturnKind::Bool),
+        base if is_signed_c_integer(base) || is_narrow_unsigned_c_integer(base) => {
+            Ok(ShimReturnKind::I64)
+        }
+        base if base.starts_with("enum ") => Ok(ShimReturnKind::I64),
+        _ => Err(format!("C return type `{base}` cannot use an adapter shim")),
+    }
+}
+
+fn shim_api_return(
+    kind: ShimReturnKind,
+    ty: &CType,
+    aliases: &BTreeMap<String, CType>,
+) -> Result<String, String> {
+    Ok(match kind {
+        ShimReturnKind::Unit => "()".into(),
+        ShimReturnKind::I64 => "i64".into(),
+        ShimReturnKind::F64 => "f64".into(),
+        ShimReturnKind::F32 => "f32".into(),
+        ShimReturnKind::Bool => "bool".into(),
+        ShimReturnKind::Pointer => map_type(ty, aliases, true)?,
+    })
+}
+
+fn is_signed_c_integer(base: &str) -> bool {
+    matches!(
+        base,
+        "char"
+            | "signed char"
+            | "short"
+            | "short int"
+            | "signed short"
+            | "signed short int"
+            | "int"
+            | "signed"
+            | "signed int"
+            | "int8_t"
+            | "int16_t"
+            | "int32_t"
+            | "int64_t"
+            | "signed long"
+            | "signed long int"
+            | "long"
+            | "long int"
+            | "ssize_t"
+            | "intptr_t"
+            | "ptrdiff_t"
+    )
+}
+
+fn is_narrow_unsigned_c_integer(base: &str) -> bool {
+    matches!(
+        base,
+        "unsigned char"
+            | "unsigned short"
+            | "unsigned short int"
+            | "unsigned int"
+            | "uint8_t"
+            | "uint16_t"
+            | "uint32_t"
+    )
+}
+
+fn c_type_spelling(ty: &CType) -> String {
+    let mut rendered = ty.base.clone();
+    for _ in 0..ty.pointers {
+        rendered.push_str(" *");
+    }
+    rendered
+}
+
+fn escape_c_include(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 fn map_type(
     ty: &CType,
     aliases: &BTreeMap<String, CType>,
     return_position: bool,
-) -> Result<&'static str, String> {
+) -> Result<String, String> {
     let resolved = resolve_alias(ty, aliases)?;
     if resolved.function_pointer {
         return Err("function pointers are deferred with callbacks".into());
     }
     if resolved.pointers != 0 {
-        return Err(
-            "raw pointers and opaque handles require the boundary-only `c_ptr[T]` type".into(),
-        );
+        let mut pointee = match canonical_base(&resolved.base).as_str() {
+            "double" => "f64".into(),
+            "int64_t" | "signed long" | "signed long int" | "long" | "long int" | "intptr_t"
+            | "ptrdiff_t" => "i64".into(),
+            base if base.starts_with("struct ") || base.starts_with("union ") => base
+                .split_whitespace()
+                .nth(1)
+                .filter(|name| valid_identifier(name))
+                .unwrap_or("()")
+                .into(),
+            _ => "()".into(),
+        };
+        for _ in 0..resolved.pointers {
+            pointee = format!("c_ptr[{pointee}]");
+        }
+        return Ok(pointee);
     }
     match canonical_base(&resolved.base).as_str() {
-        "void" if return_position => Ok("()"),
+        "void" if return_position => Ok("()".into()),
         "void" => Err("a parameter cannot have type void".into()),
-        "double" => Ok("f64"),
+        "double" => Ok("f64".into()),
         "int64_t" | "signed long" | "signed long int" | "long" | "long int" | "intptr_t"
-        | "ptrdiff_t" => Ok("i64"),
+        | "ptrdiff_t" => Ok("i64".into()),
         "bool" | "_Bool" => Err(
             "C bool is not the lulang boundary bool (`int64_t`); a conversion shim is required"
                 .into(),
@@ -242,6 +719,32 @@ fn map_type(
         }
         base => Err(format!(
             "C type `{base}` has no exact boundary representation"
+        )),
+    }
+}
+
+fn map_c_layout_field(ty: &CType, aliases: &BTreeMap<String, CType>) -> Result<String, String> {
+    let resolved = resolve_alias(ty, aliases)?;
+    if resolved.function_pointer {
+        return Err("function pointer field".into());
+    }
+    if resolved.pointers != 0 {
+        return map_type(&resolved, aliases, false);
+    }
+    match canonical_base(&resolved.base).as_str() {
+        "double" => Ok("f64".into()),
+        "float" => Ok("f32".into()),
+        "int64_t" | "signed long" | "signed long int" | "long" | "long int" | "intptr_t"
+        | "ptrdiff_t" => Ok("i64".into()),
+        base if base.starts_with("struct ") => base
+            .split_whitespace()
+            .nth(1)
+            .filter(|name| valid_identifier(name))
+            .map(String::from)
+            .ok_or_else(|| "unnamed struct field".into()),
+        _ => Err(format!(
+            "C field type `{}` has no exact layout representation",
+            resolved.base
         )),
     }
 }
@@ -620,17 +1123,53 @@ fn parse_enum(tokens: &[String], alias: Option<String>) -> Option<CEnum> {
 }
 
 fn index_struct(tokens: &[String], header: &mut Header) {
-    if let Some(name) = tokens.get(1).filter(|token| valid_identifier(token)) {
-        header.structs.insert(name.clone());
-    }
-    if let Some(close) = tokens.iter().rposition(|token| token == "}") {
-        if let Some(alias) = tokens
-            .get(close + 1)
-            .filter(|token| valid_identifier(token))
-        {
-            header.structs.insert(alias.clone());
+    let tag = tokens
+        .get(1)
+        .filter(|token| valid_identifier(token))
+        .cloned();
+    let open = tokens.iter().position(|token| token == "{");
+    let close = tokens.iter().rposition(|token| token == "}");
+    let alias = close
+        .and_then(|close| tokens.get(close + 1))
+        .filter(|token| valid_identifier(token))
+        .cloned();
+    let Some(name) = tag.or(alias) else {
+        return;
+    };
+    let fields = match (tokens.first().map(String::as_str), open, close) {
+        (Some("struct"), Some(open), Some(close)) if open < close => {
+            let mut fields = Vec::new();
+            let mut start = open + 1;
+            let mut valid = true;
+            for end in open + 1..=close {
+                if end == close || tokens[end] == ";" {
+                    let declaration = &tokens[start..end];
+                    if !declaration.is_empty() {
+                        if declaration.iter().any(|token| token == "[")
+                            || declaration.iter().any(|token| token == ":")
+                            || declaration.iter().any(|token| token == ",")
+                        {
+                            valid = false;
+                            break;
+                        }
+                        fields.push(parse_parameter(declaration, fields.len()));
+                    }
+                    start = end + 1;
+                }
+            }
+            (valid && !fields.is_empty()).then_some(fields)
         }
-    }
+        _ => None,
+    };
+    header
+        .structs
+        .entry(name)
+        .and_modify(|existing| {
+            if fields.is_some() {
+                *existing = fields.clone();
+            }
+        })
+        .or_insert(fields);
 }
 
 fn parse_function(tokens: &[String]) -> Option<CFunction> {
@@ -823,7 +1362,7 @@ mod tests {
             double hypot(double x, double y);
             int64_t count(index_t n);
         "#;
-        let generated = generate(header, Path::new("sample.h"), "m").unwrap();
+        let generated = generate(header, Path::new("sample.h"), "m", None).unwrap();
         assert!(generated.source.contains("fn LIMIT(): i64"));
         assert!(generated.source.contains("fn RATE(): f64"));
         assert!(generated.source.contains("enum state"));
@@ -844,7 +1383,7 @@ mod tests {
             void *allocate(size_t size);
             int64_t callback(int64_t (*f)(int64_t));
         "#;
-        let generated = generate(header, Path::new("unsafe.h"), "unsafe").unwrap();
+        let generated = generate(header, Path::new("unsafe.h"), "unsafe", None).unwrap();
         assert_eq!(generated.imported_functions, 0);
         assert!(generated
             .warnings
@@ -853,7 +1392,7 @@ mod tests {
         assert!(generated
             .warnings
             .iter()
-            .any(|warning| warning.contains("raw pointers")));
+            .any(|warning| warning.contains("size_t")));
         assert!(generated
             .warnings
             .iter()
