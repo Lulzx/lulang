@@ -12,7 +12,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: lu <run|build|check|interp> <file.lu> [program args...]\n\
          \x20      lu build --lib [--shared] [-o name] <file.lu>\n\
-         \x20      lu bindgen [--lib name] [-o file.lu] <header.h>\n\
+         \x20      lu bindgen [--lib name] [--no-shims] [-o file.lu] <header.h>\n\
          \x20      lu test [--runs N] <file.lu>\n\
          \x20      lu fmt [--check] <file.lu>"
     );
@@ -32,6 +32,7 @@ fn main() -> ExitCode {
     let mut build_shared = false;
     let mut output_name = None;
     let mut bindgen_library = None;
+    let mut bindgen_shims = true;
     let mut positionals = Vec::new();
     let mut i = if args.len() == 2 { 1 } else { 2 };
     while i < args.len() {
@@ -65,6 +66,10 @@ fn main() -> ExitCode {
                 bindgen_library = Some(value.clone());
                 i += 2;
             }
+            "--no-shims" if mode == "bindgen" => {
+                bindgen_shims = false;
+                i += 1;
+            }
             "--shared" if mode == "build" => {
                 build_shared = true;
                 i += 1;
@@ -94,7 +99,12 @@ fn main() -> ExitCode {
         if positionals.len() != 1 {
             return usage();
         }
-        return run_bindgen(path, output_name.as_deref(), bindgen_library.as_deref());
+        return run_bindgen(
+            path,
+            output_name.as_deref(),
+            bindgen_library.as_deref(),
+            bindgen_shims,
+        );
     }
     if !matches!(mode, "test" | "fmt") && positionals.len() > 1 {
         let program_args = positionals[1..].to_vec();
@@ -169,7 +179,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_bindgen(path: &str, output: Option<&str>, library: Option<&str>) -> ExitCode {
+fn run_bindgen(
+    path: &str,
+    output: Option<&str>,
+    library: Option<&str>,
+    build_shims: bool,
+) -> ExitCode {
     let header = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) => {
@@ -190,17 +205,57 @@ fn run_bindgen(path: &str, output: Option<&str>, library: Option<&str>) -> ExitC
                 .unwrap_or("c")
         });
     let library = library.unwrap_or(inferred_library);
-    let generated = match bindgen::generate(&header, input, library) {
+    let default_output = input.with_extension("lu");
+    let output = output
+        .map(std::path::PathBuf::from)
+        .unwrap_or(default_output);
+    let shim_output = (build_shims && output.as_os_str() != "-").then(|| {
+        output.with_extension(if cfg!(target_os = "macos") {
+            "bindgen.dylib"
+        } else {
+            "bindgen.so"
+        })
+    });
+    let shim_reference = shim_output.as_ref().map(|path| {
+        if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(path)
+        }
+    });
+    let include_path = std::fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
+    let generated = match bindgen::generate(
+        &header,
+        &include_path,
+        library,
+        shim_reference.as_deref().and_then(std::path::Path::to_str),
+    ) {
         Ok(generated) => generated,
         Err(error) => {
             eprintln!("error: cannot parse {}: {}", path, error);
             return ExitCode::FAILURE;
         }
     };
-    let default_output = input.with_extension("lu");
-    let output = output
-        .map(std::path::PathBuf::from)
-        .unwrap_or(default_output);
+    if let (Some(shim_source), Some(shim_output)) =
+        (generated.shim_source.as_deref(), shim_output.as_deref())
+    {
+        let shim_c = output.with_extension("bindgen.c");
+        if let Err(error) = std::fs::write(&shim_c, shim_source) {
+            eprintln!("error: cannot write {}: {}", shim_c.display(), error);
+            return ExitCode::FAILURE;
+        }
+        if let Err(error) = compile_bindgen_shim(&shim_c, shim_output, library) {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "built {} C adapter shim(s) in {}",
+            generated.shimmed_functions,
+            shim_output.display()
+        );
+    }
     if output.as_os_str() == "-" {
         print!("{}", generated.source);
     } else if let Err(error) = std::fs::write(&output, &generated.source) {
@@ -220,6 +275,40 @@ fn run_bindgen(path: &str, output: Option<&str>, library: Option<&str>) -> ExitC
         }
     );
     ExitCode::SUCCESS
+}
+
+fn compile_bindgen_shim(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    library: &str,
+) -> Result<(), String> {
+    let mut command = std::process::Command::new("cc");
+    if cfg!(target_os = "macos") {
+        command.arg("-dynamiclib");
+    } else {
+        command.args(["-shared", "-fPIC"]);
+    }
+    command
+        .args(["-O2", "-std=c11"])
+        .arg(source)
+        .arg("-o")
+        .arg(output);
+    if library.contains('/') || library.ends_with(".so") || library.ends_with(".dylib") {
+        command.arg(library);
+    } else if !library.is_empty() && library != "c" {
+        command.arg(format!("-l{library}"));
+    }
+    let result = command
+        .output()
+        .map_err(|error| format!("cannot start C compiler for bindgen shim: {error}"))?;
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "C adapter shim compilation failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        ))
+    }
 }
 
 fn run_pipeline(

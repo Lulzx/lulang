@@ -101,11 +101,15 @@ and functions whose C types have an exact lulang boundary representation.
 Raw pointers and opaque structs are emitted as boundary-only `c_ptr[T]`
 handles: they may cross an `extern` boundary, be stored, passed, and compared,
 but cannot be dereferenced or used to expose C layout. Declarations involving
-narrower C integers, `float`, C `bool`, callbacks, or by-value aggregates are
-parsed but reported as explicit diagnostics. They are not silently widened or
-reinterpreted. Exact C structs are emitted as `@c_layout` records and included
-in generated headers/manifests; passing them by value remains deliberately
-disabled until each target's aggregate calling convention is implemented.
+narrower C integers, `float`, C `bool`, or by-value struct parameters use a
+generated C adapter shared library. The public lulang wrapper keeps the useful
+logical type while the private adapter crosses only the stable scalar ABI.
+This works in the interpreter, JIT, LLVM AOT, and self-hosted compiler without
+making compiler-owned record layout part of the C ABI. The reproducible
+adapter source is written beside the bindings as `*.bindgen.c`; use
+`--no-shims` to emit only declarations that need no adapter. Variadic
+functions, callbacks, unions, bitfields, and by-value aggregate returns remain
+explicit diagnostics.
 
 ### Editor tooling
 

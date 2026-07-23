@@ -142,13 +142,15 @@ and checker-valid `extern` generation. The second adds boundary-only
 `c_ptr[T]`, opaque C structs, and end-to-end pointer calls in the interpreter,
 JIT, AOT, and self-hosted compiler. Unsupported pointees degrade to the
 explicit untyped handle `c_ptr[()]`; no C layout is inferred. Narrower
-integers, `float`, C `bool`, callbacks, and by-value aggregates remain
-diagnostics instead of being unsafely widened. A macOS `math.h` preflight
-currently produces 41 checker-valid imports. The remaining work for the full
-promised subset is now split cleanly: bindgen emits validated `@c_layout`
-record declarations plus header/manifest layout metadata, while by-value
-aggregate calls stay disabled until target ABI classification lands.
-Conversion shims for C-width scalars follow, then callbacks.
+integers, `float`, C `bool`, and by-value struct parameters now use generated
+C adapter shims: public wrappers retain their logical types, while private
+externs use only the proven scalar boundary ABI. Exact records carry
+`@c_layout`; records containing narrow fields become logical adapter records,
+never false layout claims. The adapters run through all four tiers and avoid
+duplicating platform aggregate classification in each backend. A macOS
+`math.h` preflight currently produces 41 direct checker-valid imports.
+Remaining explicit diagnostics are aggregate returns, unions, bitfields,
+variadics, and callbacks.
 
 ### 8. WASM target
 

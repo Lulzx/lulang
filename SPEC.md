@@ -197,6 +197,14 @@ manifests describe annotated records. By-value aggregate calls remain rejected
 until the backend implements the target C ABI's aggregate classification;
 using an annotated record behind `c_ptr[Name]` is already supported.
 
+Generated bindgen adapters may expose a record-valued lulang parameter without
+passing that record through the boundary. The generated lulang wrapper
+flattens its logical fields into supported scalar arguments, and generated C
+code reconstructs the C value before the real call. Narrow integer, C `float`,
+and C `_Bool` conversions follow the same rule. This is an adapter contract,
+not a relaxation of the boundary type set or a promise about internal record
+layout.
+
 ---
 
 # v0.2 additions (M6 — the self-hosting surface)

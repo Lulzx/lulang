@@ -23,7 +23,7 @@ fn bindgen_generates_checker_valid_imports_and_reports_deferred_types() {
     let output = directory.join("mini_bindgen.lu");
 
     let generated = Command::new(lu())
-        .args(["bindgen", "--lib", "m", "-o"])
+        .args(["bindgen", "--no-shims", "--lib", "m", "-o"])
         .arg(&output)
         .arg(fixture())
         .output()
@@ -108,13 +108,29 @@ fn generated_imports_call_a_compiled_c_library() {
         "bindgen failed:\n{}",
         String::from_utf8_lossy(&generated.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&generated.stderr).contains("built 5 C adapter shim(s)"),
+        "missing shim build report:\n{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let generated_source = std::fs::read_to_string(&bindings).expect("read generated bindings");
+    assert!(generated_source.contains("fn bindgen_half(value: f32): f32"));
+    assert!(generated_source.contains("fn bindgen_increment_i32(value: i64): i64"));
+    assert!(generated_source.contains("fn bindgen_is_positive(value: i64): bool"));
+    assert!(generated_source.contains("fn bindgen_pair_sum(value: bindgen_pair): f64"));
+    assert!(generated_source.contains("type bindgen_mixed"));
+    assert!(generated_source.contains("count: i64"));
+    assert!(generated_source.contains("scale: f32"));
+    let shim_source = std::fs::read_to_string(bindings.with_extension("bindgen.c"))
+        .expect("read generated C adapter");
+    assert!(shim_source.contains("(struct bindgen_pair){ .x = arg0_x, .y = arg0_y }"));
     let mut bindings_file = OpenOptions::new()
         .append(true)
         .open(&bindings)
         .expect("open generated bindings");
     write!(
         bindings_file,
-        "\nmain {{\n  print(bindgen_add(20, 22))\n  print(bindgen_scale(1.5, 2.0))\n  let box = bindgen_box_new(99)\n  print(bindgen_box_read(box))\n  bindgen_box_free(box)\n}}\n"
+        "\nmain {{\n  print(bindgen_add(20, 22))\n  print(bindgen_scale(1.5, 2.0))\n  print(bindgen_half(9.0))\n  print(bindgen_increment_i32(41))\n  print(bindgen_is_positive(3))\n  print(bindgen_pair_sum(bindgen_pair {{ x: 1.25, y: 2.75 }}))\n  print(bindgen_mixed_value(bindgen_mixed {{ count: 3, scale: 1.5 }}))\n  let box = bindgen_box_new(99)\n  print(bindgen_box_read(box))\n  bindgen_box_free(box)\n}}\n"
     )
     .expect("append test program");
 
@@ -131,7 +147,7 @@ fn generated_imports_call_a_compiled_c_library() {
         );
         assert_eq!(
             String::from_utf8_lossy(&executed.stdout),
-            "42\n3\n99\n",
+            "42\n3\n4.5\n42\ntrue\n4\n4.5\n99\n",
             "unexpected {mode} output"
         );
     }
@@ -156,10 +172,63 @@ fn generated_imports_call_a_compiled_c_library() {
         "AOT generated bindings failed:\n{}",
         String::from_utf8_lossy(&executed.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&executed.stdout), "42\n3\n99\n");
+    assert_eq!(
+        String::from_utf8_lossy(&executed.stdout),
+        "42\n3\n4.5\n42\ntrue\n4\n4.5\n99\n"
+    );
+
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let selfhost_interp = Command::new(lu())
+        .arg("run")
+        .arg(repository.join("selfhost/interp.lu"))
+        .arg(&bindings)
+        .output()
+        .expect("run bindings through self-hosted interpreter");
+    assert!(
+        selfhost_interp.status.success(),
+        "self-hosted interpreter failed:\n{}",
+        String::from_utf8_lossy(&selfhost_interp.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&selfhost_interp.stdout),
+        "42\n3\n4.5\n42\ntrue\n4\n4.5\n99\n"
+    );
+
+    let selfhost_executable = directory.join("bindgen_runtime_selfhost");
+    let selfhost_build = Command::new(repository.join("selfhost/build.sh"))
+        .arg(&bindings)
+        .arg("-o")
+        .arg(&selfhost_executable)
+        .current_dir(&repository)
+        .output()
+        .expect("build bindings with self-hosted compiler");
+    assert!(
+        selfhost_build.status.success(),
+        "self-hosted build failed:\n{}",
+        String::from_utf8_lossy(&selfhost_build.stderr)
+    );
+    let selfhost_output = Command::new(&selfhost_executable)
+        .output()
+        .expect("run self-hosted bindings");
+    assert!(
+        selfhost_output.status.success(),
+        "self-hosted executable failed:\n{}",
+        String::from_utf8_lossy(&selfhost_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&selfhost_output.stdout),
+        "42\n3\n4.5\n42\ntrue\n4\n4.5\n99\n"
+    );
 
     let _ = std::fs::remove_file(&bindings);
+    let _ = std::fs::remove_file(bindings.with_extension("bindgen.c"));
+    let _ = std::fs::remove_file(bindings.with_extension(if cfg!(target_os = "macos") {
+        "bindgen.dylib"
+    } else {
+        "bindgen.so"
+    }));
     let _ = std::fs::remove_file(&library);
     let _ = std::fs::remove_file(&executable);
+    let _ = std::fs::remove_file(&selfhost_executable);
     let _ = std::fs::remove_dir(&directory);
 }
