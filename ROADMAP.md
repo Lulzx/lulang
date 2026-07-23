@@ -32,7 +32,7 @@ than exposing internals.
 | 3 | `pylulang`: NumPy/Python bindings — **complete (v0.1)** | Exceptional | Medium |
 | 4 | LSP + VS Code extension (tree-sitter first) — **complete (v0.1)** | Very high | Medium |
 | 5 | `lu-numerics` first-party library corpus — **foundation shipped** | Very high | Continuous |
-| 6 | Web playground (interpreter → wasm32) | High | Medium |
+| 6 | Web playground (interpreter → wasm32) — **v0.1 shipped** | High | Medium |
 | 7 | `lu bindgen` C-header importer | Very high | Medium–high |
 | 8 | `wasm32-wasi` / `wasm32-web` target | High | Medium |
 | 9 | Git-based package manager (`lu.toml`) | High once libraries exist | Medium |
@@ -117,14 +117,14 @@ they should appear throughout the ecosystem, not stay a compiler demo.
 
 ### 6. Web playground
 
-`play.lulang.org`: editor, preloaded examples, run, property-test, inspect
-lowered IR, compare generated LLVM, shareable permalinks. Compile the
-reference interpreter to wasm32 (the CFG evaluator compiles where Cranelift
-won't). Native speed in the browser is not the point — removing installation
-friction is. Best examples are visual and surprising: quaternion slerp,
-N-body, Mandelbrot, particle systems, property counterexamples, numerical
-instability demos. A language grows faster when its central idea can be
-experienced in ten seconds.
+The first public version at `lulang.lulzx.space` includes a local browser
+interpreter, editable source, and examples for functions, reductions, arrays,
+and value semantics. It has no server-side execution and requires no install.
+Next: compile the reference interpreter to wasm32 (the CFG evaluator compiles
+where Cranelift won't), then add property tests, lowered IR, generated LLVM,
+and shareable permalinks. Best later examples are visual and surprising:
+quaternion slerp, N-body, Mandelbrot, particle systems, property
+counterexamples, and numerical-instability demos.
 
 ### 7. `lu bindgen`
 

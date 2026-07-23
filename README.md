@@ -1,5 +1,7 @@
 # lulang
 
+[Website and online interpreter](https://lulang.lulzx.space)
+
 A numerics-first programming language built from scratch to test a thesis: that the
 extraordinary performance claims of [Rysana's unreleased AE
 language](ae-research.md) fall out of **language semantics**, not compiler magic —
