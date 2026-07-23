@@ -1,0 +1,72 @@
+// Long-polling echo bot. Run it through run_echo_bot.sh so the generated
+// lutelegram library is composed into the same compilation unit.
+
+fn echo_updates(token: str, updates: str, offset: i64): i64 {
+  var next_offset = offset
+  for i in 0..json_array_len(updates) {
+    let update = Update { json: json_array_get(updates, i) }
+    let update_id = update_get_update_id(update)
+    if update_id >= next_offset { next_offset = update_id + 1 }
+    if update_has_message(update) {
+      let message = update_get_message(update)
+      if message_has_text(message) {
+        let chat = message_get_chat(message)
+        let params = SendMessageParams {
+          chat_id: json_from_i64(chat_get_id(chat)),
+          text: concat("Echo: ", message_get_text(message)),
+          optional: "{}",
+        }
+        let sent = send_message(token, params)
+        if not sent.ok { print("sendMessage failed:", sent.error.description) }
+      }
+    }
+  }
+  return next_offset
+}
+
+fn check_bot(token: str) {
+  let response = get_me(token, GetMeParams { optional: "{}" })
+  if response.ok {
+    if user_has_username(response.result) {
+      print(concat("Authenticated as @", user_get_username(response.result)))
+    } else {
+      print("Authenticated as", user_get_first_name(response.result))
+    }
+  } else {
+    print("Authentication failed:", response.error.description)
+  }
+}
+
+fn prepare_polling(token: str): bool {
+  let response = delete_webhook(token, DeleteWebhookParams { optional: "{}" })
+  if not response.ok {
+    print("deleteWebhook failed:", response.error.description)
+    return false
+  }
+  return true
+}
+
+main {
+  if nargs() < 1 {
+    print("Set TELEGRAM_BOT_TOKEN before running this example.")
+  } else {
+    let token = arg(0)
+    if nargs() > 1 and arg(1) == "--check" {
+      check_bot(token)
+    } else {
+      check_bot(token)
+      if prepare_polling(token) {
+        var offset = 0
+        while true {
+          let options = concat(concat("{\"offset\":", json_from_i64(offset)), ",\"timeout\":25}")
+          let response = get_updates(token, GetUpdatesParams { optional: options })
+          if response.ok {
+            offset = echo_updates(token, response.result, offset)
+          } else {
+            print("getUpdates failed:", response.error.description)
+          }
+        }
+      }
+    }
+  }
+}

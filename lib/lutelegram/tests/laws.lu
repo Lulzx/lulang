@@ -6,6 +6,11 @@ property json_object_navigation() {
   json_get("{\"outer\":{\"name\":\"Ada\",\"items\":[1,2,3]},\"ok\":true}", "ok") == "true" and json_get(json_get("{\"outer\":{\"name\":\"Ada\",\"items\":[1,2,3]}}", "outer"), "name") == "\"Ada\""
 }
 
+property json_array_navigation() {
+  let source = "[{\"id\":1},[2,3],\"Lu\"]"
+  return json_array_len(source) == 3 and json_get(json_array_get(source, 0), "id") == "1" and json_array_get(source, 1) == "[2,3]" and json_string(json_array_get(source, 2)) == "Lu"
+}
+
 property generated_user_accessors() {
   let user = User { json: "{\"id\":42,\"is_bot\":true,\"first_name\":\"Lu\"}" }
   return user_get_id(user) == 42 and user_get_is_bot(user) and user_get_first_name(user) == "Lu" and not user_has_username(user)

@@ -74,6 +74,21 @@ Use `LD_LIBRARY_PATH` instead on Linux. Keep the token in an environment or
 secret manager in production; the positional argument above is only a compact
 example.
 
+## Echo bot
+
+The package includes a small long-polling bot that echoes every text message:
+
+```sh
+export TELEGRAM_BOT_TOKEN='replace-me'
+./run_echo_bot.sh --check
+./run_echo_bot.sh
+```
+
+`--check` authenticates and exits without polling or sending messages. The
+runner reads the token only from the environment, builds the native bridge,
+combines the generated library with `examples/echo_bot.lu` in a temporary
+compilation unit, and removes that unit when the process exits.
+
 ## Regenerate from Telegram
 
 ```sh

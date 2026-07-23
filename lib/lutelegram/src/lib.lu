@@ -85,6 +85,36 @@ fn json_get(source: str, wanted: str): str {
   return ""
 }
 
+fn json_array_len(source: str): i64 {
+  var i = json_skip(source, 0)
+  if i >= len(source) or source[i] != 91 { return 0 }
+  i = json_skip(source, i + 1)
+  if i < len(source) and source[i] == 93 { return 0 }
+  var count = 0
+  while i < len(source) and source[i] != 93 {
+    i = json_value_end(source, i)
+    count = count + 1
+    i = json_skip(source, i)
+    if i < len(source) and source[i] == 44 { i = json_skip(source, i + 1) }
+  }
+  return count
+}
+
+fn json_array_get(source: str, wanted: i64): str {
+  var i = json_skip(source, 0)
+  if wanted < 0 or i >= len(source) or source[i] != 91 { return "" }
+  i = json_skip(source, i + 1)
+  var index = 0
+  while i < len(source) and source[i] != 93 {
+    let ending = json_value_end(source, i)
+    if index == wanted { return substr(source, i, ending) }
+    index = index + 1
+    i = json_skip(source, ending)
+    if i < len(source) and source[i] == 44 { i = json_skip(source, i + 1) }
+  }
+  return ""
+}
+
 fn json_hex(byte: i64): i64 {
   if byte >= 48 and byte <= 57 { return byte - 48 }
   if byte >= 65 and byte <= 70 { return byte - 55 }
