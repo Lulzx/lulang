@@ -107,25 +107,22 @@ pub extern "C" fn lu_print_nl() {
     println!();
 }
 
-fn arr_alloc(n: i64, stride: i64) -> *mut u8 {
-    let slot_count = n
-        .checked_mul(stride)
-        .filter(|&v| n >= 0 && stride > 0 && v >= 0)
-        .unwrap_or_else(|| {
-            eprintln!("error: invalid array length {} with stride {}", n, stride);
-            std::process::exit(1);
-        });
-    let slots = usize::try_from(slot_count).unwrap_or_else(|_| {
+fn arr_alloc(n: i64, data_bytes: i64) -> *mut u8 {
+    if n < 0 || data_bytes < 0 {
+        eprintln!(
+            "error: invalid array length {} with {} data bytes",
+            n, data_bytes
+        );
+        std::process::exit(1);
+    }
+    let data_bytes = usize::try_from(data_bytes).unwrap_or_else(|_| {
         eprintln!("error: array allocation size overflow");
         std::process::exit(1);
     });
-    let bytes = slots
-        .checked_mul(8)
-        .and_then(|v| v.checked_add(8))
-        .unwrap_or_else(|| {
-            eprintln!("error: array allocation size overflow");
-            std::process::exit(1);
-        });
+    let bytes = data_bytes.checked_add(16).unwrap_or_else(|| {
+        eprintln!("error: array allocation size overflow");
+        std::process::exit(1);
+    });
     let layout = Layout::from_size_align(bytes, 8).unwrap_or_else(|_| {
         eprintln!("error: array allocation size overflow");
         std::process::exit(1);
@@ -135,7 +132,10 @@ fn arr_alloc(n: i64, stride: i64) -> *mut u8 {
         eprintln!("error: out of memory allocating array of {} elements", n);
         std::process::exit(1);
     }
-    unsafe { *(p as *mut i64) = slot_count };
+    unsafe {
+        *(p as *mut i64) = n;
+        *(p.add(8) as *mut i64) = data_bytes as i64;
+    }
     // Fresh arrays are SSA temporaries until a language local retains them
     // through `lu_arr_clone`.
     array_refs().lock().unwrap().insert(p as usize, 0);
@@ -143,8 +143,12 @@ fn arr_alloc(n: i64, stride: i64) -> *mut u8 {
 }
 
 pub extern "C" fn lu_arr_new_f64(n: i64, init: f64) -> *mut u8 {
-    let p = arr_alloc(n, 1);
-    let data = unsafe { (p.add(8)) as *mut f64 };
+    let bytes = n.checked_mul(8).unwrap_or_else(|| {
+        eprintln!("error: array allocation size overflow");
+        std::process::exit(1);
+    });
+    let p = arr_alloc(n, bytes);
+    let data = unsafe { (p.add(16)) as *mut f64 };
     for i in 0..n as usize {
         unsafe { *data.add(i) = init };
     }
@@ -152,18 +156,58 @@ pub extern "C" fn lu_arr_new_f64(n: i64, init: f64) -> *mut u8 {
 }
 
 pub extern "C" fn lu_arr_new_i64(n: i64, init: i64) -> *mut u8 {
-    let p = arr_alloc(n, 1);
-    let data = unsafe { (p.add(8)) as *mut i64 };
+    let bytes = n.checked_mul(8).unwrap_or_else(|| {
+        eprintln!("error: array allocation size overflow");
+        std::process::exit(1);
+    });
+    let p = arr_alloc(n, bytes);
+    let data = unsafe { (p.add(16)) as *mut i64 };
     for i in 0..n as usize {
         unsafe { *data.add(i) = init };
     }
     p
 }
 
-/// Uninitialized array of `n` 8-byte slots (JIT emits the fill loop — record
-/// arrays are laid out SoA, a decision the compiler owns, not the runtime).
-pub extern "C" fn lu_arr_new_raw(n: i64, stride: i64) -> *mut u8 {
-    arr_alloc(n, stride)
+/// Uninitialized typed array. Scalar f32 arrays are packed; multi-component
+/// SoA arrays use individually 8-byte-aligned planes.
+pub extern "C" fn lu_arr_new_raw(
+    n: i64,
+    f32_components: i64,
+    wide_components: i64,
+    soa: i64,
+) -> *mut u8 {
+    let components = f32_components
+        .checked_add(wide_components)
+        .filter(|_| n >= 0 && f32_components >= 0 && wide_components >= 0)
+        .filter(|&count| count > 0)
+        .unwrap_or_else(|| {
+            eprintln!("error: invalid typed array layout");
+            std::process::exit(1);
+        });
+    let bytes = if components == 1 {
+        n.checked_mul(if f32_components == 1 { 4 } else { 8 })
+    } else if soa != 0 {
+        let wide_plane = n.checked_mul(8);
+        let f32_plane = n
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(7))
+            .map(|bytes| bytes & !7);
+        wide_plane
+            .and_then(|plane| plane.checked_mul(wide_components))
+            .and_then(|wide| {
+                f32_plane
+                    .and_then(|plane| plane.checked_mul(f32_components))
+                    .and_then(|f32| wide.checked_add(f32))
+            })
+    } else {
+        n.checked_mul(components)
+            .and_then(|slots| slots.checked_mul(8))
+    }
+    .unwrap_or_else(|| {
+        eprintln!("error: array allocation size overflow");
+        std::process::exit(1);
+    });
+    arr_alloc(n, bytes)
 }
 
 /// Share an immutable array allocation at a language value-copy boundary.
@@ -193,16 +237,16 @@ pub extern "C" fn lu_arr_cow(source: *const u8) -> *mut u8 {
         }
         *count -= 1;
     }
-    let slots = unsafe { *(source as *const i64) };
-    let bytes = usize::try_from(slots)
+    let logical = unsafe { *(source as *const i64) };
+    let data_bytes = unsafe { *(source.add(8) as *const i64) };
+    let bytes = usize::try_from(data_bytes)
         .ok()
-        .and_then(|n| n.checked_mul(8))
-        .and_then(|n| n.checked_add(8))
+        .and_then(|n| n.checked_add(16))
         .unwrap_or_else(|| {
             eprintln!("error: array allocation size overflow");
             std::process::exit(1);
         });
-    let copy = arr_alloc(slots, 1);
+    let copy = arr_alloc(logical, data_bytes);
     array_refs().lock().unwrap().insert(copy as usize, 1);
     unsafe { std::ptr::copy_nonoverlapping(source, copy, bytes) };
     copy

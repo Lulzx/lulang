@@ -10,6 +10,9 @@ pub enum Value {
     Int(i64),
     Float32(f32),
     Float(f64),
+    F32x4([f32; 4]),
+    F64x2([f64; 2]),
+    I64x2([i64; 2]),
     Bool(bool),
     Str(Rc<Vec<u8>>),
     Arr(Rc<Vec<Value>>),
@@ -343,6 +346,9 @@ impl<'a> Interp<'a> {
             I64 => "i64".into(),
             F32 => "f32".into(),
             F64 => "f64".into(),
+            F32x4 => "f32x4".into(),
+            F64x2 => "f64x2".into(),
+            I64x2 => "i64x2".into(),
             Bool => "bool".into(),
             Str => "str".into(),
             Unit => "()".into(),
@@ -785,6 +791,100 @@ impl<'a> Interp<'a> {
                 cells.resize(n, init);
                 Ok(Value::Arr(Rc::new(cells)))
             }
+            "f32x4" => Ok(Value::F32x4([
+                as_f64(&args[0])? as f32,
+                as_f64(&args[1])? as f32,
+                as_f64(&args[2])? as f32,
+                as_f64(&args[3])? as f32,
+            ])),
+            "f64x2" => Ok(Value::F64x2([as_f64(&args[0])?, as_f64(&args[1])?])),
+            "i64x2" => Ok(Value::I64x2([as_i64(&args[0])?, as_i64(&args[1])?])),
+            "f32x4_splat" => Ok(Value::F32x4([as_f64(&args[0])? as f32; 4])),
+            "f64x2_splat" => Ok(Value::F64x2([as_f64(&args[0])?; 2])),
+            "i64x2_splat" => Ok(Value::I64x2([as_i64(&args[0])?; 2])),
+            "f32x4_add" | "f32x4_sub" | "f32x4_mul" | "f32x4_div" => {
+                let (Value::F32x4(a), Value::F32x4(b)) = (&args[0], &args[1]) else {
+                    return Err(format!("`{name}` expects f32x4 values"));
+                };
+                Ok(Value::F32x4(std::array::from_fn(|i| match name {
+                    "f32x4_add" => a[i] + b[i],
+                    "f32x4_sub" => a[i] - b[i],
+                    "f32x4_mul" => a[i] * b[i],
+                    _ => a[i] / b[i],
+                })))
+            }
+            "f64x2_add" | "f64x2_sub" | "f64x2_mul" | "f64x2_div" => {
+                let (Value::F64x2(a), Value::F64x2(b)) = (&args[0], &args[1]) else {
+                    return Err(format!("`{name}` expects f64x2 values"));
+                };
+                Ok(Value::F64x2(std::array::from_fn(|i| match name {
+                    "f64x2_add" => a[i] + b[i],
+                    "f64x2_sub" => a[i] - b[i],
+                    "f64x2_mul" => a[i] * b[i],
+                    _ => a[i] / b[i],
+                })))
+            }
+            "i64x2_add" | "i64x2_sub" | "i64x2_mul" | "i64x2_div" => {
+                let (Value::I64x2(a), Value::I64x2(b)) = (&args[0], &args[1]) else {
+                    return Err(format!("`{name}` expects i64x2 values"));
+                };
+                let mut out = [0; 2];
+                for i in 0..2 {
+                    out[i] = match name {
+                        "i64x2_add" => a[i].wrapping_add(b[i]),
+                        "i64x2_sub" => a[i].wrapping_sub(b[i]),
+                        "i64x2_mul" => a[i].wrapping_mul(b[i]),
+                        _ if b[i] == 0 => return Err("integer division by zero".into()),
+                        _ if a[i] == i64::MIN && b[i] == -1 => {
+                            return Err("integer division overflow".into())
+                        }
+                        _ => a[i] / b[i],
+                    };
+                }
+                Ok(Value::I64x2(out))
+            }
+            "f32x4_sum" => match &args[0] {
+                Value::F32x4(v) => Ok(Value::Float32(v.iter().copied().sum())),
+                _ => Err("`f32x4_sum` expects f32x4".into()),
+            },
+            "f64x2_sum" => match &args[0] {
+                Value::F64x2(v) => Ok(Value::Float(v.iter().copied().sum())),
+                _ => Err("`f64x2_sum` expects f64x2".into()),
+            },
+            "i64x2_sum" => match &args[0] {
+                Value::I64x2(v) => Ok(Value::Int(v[0].wrapping_add(v[1]))),
+                _ => Err("`i64x2_sum` expects i64x2".into()),
+            },
+            "f32x4_extract" => match &args[0] {
+                Value::F32x4(v) => {
+                    let i = as_i64(&args[1])?;
+                    v.get(i as usize)
+                        .copied()
+                        .map(Value::Float32)
+                        .ok_or_else(|| format!("index {i} out of bounds for f32x4"))
+                }
+                _ => Err("`f32x4_extract` expects f32x4".into()),
+            },
+            "f64x2_extract" => match &args[0] {
+                Value::F64x2(v) => {
+                    let i = as_i64(&args[1])?;
+                    v.get(i as usize)
+                        .copied()
+                        .map(Value::Float)
+                        .ok_or_else(|| format!("index {i} out of bounds for f64x2"))
+                }
+                _ => Err("`f64x2_extract` expects f64x2".into()),
+            },
+            "i64x2_extract" => match &args[0] {
+                Value::I64x2(v) => {
+                    let i = as_i64(&args[1])?;
+                    v.get(i as usize)
+                        .copied()
+                        .map(Value::Int)
+                        .ok_or_else(|| format!("index {i} out of bounds for i64x2"))
+                }
+                _ => Err("`i64x2_extract` expects i64x2".into()),
+            },
             _ => Err(format!("unknown builtin `{}`", name)),
         }
     }
@@ -794,6 +894,15 @@ impl<'a> Interp<'a> {
             Value::Int(i) => i.to_string(),
             Value::Float32(f) => format!("{}", f),
             Value::Float(f) => format!("{}", f),
+            Value::F32x4(v) => format!(
+                "f32x4({})",
+                v.iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Value::F64x2(v) => format!("f64x2({}, {})", v[0], v[1]),
+            Value::I64x2(v) => format!("i64x2({}, {})", v[0], v[1]),
             Value::Bool(b) => b.to_string(),
             Value::Str(s) => String::from_utf8_lossy(s).into_owned(),
             Value::Unit => "()".into(),

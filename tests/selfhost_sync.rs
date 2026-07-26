@@ -180,6 +180,77 @@ fn host_and_selfhost_emit_correct_explicit_simd_with_scalar_tails() {
             "{name} lost integer precision"
         );
     }
+
+    let f32_source = directory.join("odd-f32-sum.lu");
+    std::fs::write(
+        &f32_source,
+        "main {\n\
+           let n = 19\n\
+           var values = arr(n, f32(0))\n\
+           for i in 0..n { values[i] = f32(i + 1) }\n\
+           print(sum(i in 0..n) values[i])\n\
+         }\n",
+    )
+    .expect("write f32 SIMD fixture");
+    let f32_host_path = directory.join("f32-host.ll");
+    let f32_host = emit_host_ir(&f32_source, &f32_host_path);
+    let f32_selfhost = emit_selfhost_ir(&repository, &f32_source, target_triple(&f32_host));
+    assert!(
+        f32_host.contains("load <4 x float>") && f32_selfhost.contains("load <4 x float>"),
+        "host and selfhost should emit packed f32x4 loads"
+    );
+    assert!(
+        f32_host.contains("add i64") && f32_selfhost.contains("add i64"),
+        "host and selfhost should retain an odd-length scalar tail"
+    );
+    let f32_selfhost_path = directory.join("f32-selfhost.ll");
+    std::fs::write(&f32_selfhost_path, f32_selfhost).expect("write f32 selfhost SIMD IR");
+    for (name, ir) in [
+        ("f32-host", &f32_host_path),
+        ("f32-selfhost", &f32_selfhost_path),
+    ] {
+        let binary = directory.join(name);
+        compile_ir(&repository, ir, &binary);
+        let output = run(&mut Command::new(binary));
+        assert!(output.status.success(), "{name} SIMD fixture failed");
+        assert_eq!(output.stdout, b"190\n", "{name} f32 scalar tail disagreed");
+    }
+
+    let map_source = directory.join("f32-map.lu");
+    std::fs::write(
+        &map_source,
+        "main {\n\
+           let n = 19\n\
+           var source = arr(n, f32(1.5))\n\
+           var output = arr(n, f32(0))\n\
+           let snapshot = output\n\
+           for i in 0..n { output[i] = source[i] * f32(2) }\n\
+           print(output[0], output[18], snapshot[0])\n\
+         }\n",
+    )
+    .expect("write element-wise SIMD fixture");
+    let map_host_path = directory.join("map-host.ll");
+    let map_host = emit_host_ir(&map_source, &map_host_path);
+    let map_selfhost = emit_selfhost_ir(&repository, &map_source, target_triple(&map_host));
+    assert!(
+        map_host.contains("store <4 x float>") && map_selfhost.contains("store <4 x float>"),
+        "host and selfhost should vectorize independent element-wise stores"
+    );
+    let map_selfhost_path = directory.join("map-selfhost.ll");
+    std::fs::write(&map_selfhost_path, map_selfhost).expect("write map selfhost SIMD IR");
+    for (name, ir) in [
+        ("map-host", &map_host_path),
+        ("map-selfhost", &map_selfhost_path),
+    ] {
+        let binary = directory.join(name);
+        compile_ir(&repository, ir, &binary);
+        let output = run(&mut Command::new(binary));
+        assert!(output.status.success(), "{name} SIMD map fixture failed");
+        assert_eq!(
+            output.stdout, b"3 3 0\n",
+            "{name} SIMD map or snapshot disagreed"
+        );
+    }
 }
 
 #[test]

@@ -7,6 +7,9 @@ pub enum Type {
     I64,
     F32,
     F64,
+    F32x4,
+    F64x2,
+    I64x2,
     Bool,
     Str,
     Unit,
@@ -73,6 +76,9 @@ pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
     match s {
         "f32" => Ok(Type::F32),
         "f64" => Ok(Type::F64),
+        "f32x4" => Ok(Type::F32x4),
+        "f64x2" => Ok(Type::F64x2),
+        "i64x2" => Ok(Type::I64x2),
         "i64" | "i32" => Ok(Type::I64),
         "bool" => Ok(Type::Bool),
         "str" => Ok(Type::Str),
@@ -191,6 +197,30 @@ fn is_builtin(name: &str) -> bool {
             | "len"
             | "substr"
             | "arr"
+            | "f32x4"
+            | "f64x2"
+            | "i64x2"
+            | "f32x4_splat"
+            | "f64x2_splat"
+            | "i64x2_splat"
+            | "f32x4_add"
+            | "f32x4_sub"
+            | "f32x4_mul"
+            | "f32x4_div"
+            | "f64x2_add"
+            | "f64x2_sub"
+            | "f64x2_mul"
+            | "f64x2_div"
+            | "i64x2_add"
+            | "i64x2_sub"
+            | "i64x2_mul"
+            | "i64x2_div"
+            | "f32x4_sum"
+            | "f64x2_sum"
+            | "i64x2_sum"
+            | "f32x4_extract"
+            | "f64x2_extract"
+            | "i64x2_extract"
     )
 }
 
@@ -218,6 +248,12 @@ impl<'a> Checker<'a> {
                     Type::CMutSlice(_) => {
                         return Err(format!(
                             "record field `{}.{}` cannot store a borrowed c_mut_slice",
+                            record.name, field
+                        ))
+                    }
+                    Type::F32x4 | Type::F64x2 | Type::I64x2 => {
+                        return Err(format!(
+                            "record field `{}.{}` cannot store a SIMD value",
                             record.name, field
                         ))
                     }
@@ -350,6 +386,9 @@ impl<'a> Checker<'a> {
         match s {
             "f32" => Ok(Type::F32),
             "f64" => Ok(Type::F64),
+            "f32x4" => Ok(Type::F32x4),
+            "f64x2" => Ok(Type::F64x2),
+            "i64x2" => Ok(Type::I64x2),
             "i64" | "i32" => Ok(Type::I64),
             "bool" => Ok(Type::Bool),
             "str" => Ok(Type::Str),
@@ -599,6 +638,9 @@ impl<'a> Checker<'a> {
             Type::I64 => "i64".into(),
             Type::F32 => "f32".into(),
             Type::F64 => "f64".into(),
+            Type::F32x4 => "f32x4".into(),
+            Type::F64x2 => "f64x2".into(),
+            Type::I64x2 => "i64x2".into(),
             Type::Bool => "bool".into(),
             Type::Str => "str".into(),
             Type::Unit => "()".into(),
@@ -1008,6 +1050,12 @@ impl<'a> Checker<'a> {
                     Some(&e) => self.check_expr(e, scopes)?,
                     None => return Err("cannot infer element type of empty array literal".into()),
                 };
+                if matches!(first, Type::F32x4 | Type::F64x2 | Type::I64x2) {
+                    return Err(
+                        "SIMD values cannot be array elements; store scalar lanes explicitly"
+                            .into(),
+                    );
+                }
                 for &e in it {
                     let t = self.check_expr(e, scopes)?;
                     if t != first {
@@ -1241,7 +1289,115 @@ impl<'a> Checker<'a> {
                         if ats[0] != Type::I64 {
                             return Err("`arr` length must be i64".into());
                         }
+                        if matches!(ats[1], Type::F32x4 | Type::F64x2 | Type::I64x2) {
+                            return Err("SIMD values cannot be array elements; store scalar lanes explicitly".into());
+                        }
                         Ok(Type::Arr(Box::new(ats[1].clone())))
+                    }
+                    "f32x4" => {
+                        need(4)?;
+                        if !ats.iter().all(|ty| self.numeric(ty)) {
+                            return Err("`f32x4` expects four numeric lanes".into());
+                        }
+                        Ok(Type::F32x4)
+                    }
+                    "f64x2" => {
+                        need(2)?;
+                        if !ats.iter().all(|ty| self.numeric(ty)) {
+                            return Err("`f64x2` expects two numeric lanes".into());
+                        }
+                        Ok(Type::F64x2)
+                    }
+                    "i64x2" => {
+                        need(2)?;
+                        if !ats.iter().all(|ty| *ty == Type::I64) {
+                            return Err("`i64x2` expects two i64 lanes".into());
+                        }
+                        Ok(Type::I64x2)
+                    }
+                    "f32x4_splat" => {
+                        need(1)?;
+                        if !self.numeric(&ats[0]) {
+                            return Err("`f32x4_splat` expects a numeric lane".into());
+                        }
+                        Ok(Type::F32x4)
+                    }
+                    "f64x2_splat" => {
+                        need(1)?;
+                        if !self.numeric(&ats[0]) {
+                            return Err("`f64x2_splat` expects a numeric lane".into());
+                        }
+                        Ok(Type::F64x2)
+                    }
+                    "i64x2_splat" => {
+                        need(1)?;
+                        if ats[0] != Type::I64 {
+                            return Err("`i64x2_splat` expects an i64 lane".into());
+                        }
+                        Ok(Type::I64x2)
+                    }
+                    "f32x4_add" | "f32x4_sub" | "f32x4_mul" | "f32x4_div" => {
+                        need(2)?;
+                        if !ats.iter().all(|ty| *ty == Type::F32x4) {
+                            return Err(format!("`{name}` expects two f32x4 values"));
+                        }
+                        Ok(Type::F32x4)
+                    }
+                    "f64x2_add" | "f64x2_sub" | "f64x2_mul" | "f64x2_div" => {
+                        need(2)?;
+                        if !ats.iter().all(|ty| *ty == Type::F64x2) {
+                            return Err(format!("`{name}` expects two f64x2 values"));
+                        }
+                        Ok(Type::F64x2)
+                    }
+                    "i64x2_add" | "i64x2_sub" | "i64x2_mul" | "i64x2_div" => {
+                        need(2)?;
+                        if !ats.iter().all(|ty| *ty == Type::I64x2) {
+                            return Err(format!("`{name}` expects two i64x2 values"));
+                        }
+                        Ok(Type::I64x2)
+                    }
+                    "f32x4_sum" => {
+                        need(1)?;
+                        if ats[0] != Type::F32x4 {
+                            return Err("`f32x4_sum` expects f32x4".into());
+                        }
+                        Ok(Type::F32)
+                    }
+                    "f64x2_sum" => {
+                        need(1)?;
+                        if ats[0] != Type::F64x2 {
+                            return Err("`f64x2_sum` expects f64x2".into());
+                        }
+                        Ok(Type::F64)
+                    }
+                    "i64x2_sum" => {
+                        need(1)?;
+                        if ats[0] != Type::I64x2 {
+                            return Err("`i64x2_sum` expects i64x2".into());
+                        }
+                        Ok(Type::I64)
+                    }
+                    "f32x4_extract" => {
+                        need(2)?;
+                        if ats[0] != Type::F32x4 || ats[1] != Type::I64 {
+                            return Err("`f32x4_extract` expects (f32x4, i64)".into());
+                        }
+                        Ok(Type::F32)
+                    }
+                    "f64x2_extract" => {
+                        need(2)?;
+                        if ats[0] != Type::F64x2 || ats[1] != Type::I64 {
+                            return Err("`f64x2_extract` expects (f64x2, i64)".into());
+                        }
+                        Ok(Type::F64)
+                    }
+                    "i64x2_extract" => {
+                        need(2)?;
+                        if ats[0] != Type::I64x2 || ats[1] != Type::I64 {
+                            return Err("`i64x2_extract` expects (i64x2, i64)".into());
+                        }
+                        Ok(Type::I64)
                     }
                     _ => {
                         let (params, inouts, ret) = self

@@ -10,8 +10,9 @@ use crate::backend::layout::{
 };
 use crate::backend::optimization::{
     analyze_cfg, array_local_for_value, if_convert, inline_calls, licm, simd_reduction_plan,
-    CfgAnalysis, SimdExpr, SimdScalar,
+    simd_store_plan, CfgAnalysis, SimdExpr, SimdScalar,
 };
+use crate::backend::simd::{lane_count, SIMD128};
 use crate::check::{resolve_type, Type as CType};
 use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
 use crate::runtime;
@@ -32,6 +33,9 @@ fn comps(p: &Program, t: &CType) -> Result<Vec<cranelift_codegen::ir::Type>, Str
             Component::F32 => types::F32,
             Component::F64 => types::F64,
             Component::I64 | Component::Ptr => types::I64,
+            Component::F32x4 => types::F32X4,
+            Component::F64x2 => types::F64X2,
+            Component::I64x2 => types::I64X2,
         })
         .collect())
 }
@@ -48,6 +52,7 @@ pub struct Jit<'a> {
     opt_isa: cranelift_codegen::isa::OwnedTargetIsa,
     soa: bool,
     simd: bool,
+    simd_bits: u16,
     ifconv: bool,
     do_licm: bool,
     inline_math: bool,
@@ -140,6 +145,9 @@ impl<'a> Jit<'a> {
             opt_isa,
             soa,
             simd,
+            // Cranelift's native backends currently reject fixed vectors wider
+            // than 128 bits; LLVM AOT widens independently when the host can.
+            simd_bits: SIMD128,
             ifconv,
             do_licm,
             inline_math,
@@ -187,7 +195,12 @@ impl<'a> Jit<'a> {
             ("lu_print_nl", 0, &[], false),
             ("lu_arr_new_f64", 1, &[types::I64, types::F64], false),
             ("lu_arr_new_i64", 1, &[types::I64, types::I64], false),
-            ("lu_arr_new_raw", 1, &[types::I64, types::I64], false),
+            (
+                "lu_arr_new_raw",
+                1,
+                &[types::I64, types::I64, types::I64, types::I64],
+                false,
+            ),
             ("lu_arr_clone", 1, &[types::I64], false),
             ("lu_arr_cow", 1, &[types::I64], false),
             (
@@ -361,6 +374,7 @@ impl<'a> Jit<'a> {
                 refs: HashMap::new(),
                 soa: self.soa,
                 simd: self.simd,
+                simd_bits: self.simd_bits,
                 inline_math: self.inline_math,
                 inout_outs: Vec::new(),
                 cfg: &analysis,
@@ -428,6 +442,7 @@ impl<'a> Jit<'a> {
                 refs: HashMap::new(),
                 soa: self.soa,
                 simd: self.simd,
+                simd_bits: self.simd_bits,
                 inline_math: self.inline_math,
                 inout_outs: Vec::new(),
                 cfg: &analysis,
@@ -470,6 +485,7 @@ struct Gen<'a, 'b> {
     soa: bool,
     // `sum` vectorization (the default; LU_SIMD=off flips it)
     simd: bool,
+    simd_bits: u16,
     inline_math: bool,
     // (out-pointer, component variables) of the current fn's inout params —
     // stored through the pointer at every outlined return
@@ -482,6 +498,20 @@ struct Gen<'a, 'b> {
 }
 
 impl<'a, 'b> Gen<'a, 'b> {
+    fn simd_lanes(&self, scalar: SimdScalar) -> u16 {
+        lane_count(self.simd_bits, scalar)
+    }
+
+    fn simd_vector_type(&self, scalar: SimdScalar) -> cranelift_codegen::ir::Type {
+        let lane = match scalar {
+            SimdScalar::F32 => types::F32,
+            SimdScalar::F64 => types::F64,
+            SimdScalar::I64 => types::I64,
+        };
+        lane.by(self.simd_lanes(scalar) as u32)
+            .expect("supported fixed SIMD width")
+    }
+
     /// Store the current fn's inout param values through their out-pointers
     /// (called right before every outlined return).
     fn emit_inout_stores(&mut self) {
@@ -547,17 +577,11 @@ impl<'a, 'b> Gen<'a, 'b> {
             (CType::CSlice(want), CType::Arr(got)) | (CType::CMutSlice(want), CType::Arr(got))
                 if want == got =>
             {
-                let slots = self
+                let length = self
                     .b
                     .ins()
                     .load(types::I64, MemFlags::trusted(), values[0], 0);
-                let stride = comps(self.p, want)?.len() as i64;
-                let length = if stride == 1 {
-                    slots
-                } else {
-                    self.b.ins().sdiv_imm(slots, stride)
-                };
-                vec![self.b.ins().iadd_imm(values[0], 8), length]
+                vec![self.b.ins().iadd_imm(values[0], 16), length]
             }
             _ => return Err(format!("cannot coerce IR value {:?} to {:?}", got, want)),
         };
@@ -648,15 +672,9 @@ impl<'a, 'b> Gen<'a, 'b> {
             let (ty, vars) = self
                 .lookup(&Self::ir_local(array))
                 .ok_or("invalid trusted array local")?;
-            let CType::Arr(element) = ty else { continue };
+            let CType::Arr(_) = ty else { continue };
             let base = self.b.use_var(vars[0]);
-            let stored = self.b.ins().load(types::I64, MemFlags::trusted(), base, 0);
-            let stride = comps(self.p, &element)?.len() as i64;
-            let logical = if stride == 1 {
-                stored
-            } else {
-                self.b.ins().sdiv_imm(stored, stride)
-            };
+            let logical = self.b.ins().load(types::I64, MemFlags::trusted(), base, 0);
             let zero = self.b.ins().iconst(types::I64, 0);
             let negative = self.b.ins().icmp(IntCC::SignedLessThan, lower[0], zero);
             let over = self
@@ -687,19 +705,23 @@ impl<'a, 'b> Gen<'a, 'b> {
     ) -> Result<bool, String> {
         let loop_info = &self.cfg.loops[loop_index];
         let Some(plan) = simd_reduction_plan(function, self.cfg, loop_index, self.soa) else {
-            return Ok(false);
+            return self.emit_cfg_simd_store(function, values, blocks, loop_index);
         };
         let (_, lower) = Self::ir_value(values, loop_info.lower)?;
         let (_, upper) = Self::ir_value(values, loop_info.upper)?;
         let index_var = self.b.declare_var(types::I64);
         self.b.def_var(index_var, lower[0]);
         let (scalar_type, vector_type) = match plan.scalar {
-            SimdScalar::F64 => (types::F64, types::F64X2),
-            SimdScalar::I64 => (types::I64, types::I64X2),
+            SimdScalar::F32 => (types::F32, self.simd_vector_type(plan.scalar)),
+            SimdScalar::F64 => (types::F64, self.simd_vector_type(plan.scalar)),
+            SimdScalar::I64 => (types::I64, self.simd_vector_type(plan.scalar)),
         };
+        let lanes = self.simd_lanes(plan.scalar) as i64;
+        let batch_size = lanes * 4;
         let vector_accs: Vec<_> = (0..4).map(|_| self.b.declare_var(vector_type)).collect();
         let scalar_acc = self.b.declare_var(scalar_type);
         let zero = match plan.scalar {
+            SimdScalar::F32 => self.b.ins().f32const(0.0),
             SimdScalar::F64 => self.b.ins().f64const(0.0),
             SimdScalar::I64 => self.b.ins().iconst(types::I64, 0),
         };
@@ -718,7 +740,7 @@ impl<'a, 'b> Gen<'a, 'b> {
 
         self.b.switch_to_block(vector_head);
         let index = self.b.use_var(index_var);
-        let after_batch = self.b.ins().iadd_imm(index, 8);
+        let after_batch = self.b.ins().iadd_imm(index, batch_size);
         let fits = self
             .b
             .ins()
@@ -728,16 +750,17 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.switch_to_block(vector_body);
         let batch = self.b.use_var(index_var);
         for (lane, accumulator) in vector_accs.iter().enumerate() {
-            let at = self.b.ins().iadd_imm(batch, (lane * 2) as i64);
+            let at = self.b.ins().iadd_imm(batch, (lane as i64) * lanes);
             let item = self.gen_simd_vector_expr(loop_index, plan.scalar, &plan.value, at)?;
             let current = self.b.use_var(*accumulator);
             let next = match plan.scalar {
+                SimdScalar::F32 => self.b.ins().fadd(current, item),
                 SimdScalar::F64 => self.b.ins().fadd(current, item),
                 SimdScalar::I64 => self.b.ins().iadd(current, item),
             };
             self.b.def_var(*accumulator, next);
         }
-        let next_batch = self.b.ins().iadd_imm(batch, 8);
+        let next_batch = self.b.ins().iadd_imm(batch, batch_size);
         self.b.def_var(index_var, next_batch);
         self.b.ins().jump(vector_head, &[]);
 
@@ -751,6 +774,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let item = self.gen_simd_scalar_expr(loop_index, plan.scalar, &plan.value, at)?;
         let current = self.b.use_var(scalar_acc);
         let next = match plan.scalar {
+            SimdScalar::F32 => self.b.ins().fadd(current, item),
             SimdScalar::F64 => self.b.ins().fadd(current, item),
             SimdScalar::I64 => self.b.ins().iadd(current, item),
         };
@@ -765,29 +789,108 @@ impl<'a, 'b> Gen<'a, 'b> {
         let a2 = self.b.use_var(vector_accs[2]);
         let a3 = self.b.use_var(vector_accs[3]);
         let pairs0 = match plan.scalar {
+            SimdScalar::F32 => self.b.ins().fadd(a0, a1),
             SimdScalar::F64 => self.b.ins().fadd(a0, a1),
             SimdScalar::I64 => self.b.ins().iadd(a0, a1),
         };
         let pairs1 = match plan.scalar {
+            SimdScalar::F32 => self.b.ins().fadd(a2, a3),
             SimdScalar::F64 => self.b.ins().fadd(a2, a3),
             SimdScalar::I64 => self.b.ins().iadd(a2, a3),
         };
         let vector_total = match plan.scalar {
+            SimdScalar::F32 => self.b.ins().fadd(pairs0, pairs1),
             SimdScalar::F64 => self.b.ins().fadd(pairs0, pairs1),
             SimdScalar::I64 => self.b.ins().iadd(pairs0, pairs1),
         };
-        let lane0 = self.b.ins().extractlane(vector_total, 0);
-        let lane1 = self.b.ins().extractlane(vector_total, 1);
-        let lanes = match plan.scalar {
-            SimdScalar::F64 => self.b.ins().fadd(lane0, lane1),
-            SimdScalar::I64 => self.b.ins().iadd(lane0, lane1),
-        };
+        let mut lane_total = self.b.ins().extractlane(vector_total, 0);
+        for lane in 1..lanes {
+            let value = self.b.ins().extractlane(vector_total, lane as u8);
+            lane_total = match plan.scalar {
+                SimdScalar::F32 | SimdScalar::F64 => self.b.ins().fadd(lane_total, value),
+                SimdScalar::I64 => self.b.ins().iadd(lane_total, value),
+            };
+        }
         let scalar = self.b.use_var(scalar_acc);
         let total = match plan.scalar {
-            SimdScalar::F64 => self.b.ins().fadd(lanes, scalar),
-            SimdScalar::I64 => self.b.ins().iadd(lanes, scalar),
+            SimdScalar::F32 | SimdScalar::F64 => self.b.ins().fadd(lane_total, scalar),
+            SimdScalar::I64 => self.b.ins().iadd(lane_total, scalar),
         };
         self.define_ir_local(plan.accumulator, &[total])?;
+        self.b.ins().jump(blocks[loop_info.exit as usize], &[]);
+        self.skipped_cfg_blocks
+            .extend(loop_info.blocks.iter().copied());
+        Ok(true)
+    }
+
+    fn emit_cfg_simd_store(
+        &mut self,
+        function: &ir::Function,
+        values: &[Option<(CType, Vec<Value>)>],
+        blocks: &[cranelift_codegen::ir::Block],
+        loop_index: usize,
+    ) -> Result<bool, String> {
+        let Some(plan) = simd_store_plan(function, self.cfg, loop_index, self.soa) else {
+            return Ok(false);
+        };
+        let loop_info = &self.cfg.loops[loop_index];
+        let (_, lower) = Self::ir_value(values, loop_info.lower)?;
+        let (_, upper) = Self::ir_value(values, loop_info.upper)?;
+        let (_, destination_vars) = self
+            .lookup(&Self::ir_local(plan.destination))
+            .ok_or("missing SIMD store destination")?;
+        let base = self.b.use_var(destination_vars[0]);
+        let unique = self.call_import("lu_arr_cow", &[base])[0];
+        self.b.def_var(destination_vars[0], unique);
+
+        let lanes = self.simd_lanes(plan.scalar) as i64;
+        let width = if plan.scalar == SimdScalar::F32 { 4 } else { 8 };
+        let index_var = self.b.declare_var(types::I64);
+        self.b.def_var(index_var, lower[0]);
+        let vector_head = self.b.create_block();
+        let vector_body = self.b.create_block();
+        let scalar_head = self.b.create_block();
+        let scalar_body = self.b.create_block();
+        let finish = self.b.create_block();
+        self.b.ins().jump(vector_head, &[]);
+
+        self.b.switch_to_block(vector_head);
+        let index = self.b.use_var(index_var);
+        let after_vector = self.b.ins().iadd_imm(index, lanes);
+        let fits = self
+            .b
+            .ins()
+            .icmp(IntCC::SignedLessThanOrEqual, after_vector, upper[0]);
+        self.b.ins().brif(fits, vector_body, &[], scalar_head, &[]);
+
+        self.b.switch_to_block(vector_body);
+        let index = self.b.use_var(index_var);
+        let value = self.gen_simd_vector_expr(loop_index, plan.scalar, &plan.value, index)?;
+        let offset = self.b.ins().imul_imm(index, width);
+        let data = self.b.ins().iadd_imm(unique, 16);
+        let address = self.b.ins().iadd(data, offset);
+        self.b.ins().store(MemFlags::trusted(), value, address, 0);
+        let next = self.b.ins().iadd_imm(index, lanes);
+        self.b.def_var(index_var, next);
+        self.b.ins().jump(vector_head, &[]);
+
+        self.b.switch_to_block(scalar_head);
+        let index = self.b.use_var(index_var);
+        let more = self.b.ins().icmp(IntCC::SignedLessThan, index, upper[0]);
+        self.b.ins().brif(more, scalar_body, &[], finish, &[]);
+
+        self.b.switch_to_block(scalar_body);
+        let index = self.b.use_var(index_var);
+        let value = self.gen_simd_scalar_expr(loop_index, plan.scalar, &plan.value, index)?;
+        let offset = self.b.ins().imul_imm(index, width);
+        let data = self.b.ins().iadd_imm(unique, 16);
+        let address = self.b.ins().iadd(data, offset);
+        self.b.ins().store(MemFlags::trusted(), value, address, 0);
+        let next = self.b.ins().iadd_imm(index, 1);
+        self.b.def_var(index_var, next);
+        self.b.ins().jump(scalar_head, &[]);
+
+        self.b.switch_to_block(finish);
         self.b.ins().jump(blocks[loop_info.exit as usize], &[]);
         self.skipped_cfg_blocks
             .extend(loop_info.blocks.iter().copied());
@@ -802,39 +905,37 @@ impl<'a, 'b> Gen<'a, 'b> {
         index: Value,
     ) -> Result<Value, String> {
         Ok(match expr {
+            SimdExpr::F32(value) => {
+                let lane = self.b.ins().f32const(*value);
+                let vector_type = self.simd_vector_type(scalar);
+                self.b.ins().splat(vector_type, lane)
+            }
             SimdExpr::F64(value) => {
-                let scalar = self.b.ins().f64const(*value);
-                self.b.ins().splat(types::F64X2, scalar)
+                let lane = self.b.ins().f64const(*value);
+                let vector_type = self.simd_vector_type(scalar);
+                self.b.ins().splat(vector_type, lane)
             }
             SimdExpr::I64(value) => {
                 let value = match scalar {
+                    SimdScalar::F32 => self.b.ins().f32const(*value as f32),
                     SimdScalar::F64 => self.b.ins().f64const(*value as f64),
                     SimdScalar::I64 => self.b.ins().iconst(types::I64, *value),
                 };
-                self.b.ins().splat(
-                    match scalar {
-                        SimdScalar::F64 => types::F64X2,
-                        SimdScalar::I64 => types::I64X2,
-                    },
-                    value,
-                )
+                let vector_type = self.simd_vector_type(scalar);
+                self.b.ins().splat(vector_type, value)
             }
             SimdExpr::Invariant(local) => {
                 let (_, vars) = self
                     .lookup(&Self::ir_local(*local))
                     .ok_or("missing vector invariant")?;
                 let invariant = self.b.use_var(vars[0]);
-                self.b.ins().splat(
-                    match scalar {
-                        SimdScalar::F64 => types::F64X2,
-                        SimdScalar::I64 => types::I64X2,
-                    },
-                    invariant,
-                )
+                let vector_type = self.simd_vector_type(scalar);
+                self.b.ins().splat(vector_type, invariant)
             }
             SimdExpr::Neg(value) => {
                 let inner = self.gen_simd_vector_expr(loop_index, scalar, value, index)?;
                 match scalar {
+                    SimdScalar::F32 => self.b.ins().fneg(inner),
                     SimdScalar::F64 => self.b.ins().fneg(inner),
                     SimdScalar::I64 => self.b.ins().ineg(inner),
                 }
@@ -843,6 +944,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let lhs = self.gen_simd_vector_expr(loop_index, scalar, lhs, index)?;
                 let rhs = self.gen_simd_vector_expr(loop_index, scalar, rhs, index)?;
                 match (scalar, op) {
+                    (SimdScalar::F32, BinaryOp::Add) => self.b.ins().fadd(lhs, rhs),
+                    (SimdScalar::F32, BinaryOp::Sub) => self.b.ins().fsub(lhs, rhs),
+                    (SimdScalar::F32, BinaryOp::Mul) => self.b.ins().fmul(lhs, rhs),
+                    (SimdScalar::F32, BinaryOp::Div) => self.b.ins().fdiv(lhs, rhs),
                     (SimdScalar::F64, BinaryOp::Add) => self.b.ins().fadd(lhs, rhs),
                     (SimdScalar::F64, BinaryOp::Sub) => self.b.ins().fsub(lhs, rhs),
                     (SimdScalar::F64, BinaryOp::Mul) => self.b.ins().fmul(lhs, rhs),
@@ -858,18 +963,14 @@ impl<'a, 'b> Gen<'a, 'b> {
                     .lookup(&Self::ir_local(*local))
                     .ok_or("missing vector array")?;
                 let base = self.b.use_var(vars[0]);
-                let bytes = self.b.ins().imul_imm(index, 8);
-                let data = self.b.ins().iadd_imm(base, 8);
+                let width = if scalar == SimdScalar::F32 { 4 } else { 8 };
+                let bytes = self.b.ins().imul_imm(index, width);
+                let data = self.b.ins().iadd_imm(base, 16);
                 let address = self.b.ins().iadd(data, bytes);
-                self.b.ins().load(
-                    match scalar {
-                        SimdScalar::F64 => types::F64X2,
-                        SimdScalar::I64 => types::I64X2,
-                    },
-                    MemFlags::trusted(),
-                    address,
-                    0,
-                )
+                let vector_type = self.simd_vector_type(scalar);
+                self.b
+                    .ins()
+                    .load(vector_type, MemFlags::trusted(), address, 0)
             }
             SimdExpr::Field {
                 local,
@@ -883,20 +984,12 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let field_name = &self.p.types[*record].fields[*field].0;
                 let (component, _) = field_offset(self.p, *record, field_name)?;
                 let logical = self.cfg_trusted[&(loop_index, *local)];
-                let data = self.b.ins().iadd_imm(base, 8);
-                let plane = self.b.ins().imul_imm(logical, (component * 8) as i64);
-                let lane = self.b.ins().imul_imm(index, 8);
-                let start = self.b.ins().iadd(data, plane);
-                let address = self.b.ins().iadd(start, lane);
-                self.b.ins().load(
-                    match scalar {
-                        SimdScalar::F64 => types::F64X2,
-                        SimdScalar::I64 => types::I64X2,
-                    },
-                    MemFlags::trusted(),
-                    address,
-                    0,
-                )
+                let address =
+                    self.soa_component_address(base, index, logical, *record, component)?;
+                let vector_type = self.simd_vector_type(scalar);
+                self.b
+                    .ins()
+                    .load(vector_type, MemFlags::trusted(), address, 0)
             }
             SimdExpr::Builtin { name, args } => {
                 let args = args
@@ -922,8 +1015,10 @@ impl<'a, 'b> Gen<'a, 'b> {
         index: Value,
     ) -> Result<Value, String> {
         Ok(match expr {
+            SimdExpr::F32(value) => self.b.ins().f32const(*value),
             SimdExpr::F64(value) => self.b.ins().f64const(*value),
             SimdExpr::I64(value) => match scalar {
+                SimdScalar::F32 => self.b.ins().f32const(*value as f32),
                 SimdScalar::F64 => self.b.ins().f64const(*value as f64),
                 SimdScalar::I64 => self.b.ins().iconst(types::I64, *value),
             },
@@ -936,6 +1031,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             SimdExpr::Neg(value) => {
                 let inner = self.gen_simd_scalar_expr(loop_index, scalar, value, index)?;
                 match scalar {
+                    SimdScalar::F32 => self.b.ins().fneg(inner),
                     SimdScalar::F64 => self.b.ins().fneg(inner),
                     SimdScalar::I64 => self.b.ins().ineg(inner),
                 }
@@ -944,6 +1040,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let lhs = self.gen_simd_scalar_expr(loop_index, scalar, lhs, index)?;
                 let rhs = self.gen_simd_scalar_expr(loop_index, scalar, rhs, index)?;
                 match (scalar, op) {
+                    (SimdScalar::F32, BinaryOp::Add) => self.b.ins().fadd(lhs, rhs),
+                    (SimdScalar::F32, BinaryOp::Sub) => self.b.ins().fsub(lhs, rhs),
+                    (SimdScalar::F32, BinaryOp::Mul) => self.b.ins().fmul(lhs, rhs),
+                    (SimdScalar::F32, BinaryOp::Div) => self.b.ins().fdiv(lhs, rhs),
                     (SimdScalar::F64, BinaryOp::Add) => self.b.ins().fadd(lhs, rhs),
                     (SimdScalar::F64, BinaryOp::Sub) => self.b.ins().fsub(lhs, rhs),
                     (SimdScalar::F64, BinaryOp::Mul) => self.b.ins().fmul(lhs, rhs),
@@ -959,11 +1059,13 @@ impl<'a, 'b> Gen<'a, 'b> {
                     .lookup(&Self::ir_local(*local))
                     .ok_or("missing scalar array")?;
                 let base = self.b.use_var(vars[0]);
-                let address = self.b.ins().imul_imm(index, 8);
-                let data = self.b.ins().iadd_imm(base, 8);
+                let width = if scalar == SimdScalar::F32 { 4 } else { 8 };
+                let address = self.b.ins().imul_imm(index, width);
+                let data = self.b.ins().iadd_imm(base, 16);
                 let address = self.b.ins().iadd(data, address);
                 self.b.ins().load(
                     match scalar {
+                        SimdScalar::F32 => types::F32,
                         SimdScalar::F64 => types::F64,
                         SimdScalar::I64 => types::I64,
                     },
@@ -984,13 +1086,11 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let field_name = &self.p.types[*record].fields[*field].0;
                 let (component, _) = field_offset(self.p, *record, field_name)?;
                 let logical = self.cfg_trusted[&(loop_index, *local)];
-                let data = self.b.ins().iadd_imm(base, 8);
-                let plane = self.b.ins().imul_imm(logical, (component * 8) as i64);
-                let lane = self.b.ins().imul_imm(index, 8);
-                let start = self.b.ins().iadd(data, plane);
-                let address = self.b.ins().iadd(start, lane);
+                let address =
+                    self.soa_component_address(base, index, logical, *record, component)?;
                 self.b.ins().load(
                     match scalar {
+                        SimdScalar::F32 => types::F32,
                         SimdScalar::F64 => types::F64,
                         SimdScalar::I64 => types::I64,
                     },
@@ -1288,17 +1388,11 @@ impl<'a, 'b> Gen<'a, 'b> {
         elem: &CType,
         trusted: Option<Value>,
     ) -> Result<Vec<Value>, String> {
-        let stride = comps(self.p, elem)?.len() as i64;
+        let components = layout_components(self.p, elem)?;
         let logical = match trusted {
             Some(n) => n,
             None => {
-                let len = self.b.ins().load(types::I64, MemFlags::trusted(), base, 0);
-                let logical = if stride == 1 {
-                    len
-                } else {
-                    let s = self.b.ins().iconst(types::I64, stride);
-                    self.b.ins().sdiv(len, s)
-                };
+                let logical = self.b.ins().load(types::I64, MemFlags::trusted(), base, 0);
                 let bad = self
                     .b
                     .ins()
@@ -1314,23 +1408,72 @@ impl<'a, 'b> Gen<'a, 'b> {
                 logical
             }
         };
-        let base8 = self.b.ins().iadd_imm(base, 8);
-        if stride > 1 && self.soa {
-            let off = self.b.ins().imul_imm(idx, 8);
-            let lane0 = self.b.ins().iadd(base8, off);
+        let data = self.b.ins().iadd_imm(base, 16);
+        if components.len() == 1 {
+            let off = self.b.ins().imul_imm(idx, components[0].bytes() as i64);
+            return Ok(vec![self.b.ins().iadd(data, off)]);
+        }
+        if self.soa {
+            let mut plane = self.b.ins().iconst(types::I64, 0);
             let mut out = Vec::new();
-            for c in 0..stride {
-                let plane = self.b.ins().imul_imm(logical, 8 * c);
-                out.push(self.b.ins().iadd(lane0, plane));
+            for component in components {
+                let lane = self.b.ins().imul_imm(idx, component.bytes() as i64);
+                let start = self.b.ins().iadd(data, plane);
+                out.push(self.b.ins().iadd(start, lane));
+                let raw = self.b.ins().imul_imm(logical, component.bytes() as i64);
+                let padded = self.b.ins().iadd_imm(raw, 7);
+                let span = self.b.ins().band_imm(padded, -8);
+                plane = self.b.ins().iadd(plane, span);
             }
             Ok(out)
         } else {
-            let off = self.b.ins().imul_imm(idx, stride * 8);
-            let a0 = self.b.ins().iadd(base8, off);
-            Ok((0..stride)
-                .map(|c| self.b.ins().iadd_imm(a0, c * 8))
+            let off = self.b.ins().imul_imm(idx, (components.len() * 8) as i64);
+            let first = self.b.ins().iadd(data, off);
+            Ok((0..components.len())
+                .map(|component| self.b.ins().iadd_imm(first, (component * 8) as i64))
                 .collect())
         }
+    }
+
+    fn alloc_array_raw(&mut self, logical: Value, elem: &CType) -> Result<Value, String> {
+        let components = layout_components(self.p, elem)?;
+        let f32_components = components
+            .iter()
+            .filter(|component| **component == Component::F32)
+            .count() as i64;
+        let wide_components = components.len() as i64 - f32_components;
+        let f32_components = self.b.ins().iconst(types::I64, f32_components);
+        let wide_components = self.b.ins().iconst(types::I64, wide_components);
+        let soa = self.b.ins().iconst(types::I64, self.soa as i64);
+        Ok(self.call_import(
+            "lu_arr_new_raw",
+            &[logical, f32_components, wide_components, soa],
+        )[0])
+    }
+
+    fn soa_component_address(
+        &mut self,
+        base: Value,
+        index: Value,
+        logical: Value,
+        record: usize,
+        component_index: usize,
+    ) -> Result<Value, String> {
+        let components = layout_components(self.p, &CType::Rec(record))?;
+        let data = self.b.ins().iadd_imm(base, 16);
+        let mut plane = self.b.ins().iconst(types::I64, 0);
+        for component in components.iter().take(component_index) {
+            let raw = self.b.ins().imul_imm(logical, component.bytes() as i64);
+            let padded = self.b.ins().iadd_imm(raw, 7);
+            let span = self.b.ins().band_imm(padded, -8);
+            plane = self.b.ins().iadd(plane, span);
+        }
+        let component = components
+            .get(component_index)
+            .ok_or("invalid SIMD record component")?;
+        let lane = self.b.ins().imul_imm(index, component.bytes() as i64);
+        let start = self.b.ins().iadd(data, plane);
+        Ok(self.b.ins().iadd(start, lane))
     }
 
     /// Emit `idx u< len` check, aborting via lu_oob on failure.
@@ -1520,11 +1663,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             return Err("IR array with non-array type".into());
         };
         let logical = self.b.ins().iconst(types::I64, items.len() as i64);
-        let stride = self
-            .b
-            .ins()
-            .iconst(types::I64, comps(self.p, elem)?.len() as i64);
-        let base = self.call_import("lu_arr_new_raw", &[logical, stride])[0];
+        let base = self.alloc_array_raw(logical, elem)?;
         for (i, (got, mut vals)) in items.into_iter().enumerate() {
             if **elem == CType::F64 && got == CType::I64 {
                 vals = vec![self.b.ins().fcvt_from_sint(types::F64, vals[0])];
@@ -1610,19 +1749,13 @@ impl<'a, 'b> Gen<'a, 'b> {
             }
             let values = self.coerce(want, &got, values)?;
             match want {
-                CType::Arr(element) => {
+                CType::Arr(_) => {
                     let handle = values[0];
-                    let slots = self
+                    let length = self
                         .b
                         .ins()
                         .load(types::I64, MemFlags::trusted(), handle, 0);
-                    let stride = comps(self.p, element)?.len() as i64;
-                    let length = if stride == 1 {
-                        slots
-                    } else {
-                        self.b.ins().sdiv_imm(slots, stride)
-                    };
-                    flat.push(self.b.ins().iadd_imm(handle, 8));
+                    flat.push(self.b.ins().iadd_imm(handle, 16));
                     flat.push(length);
                 }
                 _ => flat.extend(values),
@@ -1922,6 +2055,99 @@ impl<'a, 'b> Gen<'a, 'b> {
                 };
                 Ok((CType::I64, vec![v]))
             }
+            "f32x4" | "f64x2" | "i64x2" => {
+                let (ty, lane_ty) = match name {
+                    "f32x4" => (CType::F32x4, CType::F32),
+                    "f64x2" => (CType::F64x2, CType::F64),
+                    _ => (CType::I64x2, CType::I64),
+                };
+                let vector_type = comps(self.p, &ty)?[0];
+                let mut vector = {
+                    let lane = self.coerce(&lane_ty, &atys[0], avals[0].clone())?[0];
+                    self.b.ins().splat(vector_type, lane)
+                };
+                for lane in 1..avals.len() {
+                    let value = self.coerce(&lane_ty, &atys[lane], avals[lane].clone())?[0];
+                    vector = self.b.ins().insertlane(vector, value, lane as u8);
+                }
+                Ok((ty, vec![vector]))
+            }
+            "f32x4_splat" | "f64x2_splat" | "i64x2_splat" => {
+                let (ty, lane_ty) = match name {
+                    "f32x4_splat" => (CType::F32x4, CType::F32),
+                    "f64x2_splat" => (CType::F64x2, CType::F64),
+                    _ => (CType::I64x2, CType::I64),
+                };
+                let lane = self.coerce(&lane_ty, &atys[0], avals[0].clone())?[0];
+                let vector_type = comps(self.p, &ty)?[0];
+                Ok((ty, vec![self.b.ins().splat(vector_type, lane)]))
+            }
+            "f32x4_add" | "f32x4_sub" | "f32x4_mul" | "f32x4_div" | "f64x2_add" | "f64x2_sub"
+            | "f64x2_mul" | "f64x2_div" | "i64x2_add" | "i64x2_sub" | "i64x2_mul" => {
+                let result = match name.rsplit('_').next().unwrap() {
+                    "add" if name.starts_with('i') => self.b.ins().iadd(avals[0][0], avals[1][0]),
+                    "sub" if name.starts_with('i') => self.b.ins().isub(avals[0][0], avals[1][0]),
+                    "mul" if name.starts_with('i') => self.b.ins().imul(avals[0][0], avals[1][0]),
+                    "add" => self.b.ins().fadd(avals[0][0], avals[1][0]),
+                    "sub" => self.b.ins().fsub(avals[0][0], avals[1][0]),
+                    "mul" => self.b.ins().fmul(avals[0][0], avals[1][0]),
+                    _ => self.b.ins().fdiv(avals[0][0], avals[1][0]),
+                };
+                Ok((atys[0].clone(), vec![result]))
+            }
+            "i64x2_div" => {
+                let mut lanes = Vec::new();
+                for lane in 0..2 {
+                    let lhs = self.b.ins().extractlane(avals[0][0], lane);
+                    let rhs = self.b.ins().extractlane(avals[1][0], lane);
+                    lanes.push(self.call_import("lu_i64_div", &[lhs, rhs])[0]);
+                }
+                let mut vector = self.b.ins().splat(types::I64X2, lanes[0]);
+                vector = self.b.ins().insertlane(vector, lanes[1], 1);
+                Ok((CType::I64x2, vec![vector]))
+            }
+            "f32x4_sum" | "f64x2_sum" | "i64x2_sum" => {
+                let lanes = if name.starts_with("f32") { 4 } else { 2 };
+                let mut total = self.b.ins().extractlane(avals[0][0], 0);
+                for lane in 1..lanes {
+                    let value = self.b.ins().extractlane(avals[0][0], lane as u8);
+                    total = if name.starts_with('i') {
+                        self.b.ins().iadd(total, value)
+                    } else {
+                        self.b.ins().fadd(total, value)
+                    };
+                }
+                let ty = match name {
+                    "f32x4_sum" => CType::F32,
+                    "f64x2_sum" => CType::F64,
+                    _ => CType::I64,
+                };
+                Ok((ty, vec![total]))
+            }
+            "f32x4_extract" | "f64x2_extract" | "i64x2_extract" => {
+                use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+                let (lanes, lane_type, ty, align_log2) = match name {
+                    "f32x4_extract" => (4, types::F32, CType::F32, 2),
+                    "f64x2_extract" => (2, types::F64, CType::F64, 3),
+                    _ => (2, types::I64, CType::I64, 3),
+                };
+                let length = self.b.ins().iconst(types::I64, lanes);
+                self.check_idx(avals[1][0], length);
+                let slot = self.b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    16,
+                    4,
+                ));
+                self.b.ins().stack_store(avals[0][0], slot, 0);
+                let base = self.b.ins().stack_addr(types::I64, slot, 0);
+                let offset = self.b.ins().imul_imm(avals[1][0], 1_i64 << align_log2);
+                let address = self.b.ins().iadd(base, offset);
+                let value = self
+                    .b
+                    .ins()
+                    .load(lane_type, MemFlags::trusted(), address, 0);
+                Ok((ty, vec![value]))
+            }
             "len" if atys[0] == CType::Str => Ok((CType::I64, vec![avals[0][1]])),
             "substr" => {
                 let (p0, l0) = (avals[0][0], avals[0][1]);
@@ -1946,25 +2172,18 @@ impl<'a, 'b> Gen<'a, 'b> {
                 Ok((CType::Str, vec![np, nl]))
             }
             "len" => {
-                let elem = match &atys[0] {
-                    CType::Arr(e) => e.as_ref().clone(),
+                match &atys[0] {
+                    CType::Arr(_) => {}
                     CType::CSlice(_) | CType::CMutSlice(_) => {
                         return Ok((CType::I64, vec![avals[0][1]]));
                     }
                     _ => return Err("`len` expects array".into()),
-                };
-                let stride = comps(self.p, &elem)?.len() as i64;
+                }
                 let n = self
                     .b
                     .ins()
                     .load(types::I64, MemFlags::trusted(), avals[0][0], 0);
-                let v = if stride == 1 {
-                    n
-                } else {
-                    let s = self.b.ins().iconst(types::I64, stride);
-                    self.b.ins().sdiv(n, s)
-                };
-                Ok((CType::I64, vec![v]))
+                Ok((CType::I64, vec![n]))
             }
             "arr" => {
                 let n = avals[0][0];
@@ -1984,9 +2203,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                     }
                     t @ (CType::F32 | CType::Rec(_) | CType::Str) => {
                         let elem = t.clone();
-                        let stride = comps(self.p, &elem)?.len() as i64;
-                        let stride_val = self.b.ins().iconst(types::I64, stride);
-                        let base = self.call_import("lu_arr_new_raw", &[n, stride_val])[0];
+                        let base = self.alloc_array_raw(n, &elem)?;
                         // fill loop: SoA planes (or AoS under LU_LAYOUT=aos)
                         let ivar = self.b.declare_var(types::I64);
                         let zero = self.b.ins().iconst(types::I64, 0);

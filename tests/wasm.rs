@@ -44,7 +44,9 @@ fn wasi_and_web_targets_execute_the_same_program() {
              b[i] = float(i + 1)\n\
            }\n\
            let exact = arr(n, 9007199254740992 + 1)\n\
-           print(\"wasm\", 6 * 7, sum(i in 0..n) a[i] * b[i], sum(i in 0..n) exact[i])\n\
+           var packed = arr(n, f32(0))\n\
+           for i in 0..n { packed[i] = f32(i + 1) * f32(2) }\n\
+           print(\"wasm\", 6 * 7, sum(i in 0..n) a[i] * b[i], sum(i in 0..n) exact[i], sum(i in 0..n) packed[i])\n\
          }\n",
     )
     .expect("write source");
@@ -67,7 +69,7 @@ WebAssembly.instantiate(fs.readFileSync(process.argv[1]), {
 }).then(({ instance }) => wasi.start(instance));
 "#;
     let wasi_output = run(Command::new("node").args(["-e", wasi_runner]).arg(&wasi));
-    assert_eq!(wasi_output.stdout, b"wasm 42 440 99079191802150923\n");
+    assert_eq!(wasi_output.stdout, b"wasm 42 440 99079191802150923 132\n");
 
     let web = directory.join("answer-web.wasm");
     run(Command::new(env!("CARGO_BIN_EXE_lu"))
@@ -97,7 +99,7 @@ process.stdout.write(lines.join("\n") + "\n");
         .arg(&web_runner)
         .arg(&module_loader)
         .arg(&web));
-    assert_eq!(web_output.stdout, b"wasm 42 440 99079191802150923\n");
+    assert_eq!(web_output.stdout, b"wasm 42 440 99079191802150923 132\n");
 
     let _ = std::fs::remove_dir_all(&directory);
 }

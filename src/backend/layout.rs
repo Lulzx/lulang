@@ -7,12 +7,28 @@ pub enum Component {
     F32,
     F64,
     Ptr,
+    F32x4,
+    F64x2,
+    I64x2,
+}
+
+impl Component {
+    pub fn bytes(self) -> usize {
+        match self {
+            Component::F32 => 4,
+            Component::I64 | Component::F64 | Component::Ptr => 8,
+            Component::F32x4 | Component::F64x2 | Component::I64x2 => 16,
+        }
+    }
 }
 
 pub fn components(p: &Program, ty: &Type) -> Result<Vec<Component>, String> {
     Ok(match ty {
         Type::F32 => vec![Component::F32],
         Type::F64 => vec![Component::F64],
+        Type::F32x4 => vec![Component::F32x4],
+        Type::F64x2 => vec![Component::F64x2],
+        Type::I64x2 => vec![Component::I64x2],
         Type::I64 | Type::Bool | Type::Enum(_) => vec![Component::I64],
         Type::Str => vec![Component::Ptr, Component::I64],
         Type::Arr(_) => vec![Component::Ptr],

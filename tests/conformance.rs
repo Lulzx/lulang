@@ -657,6 +657,53 @@ fn simd_reductions_handle_odd_lengths_with_a_scalar_tail() {
 }
 
 #[test]
+fn packed_f32_simd_reductions_handle_four_lane_vectors_and_scalar_tails() {
+    assert_success(
+        "simd_f32_odd_length_tail",
+        "main {\n\
+           let n = 19\n\
+           var a = arr(n, f32(0))\n\
+           for i in 0..n { a[i] = f32(i + 1) }\n\
+           print(sum(i in 0..n) a[i])\n\
+         }\n",
+        b"190\n",
+    );
+}
+
+#[test]
+fn independent_elementwise_loops_vectorize_without_breaking_array_snapshots() {
+    assert_success(
+        "simd_elementwise_store",
+        "main {\n\
+           let n = 19\n\
+           var source = arr(n, f32(1.5))\n\
+           var output = arr(n, f32(0))\n\
+           let snapshot = output\n\
+           for i in 0..n { output[i] = source[i] * f32(2) }\n\
+           print(output[0], output[18], snapshot[0])\n\
+         }\n",
+        b"3 3 0\n",
+    );
+}
+
+#[test]
+fn explicit_portable_simd_values_and_intrinsics_cross_function_boundaries() {
+    assert_success(
+        "explicit_simd_values",
+        "fn add4(a: f32x4, b: f32x4): f32x4 { f32x4_add(a, b) }\n\
+         fn mul2(a: f64x2, b: f64x2): f64x2 { f64x2_mul(a, b) }\n\
+         fn div2(a: i64x2, b: i64x2): i64x2 { i64x2_div(a, b) }\n\
+         main {\n\
+           let a = add4(f32x4(1, 2, 3, 4), f32x4_splat(2))\n\
+           let b = mul2(f64x2(3, 5), f64x2_splat(2))\n\
+           let c = div2(i64x2(20, -9), i64x2(4, 2))\n\
+           print(f32x4_sum(a), f64x2_sum(b), i64x2_sum(c), i64x2_extract(c, 1))\n\
+         }\n",
+        b"18 16 1 -4\n",
+    );
+}
+
+#[test]
 fn integer_simd_reductions_remain_exact_above_f64_precision() {
     assert_success(
         "integer_simd_exact_odd_tail",

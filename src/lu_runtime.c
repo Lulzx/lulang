@@ -64,48 +64,99 @@ void lu_print_str(const char *p, long long n) { fwrite(p, 1, (size_t)n, stdout);
 void lu_print_sep(void) { putchar(' '); }
 void lu_print_nl(void) { putchar('\n'); }
 
-static char *arr_alloc(long long n, long long stride) {
-  if (n < 0 || stride <= 0 ||
-      (unsigned long long)n > (SIZE_MAX - 8) / 8 / (unsigned long long)stride) {
-    fprintf(stderr, "error: invalid array length %lld with stride %lld\n", n, stride);
+static char *arr_alloc(long long n, long long data_bytes) {
+  if (n < 0 || data_bytes < 0 ||
+      (unsigned long long)data_bytes > SIZE_MAX - 16) {
+    fprintf(stderr, "error: invalid array length %lld with %lld data bytes\n",
+            n, data_bytes);
     exit(1);
   }
-  long long slots = n * stride;
-  char *p = malloc(8 + (size_t)slots * 8);
+  char *p = malloc(16 + (size_t)data_bytes);
   if (!p) {
     fprintf(stderr, "error: out of memory allocating array of %lld elements\n", n);
     exit(1);
   }
-  *(long long *)p = slots;
+  ((long long *)p)[0] = n;
+  ((long long *)p)[1] = data_bytes;
   return p;
 }
 
 char *lu_arr_new_f64(long long n, double init) {
-  char *p = arr_alloc(n, 1);
-  double *d = (double *)(p + 8);
+  if (n < 0 || (unsigned long long)n > (SIZE_MAX - 16) / 8) {
+    fprintf(stderr, "error: invalid array length %lld\n", n);
+    exit(1);
+  }
+  char *p = arr_alloc(n, n * 8);
+  double *d = (double *)(p + 16);
   for (long long i = 0; i < n; i++) d[i] = init;
   return p;
 }
 
 char *lu_arr_new_i64(long long n, long long init) {
-  char *p = arr_alloc(n, 1);
-  long long *d = (long long *)(p + 8);
+  if (n < 0 || (unsigned long long)n > (SIZE_MAX - 16) / 8) {
+    fprintf(stderr, "error: invalid array length %lld\n", n);
+    exit(1);
+  }
+  char *p = arr_alloc(n, n * 8);
+  long long *d = (long long *)(p + 16);
   for (long long i = 0; i < n; i++) d[i] = init;
   return p;
 }
 
-/* Uninitialized array of n 8-byte slots; the compiler emits the fill loop
-   (record arrays are laid out SoA — a compiler decision, not a runtime one). */
-char *lu_arr_new_raw(long long n, long long stride) { return arr_alloc(n, stride); }
+/* Uninitialized typed array. Scalar f32 arrays are packed; multi-component
+   SoA arrays use individually 8-byte-aligned planes. */
+char *lu_arr_new_raw(long long n, long long f32_components,
+                     long long wide_components, long long soa) {
+  if (n < 0 || f32_components < 0 || wide_components < 0) {
+    fprintf(stderr, "error: invalid typed array layout\n");
+    exit(1);
+  }
+  unsigned long long un = (unsigned long long)n;
+  unsigned long long f32_count = (unsigned long long)f32_components;
+  unsigned long long wide_count = (unsigned long long)wide_components;
+  unsigned long long component_count = f32_count + wide_count;
+  if (component_count == 0) {
+    fprintf(stderr, "error: invalid typed array layout\n");
+    exit(1);
+  }
+  unsigned long long bytes;
+  if (component_count == 1) {
+    unsigned long long width = f32_count ? 4 : 8;
+    if (un > (SIZE_MAX - 16) / width) goto overflow;
+    bytes = un * width;
+  } else if (soa) {
+    if (un > (SIZE_MAX - 16) / 8) goto overflow;
+    unsigned long long wide_plane = un * 8;
+    unsigned long long f32_raw = un * 4;
+    if (f32_raw > SIZE_MAX - 7) goto overflow;
+    unsigned long long f32_plane = (f32_raw + 7) & ~(unsigned long long)7;
+    if (wide_count > (SIZE_MAX - 16) / (wide_plane ? wide_plane : 1) ||
+        f32_count > (SIZE_MAX - 16) / (f32_plane ? f32_plane : 1))
+      goto overflow;
+    unsigned long long wide_bytes = wide_count * wide_plane;
+    unsigned long long f32_bytes = f32_count * f32_plane;
+    if (wide_bytes > SIZE_MAX - 16 - f32_bytes) goto overflow;
+    bytes = wide_bytes + f32_bytes;
+  } else {
+    if (component_count > (SIZE_MAX - 16) / 8 ||
+        un > (SIZE_MAX - 16) / (component_count * 8))
+      goto overflow;
+    bytes = un * component_count * 8;
+  }
+  return arr_alloc(n, (long long)bytes);
+overflow:
+  fprintf(stderr, "error: array allocation size overflow\n");
+  exit(1);
+}
 
 char *lu_arr_clone(const char *source) {
   if (!source) return 0;
-  long long slots = *(const long long *)source;
-  if (slots < 0 || (unsigned long long)slots > (SIZE_MAX - 8) / 8) {
+  long long data_bytes = ((const long long *)source)[1];
+  if (data_bytes < 0 || (unsigned long long)data_bytes > SIZE_MAX - 16) {
     fprintf(stderr, "error: array allocation size overflow\n");
     exit(1);
   }
-  size_t bytes = 8 + (size_t)slots * 8;
+  size_t bytes = 16 + (size_t)data_bytes;
   char *copy = malloc(bytes);
   if (!copy) {
     fprintf(stderr, "error: out of memory cloning array\n");
@@ -134,7 +185,7 @@ struct lu_owned_i64 *lu_owned_i64_wrap(void *allocation) {
     free(allocation);
     return 0;
   }
-  handle->data = (long long *)((char *)allocation + 8);
+  handle->data = (long long *)((char *)allocation + 16);
   handle->length = *(long long *)allocation;
   handle->allocation = allocation;
   return handle;
@@ -147,7 +198,7 @@ struct lu_owned_f64 *lu_owned_f64_wrap(void *allocation) {
     free(allocation);
     return 0;
   }
-  handle->data = (double *)((char *)allocation + 8);
+  handle->data = (double *)((char *)allocation + 16);
   handle->length = *(long long *)allocation;
   handle->allocation = allocation;
   return handle;

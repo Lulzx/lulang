@@ -38,6 +38,7 @@ pub struct Reduction {
 /// the same legality proof and scalar-tail expression.
 #[derive(Clone, Debug)]
 pub enum SimdExpr {
+    F32(f32),
     F64(f64),
     I64(i64),
     Invariant(LocalId),
@@ -63,6 +64,7 @@ pub enum SimdExpr {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimdScalar {
+    F32,
     F64,
     I64,
 }
@@ -72,6 +74,82 @@ pub struct SimdReductionPlan {
     pub accumulator: LocalId,
     pub scalar: SimdScalar,
     pub value: SimdExpr,
+}
+
+/// A canonical element-wise loop whose only observable body effect is one
+/// scalar array store at the induction index.
+#[derive(Clone, Debug)]
+pub struct SimdStorePlan {
+    pub destination: LocalId,
+    pub scalar: SimdScalar,
+    pub value: SimdExpr,
+}
+
+pub fn simd_store_plan(
+    function: &Function,
+    analysis: &CfgAnalysis,
+    loop_index: usize,
+    soa: bool,
+) -> Option<SimdStorePlan> {
+    let loop_info = analysis.loops.get(loop_index)?;
+    if loop_info.reduction.is_some() {
+        return None;
+    }
+    let mut store = None;
+    for &block in &loop_info.blocks {
+        for (instruction, inst) in function.blocks[block as usize]
+            .instructions
+            .iter()
+            .enumerate()
+        {
+            match &inst.kind {
+                InstKind::SetIndex {
+                    root,
+                    path,
+                    base,
+                    index,
+                    value,
+                } => {
+                    if store.is_some()
+                        || !path.is_empty()
+                        || array_local_for_value(function, *base) != Some(*root)
+                        || !cfg_value_is_load(function, *index, loop_info.induction)
+                        || analysis.trusted_accesses.get(&(block, instruction)) != Some(&loop_index)
+                    {
+                        return None;
+                    }
+                    store = Some((*root, *value));
+                }
+                InstKind::Store { local, .. } if *local != loop_info.induction => return None,
+                InstKind::SetField { .. } | InstKind::Array(_) => return None,
+                InstKind::Call { callee, .. }
+                    if !matches!(
+                        callee,
+                        Callee::Builtin(name)
+                            if matches!(name.as_str(), "sqrt" | "abs" | "min" | "max" | "f32")
+                    ) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+    }
+    let (destination, value) = store?;
+    let Type::Arr(element) = &function.locals[destination as usize].ty else {
+        return None;
+    };
+    let scalar = match element.as_ref() {
+        Type::F32 => SimdScalar::F32,
+        Type::F64 => SimdScalar::F64,
+        Type::I64 => SimdScalar::I64,
+        _ => return None,
+    };
+    Some(SimdStorePlan {
+        destination,
+        scalar,
+        value: simd_expr(function, analysis, loop_index, value, scalar, soa)?,
+    })
 }
 
 /// Proves that a canonical `sum` loop can be evaluated lane-wise. This proof
@@ -86,6 +164,7 @@ pub fn simd_reduction_plan(
     let loop_info = analysis.loops.get(loop_index)?;
     let reduction = loop_info.reduction.as_ref()?;
     let scalar = match function.locals[reduction.accumulator as usize].ty {
+        Type::F32 => SimdScalar::F32,
         Type::F64 => SimdScalar::F64,
         Type::I64 => SimdScalar::I64,
         _ => return None,
@@ -108,6 +187,9 @@ fn simd_expr(
 ) -> Option<SimdExpr> {
     let (block, instruction, inst) = cfg_value_definition(function, value)?;
     Some(match &inst.kind {
+        InstKind::Constant(Constant::F32(value)) if scalar == SimdScalar::F32 => {
+            SimdExpr::F32(*value)
+        }
         InstKind::Constant(Constant::F64(value)) if scalar == SimdScalar::F64 => {
             SimdExpr::F64(*value)
         }
@@ -116,6 +198,7 @@ fn simd_expr(
             if *local != analysis.loops[loop_index].induction
                 && function.locals[*local as usize].ty
                     == match scalar {
+                        SimdScalar::F32 => Type::F32,
                         SimdScalar::F64 => Type::F64,
                         SimdScalar::I64 => Type::I64,
                     }
@@ -131,7 +214,7 @@ fn simd_expr(
         )?)),
         InstKind::Binary { op, lhs, rhs }
             if match scalar {
-                SimdScalar::F64 => matches!(
+                SimdScalar::F32 | SimdScalar::F64 => matches!(
                     op,
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
                 ),
@@ -153,6 +236,7 @@ fn simd_expr(
         InstKind::Index { base, index }
             if function.values[value as usize]
                 == match scalar {
+                    SimdScalar::F32 => Type::F32,
                     SimdScalar::F64 => Type::F64,
                     SimdScalar::I64 => Type::I64,
                 }
@@ -174,6 +258,7 @@ fn simd_expr(
             };
             if function.values[value as usize]
                 != match scalar {
+                    SimdScalar::F32 => Type::F32,
                     SimdScalar::F64 => Type::F64,
                     SimdScalar::I64 => Type::I64,
                 }
@@ -195,7 +280,14 @@ fn simd_expr(
             callee: Callee::Builtin(name),
             args,
             ..
-        } if scalar == SimdScalar::F64
+        } if scalar == SimdScalar::F32 && name == "f32" && args.len() == 1 => {
+            return simd_expr(function, analysis, loop_index, args[0], scalar, soa);
+        }
+        InstKind::Call {
+            callee: Callee::Builtin(name),
+            args,
+            ..
+        } if matches!(scalar, SimdScalar::F32 | SimdScalar::F64)
             && matches!(name.as_str(), "sqrt" | "abs" | "min" | "max") =>
         {
             SimdExpr::Builtin {
@@ -548,7 +640,7 @@ fn find_reduction(
         let accumulator = accumulator as LocalId;
         if accumulator == induction
             || !local.name.contains("$tmp")
-            || !matches!(local.ty, Type::I64 | Type::F64)
+            || !matches!(local.ty, Type::I64 | Type::F32 | Type::F64)
         {
             continue;
         }
@@ -556,7 +648,7 @@ fn find_reduction(
         let zero = defs.get(&initial).is_some_and(|(_, inst)| {
             matches!(
                 inst.kind,
-                InstKind::Constant(Constant::I64(0) | Constant::F64(0.0))
+                InstKind::Constant(Constant::I64(0) | Constant::F32(0.0) | Constant::F64(0.0))
             )
         });
         if !zero {
@@ -1285,15 +1377,34 @@ mod cfg_tests {
     }
 
     #[test]
-    fn keeps_f32_reductions_scalar_until_arrays_are_packed() {
+    fn proves_packed_f32_array_reductions_for_simd() {
         let function = lower("main { let a = arr(11, f32(1)) print(sum(i in 0..len(a)) a[i]) }")
             .main
             .unwrap();
         let analysis = analyze_cfg(&function);
-        assert!(
-            simd_reduction_plan(&function, &analysis, 0, true).is_none(),
-            "f32 array elements currently occupy 8-byte storage slots"
-        );
+        let plan = simd_reduction_plan(&function, &analysis, 0, true)
+            .expect("packed f32 arrays should vectorize");
+        assert_eq!(plan.scalar, SimdScalar::F32);
+    }
+
+    #[test]
+    fn proves_independent_elementwise_array_stores_for_simd() {
+        let function = lower(
+            "main { let n = 17 var a = arr(n, f32(1)) var b = arr(n, f32(0)) for i in 0..n { b[i] = a[i] * f32(2) } print(b[16]) }",
+        )
+        .main
+        .unwrap();
+        let analysis = analyze_cfg(&function);
+        let plan = simd_store_plan(&function, &analysis, 0, true)
+            .expect("an independent packed element-wise store should vectorize");
+        assert_eq!(plan.scalar, SimdScalar::F32);
+        assert!(matches!(
+            plan.value,
+            SimdExpr::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
     }
 
     #[test]

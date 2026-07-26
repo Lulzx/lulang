@@ -5,3 +5,4 @@
 pub mod abi;
 pub mod layout;
 pub mod optimization;
+pub mod simd;

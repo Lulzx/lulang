@@ -13,8 +13,9 @@ use crate::backend::layout::{
     array_component_offsets, components as layout_components, field_offset, Component,
 };
 use crate::backend::optimization::{
-    analyze_cfg, simd_reduction_plan, CfgAnalysis, SimdExpr, SimdScalar,
+    analyze_cfg, simd_reduction_plan, simd_store_plan, CfgAnalysis, SimdExpr, SimdScalar,
 };
+use crate::backend::simd::{lane_count, native_width_bits, SIMD128};
 use crate::check::{resolve_type, Type as CType};
 use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
 use std::collections::{HashMap, HashSet};
@@ -44,6 +45,9 @@ fn llvm_component(component: Component) -> &'static str {
         Component::F32 => "float",
         Component::F64 => "double",
         Component::Ptr => "ptr",
+        Component::F32x4 => "<4 x float>",
+        Component::F64x2 => "<2 x double>",
+        Component::I64x2 => "<2 x i64>",
     }
 }
 
@@ -148,10 +152,12 @@ fn emit_export_wrapper(
         }
     }
     for (index, (source, len, handle, component)) in arrays.iter().enumerate() {
+        let f32_components = (*component == "float") as i64;
+        let wide_components = 1 - f32_components;
         let _ = writeln!(
             out,
-            "  {handle} = call ptr @lu_arr_new_raw(i64 {len}, i64 1)\n\
-             \x20 %wa{index}_data = getelementptr i8, ptr {handle}, i64 8\n\
+            "  {handle} = call ptr @lu_arr_new_raw(i64 {len}, i64 {f32_components}, i64 {wide_components}, i64 1)\n\
+             \x20 %wa{index}_data = getelementptr i8, ptr {handle}, i64 16\n\
              \x20 %wa{index}_in_idx = alloca i64\n\
              \x20 store i64 0, ptr %wa{index}_in_idx\n\
              \x20 br label %wa{index}_in_cond\n\
@@ -189,7 +195,7 @@ fn emit_export_wrapper(
     for (index, (destination, len, handle, component)) in arrays.iter().enumerate() {
         let _ = writeln!(
             out,
-            "  %wa{index}_out_data = getelementptr i8, ptr {handle}, i64 8\n\
+            "  %wa{index}_out_data = getelementptr i8, ptr {handle}, i64 16\n\
              \x20 %wa{index}_out_idx = alloca i64\n\
              \x20 store i64 0, ptr %wa{index}_out_idx\n\
              \x20 br label %wa{index}_out_cond\n\
@@ -273,6 +279,7 @@ struct Emit<'a> {
     cfg_trusted: HashMap<(usize, ir::LocalId), String>,
     skipped_cfg_blocks: HashSet<ir::BlockId>,
     simd: bool,
+    simd_bits: u16,
     location: (ir::BlockId, usize),
     externs: &'a [ir::ExternDef],
 }
@@ -473,6 +480,11 @@ fn build_output(
         simd: std::env::var("LU_SIMD")
             .map(|value| value != "off" && value != "0")
             .unwrap_or(true),
+        simd_bits: if wasm.is_some() {
+            SIMD128
+        } else {
+            native_width_bits()
+        },
         location: (0, 0),
         externs: &ir.externs,
     };
@@ -506,20 +518,43 @@ fn build_output(
     };
     let _ = writeln!(module, "target triple = \"{}\"", triple);
     module.push_str(
-        "declare double @llvm.sqrt.f64(double)\ndeclare <2 x double> @llvm.sqrt.v2f64(<2 x double>)\n\
+        "declare float @llvm.sqrt.f32(float)\ndeclare <4 x float> @llvm.sqrt.v4f32(<4 x float>)\n\
+         declare <8 x float> @llvm.sqrt.v8f32(<8 x float>)\n\
+         declare <16 x float> @llvm.sqrt.v16f32(<16 x float>)\n\
+         declare double @llvm.sqrt.f64(double)\ndeclare <2 x double> @llvm.sqrt.v2f64(<2 x double>)\n\
+         declare <4 x double> @llvm.sqrt.v4f64(<4 x double>)\n\
+         declare <8 x double> @llvm.sqrt.v8f64(<8 x double>)\n\
          declare double @llvm.sin.f64(double)\n\
-         declare double @llvm.cos.f64(double)\ndeclare double @llvm.fabs.f64(double)\n\
+         declare double @llvm.cos.f64(double)\ndeclare float @llvm.fabs.f32(float)\n\
+         declare <4 x float> @llvm.fabs.v4f32(<4 x float>)\n\
+         declare <8 x float> @llvm.fabs.v8f32(<8 x float>)\n\
+         declare <16 x float> @llvm.fabs.v16f32(<16 x float>)\n\
+         declare double @llvm.fabs.f64(double)\n\
          declare <2 x double> @llvm.fabs.v2f64(<2 x double>)\n\
-         declare double @llvm.floor.f64(double)\ndeclare double @llvm.minnum.f64(double, double)\n\
+         declare <4 x double> @llvm.fabs.v4f64(<4 x double>)\n\
+         declare <8 x double> @llvm.fabs.v8f64(<8 x double>)\n\
+         declare double @llvm.floor.f64(double)\ndeclare float @llvm.minnum.f32(float, float)\n\
+         declare <4 x float> @llvm.minnum.v4f32(<4 x float>, <4 x float>)\n\
+         declare <8 x float> @llvm.minnum.v8f32(<8 x float>, <8 x float>)\n\
+         declare <16 x float> @llvm.minnum.v16f32(<16 x float>, <16 x float>)\n\
+         declare double @llvm.minnum.f64(double, double)\n\
          declare <2 x double> @llvm.minnum.v2f64(<2 x double>, <2 x double>)\n\
+         declare <4 x double> @llvm.minnum.v4f64(<4 x double>, <4 x double>)\n\
+         declare <8 x double> @llvm.minnum.v8f64(<8 x double>, <8 x double>)\n\
+         declare float @llvm.maxnum.f32(float, float)\n\
+         declare <4 x float> @llvm.maxnum.v4f32(<4 x float>, <4 x float>)\n\
+         declare <8 x float> @llvm.maxnum.v8f32(<8 x float>, <8 x float>)\n\
+         declare <16 x float> @llvm.maxnum.v16f32(<16 x float>, <16 x float>)\n\
          declare double @llvm.maxnum.f64(double, double)\n\
          declare <2 x double> @llvm.maxnum.v2f64(<2 x double>, <2 x double>)\n\
+         declare <4 x double> @llvm.maxnum.v4f64(<4 x double>, <4 x double>)\n\
+         declare <8 x double> @llvm.maxnum.v8f64(<8 x double>, <8 x double>)\n\
          declare double @llvm.pow.f64(double, double)\n\
          declare double @acos(double) #0\ndeclare double @atan2(double, double) #0\n\
          declare void @lu_print_f64(double)\ndeclare void @lu_print_i64(i64)\n\
          declare void @lu_print_bool(i64)\ndeclare void @lu_print_str(ptr, i64)\n\
          declare void @lu_print_sep()\ndeclare void @lu_print_nl()\n\
-         declare ptr @lu_arr_new_raw(i64, i64)\n\
+         declare ptr @lu_arr_new_raw(i64, i64, i64, i64)\n\
          declare ptr @lu_arr_clone(ptr)\n\
          declare ptr @lu_owned_i64_wrap(ptr)\n\
          declare ptr @lu_owned_f64_wrap(ptr)\n\
@@ -793,6 +828,49 @@ fn build_output(
 }
 
 impl<'a> Emit<'a> {
+    fn simd_lanes(&self, scalar: SimdScalar) -> usize {
+        lane_count(self.simd_bits, scalar) as usize
+    }
+
+    fn simd_scalar_type(scalar: SimdScalar) -> &'static str {
+        match scalar {
+            SimdScalar::F32 => "float",
+            SimdScalar::F64 => "double",
+            SimdScalar::I64 => "i64",
+        }
+    }
+
+    fn simd_vector_type(&self, scalar: SimdScalar) -> String {
+        format!(
+            "<{} x {}>",
+            self.simd_lanes(scalar),
+            Self::simd_scalar_type(scalar)
+        )
+    }
+
+    fn simd_intrinsic_suffix(&self, scalar: SimdScalar) -> String {
+        format!(
+            "v{}{}",
+            self.simd_lanes(scalar),
+            if scalar == SimdScalar::F32 {
+                "f32"
+            } else {
+                "f64"
+            }
+        )
+    }
+
+    fn simd_constant(&self, scalar: SimdScalar, value: &str) -> String {
+        let lane = Self::simd_scalar_type(scalar);
+        format!(
+            "<{}>",
+            (0..self.simd_lanes(scalar))
+                .map(|_| format!("{} {}", lane, value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
     fn t(&mut self) -> String {
         self.tmp += 1;
         format!("%t{}", self.tmp)
@@ -975,15 +1053,20 @@ impl<'a> Emit<'a> {
         loop_index: usize,
     ) -> Result<bool, String> {
         let Some(plan) = simd_reduction_plan(function, &self.cfg, loop_index, self.soa) else {
-            return Ok(false);
+            return self.emit_cfg_simd_store(function, values, loop_index);
         };
         let loop_info = self.cfg.loops[loop_index].clone();
         let lower = Self::ir_value(values, loop_info.lower)?.regs[0].clone();
         let upper = Self::ir_value(values, loop_info.upper)?.regs[0].clone();
-        let (scalar_type, vector_type, zero) = match plan.scalar {
-            SimdScalar::F64 => ("double", "<2 x double>", "0.0"),
-            SimdScalar::I64 => ("i64", "<2 x i64>", "0"),
+        let scalar_type = Self::simd_scalar_type(plan.scalar);
+        let vector_type = self.simd_vector_type(plan.scalar);
+        let zero = if plan.scalar == SimdScalar::I64 {
+            "0"
+        } else {
+            "0.0"
         };
+        let lanes = self.simd_lanes(plan.scalar);
+        let batch_size = lanes * 4;
 
         let index_ptr = self.t();
         self.line(format!("{} = alloca i64", index_ptr));
@@ -1016,7 +1099,10 @@ impl<'a> Emit<'a> {
         let index = self.t();
         self.line(format!("{} = load i64, ptr {}", index, index_ptr));
         let after_batch = self.t();
-        self.line(format!("{} = add i64 {}, 8", after_batch, index));
+        self.line(format!(
+            "{} = add i64 {}, {}",
+            after_batch, index, batch_size
+        ));
         let fits = self.t();
         self.line(format!(
             "{} = icmp sle i64 {}, {}",
@@ -1033,7 +1119,7 @@ impl<'a> Emit<'a> {
                 index.clone()
             } else {
                 let at = self.t();
-                self.line(format!("{} = add i64 {}, {}", at, index, lane * 2));
+                self.line(format!("{} = add i64 {}, {}", at, index, lane * lanes));
                 at
             };
             let item = self.emit_simd_vector_expr(loop_index, plan.scalar, &plan.value, &at)?;
@@ -1043,7 +1129,7 @@ impl<'a> Emit<'a> {
                 current, vector_type, accumulator
             ));
             let next = self.t();
-            self.emit_simd_add(plan.scalar, &next, vector_type, &current, &item);
+            self.emit_simd_add(plan.scalar, &next, &vector_type, &current, &item);
             self.line(format!(
                 "store {} {}, ptr {}",
                 vector_type, next, accumulator
@@ -1095,34 +1181,38 @@ impl<'a> Emit<'a> {
             vectors.push(value);
         }
         let pair0 = self.t();
-        self.emit_simd_add(plan.scalar, &pair0, vector_type, &vectors[0], &vectors[1]);
+        self.emit_simd_add(plan.scalar, &pair0, &vector_type, &vectors[0], &vectors[1]);
         let pair1 = self.t();
-        self.emit_simd_add(plan.scalar, &pair1, vector_type, &vectors[2], &vectors[3]);
+        self.emit_simd_add(plan.scalar, &pair1, &vector_type, &vectors[2], &vectors[3]);
         let vector_total = self.t();
-        self.emit_simd_add(plan.scalar, &vector_total, vector_type, &pair0, &pair1);
-        let lane0 = self.t();
+        self.emit_simd_add(plan.scalar, &vector_total, &vector_type, &pair0, &pair1);
+        let mut lane_total = self.t();
         self.line(format!(
             "{} = extractelement {} {}, i64 0",
-            lane0, vector_type, vector_total
+            lane_total, vector_type, vector_total
         ));
-        let lane1 = self.t();
-        self.line(format!(
-            "{} = extractelement {} {}, i64 1",
-            lane1, vector_type, vector_total
-        ));
-        let lanes = self.t();
-        self.emit_simd_add(plan.scalar, &lanes, scalar_type, &lane0, &lane1);
+        for lane in 1..lanes {
+            let value = self.t();
+            self.line(format!(
+                "{} = extractelement {} {}, i64 {}",
+                value, vector_type, vector_total, lane
+            ));
+            let next = self.t();
+            self.emit_simd_add(plan.scalar, &next, scalar_type, &lane_total, &value);
+            lane_total = next;
+        }
         let scalar = self.t();
         self.line(format!(
             "{} = load {}, ptr {}",
             scalar, scalar_type, scalar_ptr
         ));
         let total = self.t();
-        self.emit_simd_add(plan.scalar, &total, scalar_type, &lanes, &scalar);
+        self.emit_simd_add(plan.scalar, &total, scalar_type, &lane_total, &scalar);
         self.store_var(
             &Self::ir_local(plan.accumulator),
             &EV {
                 ty: match plan.scalar {
+                    SimdScalar::F32 => CType::F32,
                     SimdScalar::F64 => CType::F64,
                     SimdScalar::I64 => CType::I64,
                 },
@@ -1135,9 +1225,112 @@ impl<'a> Emit<'a> {
         Ok(true)
     }
 
+    fn emit_cfg_simd_store(
+        &mut self,
+        function: &ir::Function,
+        values: &[Option<EV>],
+        loop_index: usize,
+    ) -> Result<bool, String> {
+        let Some(plan) = simd_store_plan(function, &self.cfg, loop_index, self.soa) else {
+            return Ok(false);
+        };
+        let loop_info = self.cfg.loops[loop_index].clone();
+        let lower = Self::ir_value(values, loop_info.lower)?.regs[0].clone();
+        let upper = Self::ir_value(values, loop_info.upper)?.regs[0].clone();
+        let base = self.load_var(&Self::ir_local(plan.destination))?.regs[0].clone();
+        let lanes = self.simd_lanes(plan.scalar);
+        let width = if plan.scalar == SimdScalar::F32 { 4 } else { 8 };
+        let scalar_type = Self::simd_scalar_type(plan.scalar);
+        let vector_type = self.simd_vector_type(plan.scalar);
+        let index_ptr = self.t();
+        self.line(format!("{} = alloca i64", index_ptr));
+        self.line(format!("store i64 {}, ptr {}", lower, index_ptr));
+        let vector_head = self.l();
+        let vector_body = self.l();
+        let scalar_head = self.l();
+        let scalar_body = self.l();
+        let finish = self.l();
+        self.line(format!("br label %{}", vector_head));
+
+        self.label(&vector_head);
+        let index = self.t();
+        self.line(format!("{} = load i64, ptr {}", index, index_ptr));
+        let after = self.t();
+        self.line(format!("{} = add i64 {}, {}", after, index, lanes));
+        let fits = self.t();
+        self.line(format!("{} = icmp sle i64 {}, {}", fits, after, upper));
+        self.line(format!(
+            "br i1 {}, label %{}, label %{}",
+            fits, vector_body, scalar_head
+        ));
+
+        self.label(&vector_body);
+        let value = self.emit_simd_vector_expr(loop_index, plan.scalar, &plan.value, &index)?;
+        let offset = self.t();
+        self.line(format!("{} = mul i64 {}, {}", offset, index, width));
+        let data = self.t();
+        self.line(format!("{} = getelementptr i8, ptr {}, i64 16", data, base));
+        let address = self.t();
+        self.line(format!(
+            "{} = getelementptr i8, ptr {}, i64 {}",
+            address, data, offset
+        ));
+        self.line(format!(
+            "store {} {}, ptr {}, align 8",
+            vector_type, value, address
+        ));
+        self.line(format!("store i64 {}, ptr {}", after, index_ptr));
+        self.line(format!("br label %{}", vector_head));
+
+        self.label(&scalar_head);
+        let scalar_index = self.t();
+        self.line(format!("{} = load i64, ptr {}", scalar_index, index_ptr));
+        let more = self.t();
+        self.line(format!(
+            "{} = icmp slt i64 {}, {}",
+            more, scalar_index, upper
+        ));
+        self.line(format!(
+            "br i1 {}, label %{}, label %{}",
+            more, scalar_body, finish
+        ));
+
+        self.label(&scalar_body);
+        let value =
+            self.emit_simd_scalar_expr(loop_index, plan.scalar, &plan.value, &scalar_index)?;
+        let offset = self.t();
+        self.line(format!("{} = mul i64 {}, {}", offset, scalar_index, width));
+        let scalar_data = self.t();
+        self.line(format!(
+            "{} = getelementptr i8, ptr {}, i64 16",
+            scalar_data, base
+        ));
+        let address = self.t();
+        self.line(format!(
+            "{} = getelementptr i8, ptr {}, i64 {}",
+            address, scalar_data, offset
+        ));
+        self.line(format!(
+            "store {} {}, ptr {}, align {}",
+            scalar_type, value, address, width
+        ));
+        let next = self.t();
+        self.line(format!("{} = add i64 {}, 1", next, scalar_index));
+        self.line(format!("store i64 {}, ptr {}", next, index_ptr));
+        self.line(format!("br label %{}", scalar_head));
+
+        self.label(&finish);
+        self.line(format!("br label %B{}", loop_info.exit));
+        self.skipped_cfg_blocks
+            .extend(loop_info.blocks.iter().copied());
+        Ok(true)
+    }
+
     fn emit_simd_add(&mut self, scalar: SimdScalar, out: &str, ty: &str, lhs: &str, rhs: &str) {
         match scalar {
-            SimdScalar::F64 => self.line(format!("{} = fadd fast {} {}, {}", out, ty, lhs, rhs)),
+            SimdScalar::F32 | SimdScalar::F64 => {
+                self.line(format!("{} = fadd fast {} {}, {}", out, ty, lhs, rhs))
+            }
             SimdScalar::I64 => self.line(format!("{} = add {} {}, {}", out, ty, lhs, rhs)),
         }
     }
@@ -1150,45 +1343,53 @@ impl<'a> Emit<'a> {
         index: &str,
     ) -> Result<String, String> {
         Ok(match expr {
+            SimdExpr::F32(value) => {
+                let bits = format!("0x{:016X}", (*value as f64).to_bits());
+                self.simd_constant(scalar, &bits)
+            }
             SimdExpr::F64(value) => {
                 let bits = format!("0x{:016X}", value.to_bits());
-                format!("<double {bits}, double {bits}>")
+                self.simd_constant(scalar, &bits)
             }
             SimdExpr::I64(value) => match scalar {
+                SimdScalar::F32 => {
+                    let bits = format!("0x{:016X}", (*value as f32 as f64).to_bits());
+                    self.simd_constant(scalar, &bits)
+                }
                 SimdScalar::F64 => {
                     let bits = format!("0x{:016X}", (*value as f64).to_bits());
-                    format!("<double {bits}, double {bits}>")
+                    self.simd_constant(scalar, &bits)
                 }
-                SimdScalar::I64 => format!("<i64 {value}, i64 {value}>"),
+                SimdScalar::I64 => self.simd_constant(scalar, &value.to_string()),
             },
             SimdExpr::Invariant(local) => {
                 let value = self.load_var(&Self::ir_local(*local))?.regs[0].clone();
-                let (vector_type, scalar_type) = match scalar {
-                    SimdScalar::F64 => ("<2 x double>", "double"),
-                    SimdScalar::I64 => ("<2 x i64>", "i64"),
-                };
+                let vector_type = self.simd_vector_type(scalar);
+                let scalar_type = Self::simd_scalar_type(scalar);
                 let inserted = self.t();
                 self.line(format!(
                     "{} = insertelement {} poison, {} {}, i64 0",
                     inserted, vector_type, scalar_type, value
                 ));
                 let splat = self.t();
+                let mask = format!("<{} x i32> zeroinitializer", self.simd_lanes(scalar));
                 self.line(format!(
-                    "{} = shufflevector {} {}, {} poison, <2 x i32> zeroinitializer",
-                    splat, vector_type, inserted, vector_type
+                    "{} = shufflevector {} {}, {} poison, {}",
+                    splat, vector_type, inserted, vector_type, mask
                 ));
                 splat
             }
             SimdExpr::Neg(value) => {
                 let value = self.emit_simd_vector_expr(loop_index, scalar, value, index)?;
                 let out = self.t();
+                let vector_type = self.simd_vector_type(scalar);
                 match scalar {
-                    SimdScalar::F64 => {
-                        self.line(format!("{} = fneg fast <2 x double> {}", out, value))
+                    SimdScalar::F32 | SimdScalar::F64 => {
+                        self.line(format!("{} = fneg fast {} {}", out, vector_type, value))
                     }
                     SimdScalar::I64 => self.line(format!(
-                        "{} = sub <2 x i64> zeroinitializer, {}",
-                        out, value
+                        "{} = sub {} zeroinitializer, {}",
+                        out, vector_type, value
                     )),
                 }
                 out
@@ -1196,16 +1397,17 @@ impl<'a> Emit<'a> {
             SimdExpr::Binary { op, lhs, rhs } => {
                 let lhs = self.emit_simd_vector_expr(loop_index, scalar, lhs, index)?;
                 let rhs = self.emit_simd_vector_expr(loop_index, scalar, rhs, index)?;
-                let (instruction, flags, ty) = match (scalar, op) {
-                    (SimdScalar::F64, BinaryOp::Add) => ("fadd", " fast", "<2 x double>"),
-                    (SimdScalar::F64, BinaryOp::Sub) => ("fsub", " fast", "<2 x double>"),
-                    (SimdScalar::F64, BinaryOp::Mul) => ("fmul", " fast", "<2 x double>"),
-                    (SimdScalar::F64, BinaryOp::Div) => ("fdiv", " fast", "<2 x double>"),
-                    (SimdScalar::I64, BinaryOp::Add) => ("add", "", "<2 x i64>"),
-                    (SimdScalar::I64, BinaryOp::Sub) => ("sub", "", "<2 x i64>"),
-                    (SimdScalar::I64, BinaryOp::Mul) => ("mul", "", "<2 x i64>"),
+                let (instruction, flags) = match (scalar, op) {
+                    (SimdScalar::F32 | SimdScalar::F64, BinaryOp::Add) => ("fadd", " fast"),
+                    (SimdScalar::F32 | SimdScalar::F64, BinaryOp::Sub) => ("fsub", " fast"),
+                    (SimdScalar::F32 | SimdScalar::F64, BinaryOp::Mul) => ("fmul", " fast"),
+                    (SimdScalar::F32 | SimdScalar::F64, BinaryOp::Div) => ("fdiv", " fast"),
+                    (SimdScalar::I64, BinaryOp::Add) => ("add", ""),
+                    (SimdScalar::I64, BinaryOp::Sub) => ("sub", ""),
+                    (SimdScalar::I64, BinaryOp::Mul) => ("mul", ""),
                     _ => return Err("unsupported SIMD binary operation".into()),
                 };
+                let ty = self.simd_vector_type(scalar);
                 let out = self.t();
                 self.line(format!(
                     "{} = {}{} {} {}, {}",
@@ -1230,7 +1432,12 @@ impl<'a> Emit<'a> {
                     .get(&(loop_index, *local))
                     .cloned()
                     .ok_or("missing trusted SIMD field length")?;
-                self.emit_simd_vector_load(scalar, &base, index, Some((component, logical)))?
+                self.emit_simd_vector_load(
+                    scalar,
+                    &base,
+                    index,
+                    Some((*record, component, logical)),
+                )?
             }
             SimdExpr::Builtin { name, args } => {
                 let args = args
@@ -1238,22 +1445,27 @@ impl<'a> Emit<'a> {
                     .map(|arg| self.emit_simd_vector_expr(loop_index, scalar, arg, index))
                     .collect::<Result<Vec<_>, _>>()?;
                 let out = self.t();
+                if scalar == SimdScalar::I64 {
+                    return Err("integer SIMD builtin is unsupported".into());
+                }
+                let vector_type = self.simd_vector_type(scalar);
+                let suffix = self.simd_intrinsic_suffix(scalar);
                 match name.as_str() {
                     "sqrt" => self.line(format!(
-                        "{} = call fast <2 x double> @llvm.sqrt.v2f64(<2 x double> {})",
-                        out, args[0]
+                        "{} = call fast {} @llvm.sqrt.{}({} {})",
+                        out, vector_type, suffix, vector_type, args[0]
                     )),
                     "abs" => self.line(format!(
-                        "{} = call fast <2 x double> @llvm.fabs.v2f64(<2 x double> {})",
-                        out, args[0]
+                        "{} = call fast {} @llvm.fabs.{}({} {})",
+                        out, vector_type, suffix, vector_type, args[0]
                     )),
                     "min" => self.line(format!(
-                        "{} = call fast <2 x double> @llvm.minnum.v2f64(<2 x double> {}, <2 x double> {})",
-                        out, args[0], args[1]
+                        "{} = call fast {} @llvm.minnum.{}({} {}, {} {})",
+                        out, vector_type, suffix, vector_type, args[0], vector_type, args[1]
                     )),
                     "max" => self.line(format!(
-                        "{} = call fast <2 x double> @llvm.maxnum.v2f64(<2 x double> {}, <2 x double> {})",
-                        out, args[0], args[1]
+                        "{} = call fast {} @llvm.maxnum.{}({} {}, {} {})",
+                        out, vector_type, suffix, vector_type, args[0], vector_type, args[1]
                     )),
                     _ => return Err("unsupported SIMD builtin".into()),
                 }
@@ -1267,27 +1479,43 @@ impl<'a> Emit<'a> {
         scalar: SimdScalar,
         base: &str,
         index: &str,
-        plane: Option<(usize, String)>,
+        plane: Option<(usize, usize, String)>,
     ) -> Result<String, String> {
         let data = self.t();
-        self.line(format!("{} = getelementptr i8, ptr {}, i64 8", data, base));
-        let at = if let Some((component, logical)) = plane {
-            let offset = self.t();
-            self.line(format!("{} = mul i64 {}, {}", offset, logical, component));
+        self.line(format!("{} = getelementptr i8, ptr {}, i64 16", data, base));
+        let width = match scalar {
+            SimdScalar::F32 => 4,
+            SimdScalar::F64 | SimdScalar::I64 => 8,
+        };
+        let lane = self.t();
+        self.line(format!("{} = mul i64 {}, {}", lane, index, width));
+        let at = if let Some((record, component, logical)) = plane {
+            let components = layout_components(self.p, &CType::Rec(record))?;
+            let mut plane = "0".to_string();
+            for prior in components.iter().take(component) {
+                let raw = self.t();
+                self.line(format!("{} = mul i64 {}, {}", raw, logical, prior.bytes()));
+                let padded = self.t();
+                self.line(format!("{} = add i64 {}, 7", padded, raw));
+                let span = self.t();
+                self.line(format!("{} = and i64 {}, -8", span, padded));
+                let next = self.t();
+                self.line(format!("{} = add i64 {}, {}", next, plane, span));
+                plane = next;
+            }
             let at = self.t();
-            self.line(format!("{} = add i64 {}, {}", at, offset, index));
+            self.line(format!("{} = add i64 {}, {}", at, plane, lane));
             at
         } else {
-            index.to_string()
+            lane
         };
         let address = self.t();
-        let (scalar_type, vector_type) = match scalar {
-            SimdScalar::F64 => ("double", "<2 x double>"),
-            SimdScalar::I64 => ("i64", "<2 x i64>"),
+        let vector_type = match scalar {
+            _ => self.simd_vector_type(scalar),
         };
         self.line(format!(
-            "{} = getelementptr {}, ptr {}, i64 {}",
-            address, scalar_type, data, at
+            "{} = getelementptr i8, ptr {}, i64 {}",
+            address, data, at
         ));
         let value = self.t();
         self.line(format!(
@@ -1305,8 +1533,10 @@ impl<'a> Emit<'a> {
         index: &str,
     ) -> Result<String, String> {
         Ok(match expr {
+            SimdExpr::F32(value) => format!("0x{:016X}", (*value as f64).to_bits()),
             SimdExpr::F64(value) => format!("0x{:016X}", value.to_bits()),
             SimdExpr::I64(value) => match scalar {
+                SimdScalar::F32 => format!("0x{:016X}", (*value as f32 as f64).to_bits()),
                 SimdScalar::F64 => format!("0x{:016X}", (*value as f64).to_bits()),
                 SimdScalar::I64 => value.to_string(),
             },
@@ -1315,6 +1545,7 @@ impl<'a> Emit<'a> {
                 let value = self.emit_simd_scalar_expr(loop_index, scalar, value, index)?;
                 let out = self.t();
                 match scalar {
+                    SimdScalar::F32 => self.line(format!("{} = fneg fast float {}", out, value)),
                     SimdScalar::F64 => self.line(format!("{} = fneg fast double {}", out, value)),
                     SimdScalar::I64 => self.line(format!("{} = sub i64 0, {}", out, value)),
                 }
@@ -1324,6 +1555,10 @@ impl<'a> Emit<'a> {
                 let lhs = self.emit_simd_scalar_expr(loop_index, scalar, lhs, index)?;
                 let rhs = self.emit_simd_scalar_expr(loop_index, scalar, rhs, index)?;
                 let (instruction, flags, ty) = match (scalar, op) {
+                    (SimdScalar::F32, BinaryOp::Add) => ("fadd", " fast", "float"),
+                    (SimdScalar::F32, BinaryOp::Sub) => ("fsub", " fast", "float"),
+                    (SimdScalar::F32, BinaryOp::Mul) => ("fmul", " fast", "float"),
+                    (SimdScalar::F32, BinaryOp::Div) => ("fdiv", " fast", "float"),
                     (SimdScalar::F64, BinaryOp::Add) => ("fadd", " fast", "double"),
                     (SimdScalar::F64, BinaryOp::Sub) => ("fsub", " fast", "double"),
                     (SimdScalar::F64, BinaryOp::Mul) => ("fmul", " fast", "double"),
@@ -1357,7 +1592,12 @@ impl<'a> Emit<'a> {
                     .get(&(loop_index, *local))
                     .cloned()
                     .ok_or("missing trusted scalar-tail field length")?;
-                self.emit_simd_scalar_load(scalar, &base, index, Some((component, logical)))?
+                self.emit_simd_scalar_load(
+                    scalar,
+                    &base,
+                    index,
+                    Some((*record, component, logical)),
+                )?
             }
             SimdExpr::Builtin { name, args } => {
                 let args = args
@@ -1365,22 +1605,29 @@ impl<'a> Emit<'a> {
                     .map(|arg| self.emit_simd_scalar_expr(loop_index, scalar, arg, index))
                     .collect::<Result<Vec<_>, _>>()?;
                 let out = self.t();
+                let (scalar_type, suffix) = match scalar {
+                    SimdScalar::F32 => ("float", "f32"),
+                    SimdScalar::F64 => ("double", "f64"),
+                    SimdScalar::I64 => {
+                        return Err("integer scalar-tail builtin is unsupported".into())
+                    }
+                };
                 match name.as_str() {
                     "sqrt" => self.line(format!(
-                        "{} = call fast double @llvm.sqrt.f64(double {})",
-                        out, args[0]
+                        "{} = call fast {} @llvm.sqrt.{}({} {})",
+                        out, scalar_type, suffix, scalar_type, args[0]
                     )),
                     "abs" => self.line(format!(
-                        "{} = call fast double @llvm.fabs.f64(double {})",
-                        out, args[0]
+                        "{} = call fast {} @llvm.fabs.{}({} {})",
+                        out, scalar_type, suffix, scalar_type, args[0]
                     )),
                     "min" => self.line(format!(
-                        "{} = call fast double @llvm.minnum.f64(double {}, double {})",
-                        out, args[0], args[1]
+                        "{} = call fast {} @llvm.minnum.{}({} {}, {} {})",
+                        out, scalar_type, suffix, scalar_type, args[0], scalar_type, args[1]
                     )),
                     "max" => self.line(format!(
-                        "{} = call fast double @llvm.maxnum.f64(double {}, double {})",
-                        out, args[0], args[1]
+                        "{} = call fast {} @llvm.maxnum.{}({} {}, {} {})",
+                        out, scalar_type, suffix, scalar_type, args[0], scalar_type, args[1]
                     )),
                     _ => return Err("unsupported scalar-tail builtin".into()),
                 }
@@ -1394,32 +1641,50 @@ impl<'a> Emit<'a> {
         scalar: SimdScalar,
         base: &str,
         index: &str,
-        plane: Option<(usize, String)>,
+        plane: Option<(usize, usize, String)>,
     ) -> Result<String, String> {
         let data = self.t();
-        self.line(format!("{} = getelementptr i8, ptr {}, i64 8", data, base));
-        let at = if let Some((component, logical)) = plane {
-            let offset = self.t();
-            self.line(format!("{} = mul i64 {}, {}", offset, logical, component));
+        self.line(format!("{} = getelementptr i8, ptr {}, i64 16", data, base));
+        let width = match scalar {
+            SimdScalar::F32 => 4,
+            SimdScalar::F64 | SimdScalar::I64 => 8,
+        };
+        let lane = self.t();
+        self.line(format!("{} = mul i64 {}, {}", lane, index, width));
+        let at = if let Some((record, component, logical)) = plane {
+            let components = layout_components(self.p, &CType::Rec(record))?;
+            let mut plane = "0".to_string();
+            for prior in components.iter().take(component) {
+                let raw = self.t();
+                self.line(format!("{} = mul i64 {}, {}", raw, logical, prior.bytes()));
+                let padded = self.t();
+                self.line(format!("{} = add i64 {}, 7", padded, raw));
+                let span = self.t();
+                self.line(format!("{} = and i64 {}, -8", span, padded));
+                let next = self.t();
+                self.line(format!("{} = add i64 {}, {}", next, plane, span));
+                plane = next;
+            }
             let at = self.t();
-            self.line(format!("{} = add i64 {}, {}", at, offset, index));
+            self.line(format!("{} = add i64 {}, {}", at, plane, lane));
             at
         } else {
-            index.to_string()
+            lane
         };
         let address = self.t();
         let scalar_type = match scalar {
+            SimdScalar::F32 => "float",
             SimdScalar::F64 => "double",
             SimdScalar::I64 => "i64",
         };
         self.line(format!(
-            "{} = getelementptr {}, ptr {}, i64 {}",
-            address, scalar_type, data, at
+            "{} = getelementptr i8, ptr {}, i64 {}",
+            address, data, at
         ));
         let value = self.t();
         self.line(format!(
-            "{} = load {}, ptr {}, align 8",
-            value, scalar_type, address
+            "{} = load {}, ptr {}, align {}",
+            value, scalar_type, address, width
         ));
         Ok(value)
     }
@@ -1443,18 +1708,10 @@ impl<'a> Emit<'a> {
         let arrays = loop_info.arrays.clone();
         for array in arrays {
             let ty = function.locals[array as usize].ty.clone();
-            let CType::Arr(element) = ty else { continue };
+            let CType::Arr(_) = ty else { continue };
             let base = self.load_var(&Self::ir_local(array))?.regs[0].clone();
-            let stored = self.t();
-            self.line(format!("{} = load i64, ptr {}", stored, base));
-            let stride = lty(self.p, &element)?.len();
-            let logical = if stride == 1 {
-                stored
-            } else {
-                let logical = self.t();
-                self.line(format!("{} = sdiv i64 {}, {}", logical, stored, stride));
-                logical
-            };
+            let logical = self.t();
+            self.line(format!("{} = load i64, ptr {}", logical, base));
             let negative = self.t();
             self.line(format!("{} = icmp slt i64 {}, 0", negative, lower));
             let over = self.t();
@@ -1997,13 +2254,7 @@ impl<'a> Emit<'a> {
         };
         let components = lty(self.p, elem)?;
         let logical = items.len() as i64;
-        let base = self.t();
-        self.line(format!(
-            "{} = call ptr @lu_arr_new_raw(i64 {}, i64 {})",
-            base,
-            logical,
-            components.len()
-        ));
+        let base = self.alloc_array_raw(&logical.to_string(), elem)?;
         for (i, mut value) in items.into_iter().enumerate() {
             value = self.coerce_ev(value, elem)?;
             let addrs = self.elem_addrs(&base, &i.to_string(), elem, Some(logical.to_string()))?;
@@ -2099,22 +2350,14 @@ impl<'a> Emit<'a> {
         for ((_, want), value) in declaration.params.iter().zip(args) {
             let value = self.coerce_ev(value, want)?;
             match want {
-                CType::Arr(element) => {
+                CType::Arr(_) => {
                     let data = self.t();
                     self.line(format!(
-                        "{} = getelementptr i8, ptr {}, i64 8",
+                        "{} = getelementptr i8, ptr {}, i64 16",
                         data, value.regs[0]
                     ));
-                    let slots = self.t();
-                    self.line(format!("{} = load i64, ptr {}", slots, value.regs[0]));
-                    let stride = lty(self.p, element)?.len();
-                    let length = if stride == 1 {
-                        slots
-                    } else {
-                        let length = self.t();
-                        self.line(format!("{} = sdiv i64 {}, {}", length, slots, stride));
-                        length
-                    };
+                    let length = self.t();
+                    self.line(format!("{} = load i64, ptr {}", length, value.regs[0]));
                     parts.push(format!("ptr {}", data));
                     parts.push(format!("i64 {}", length));
                 }
@@ -2305,19 +2548,11 @@ impl<'a> Emit<'a> {
             | (CType::CMutSlice(want_element), CType::Arr(got_element))
                 if want_element == got_element =>
             {
-                let slots = self.t();
-                self.line(format!("{} = load i64, ptr {}", slots, value.regs[0]));
-                let stride = lty(self.p, want_element)?.len();
-                let length = if stride == 1 {
-                    slots
-                } else {
-                    let length = self.t();
-                    self.line(format!("{} = sdiv i64 {}, {}", length, slots, stride));
-                    length
-                };
+                let length = self.t();
+                self.line(format!("{} = load i64, ptr {}", length, value.regs[0]));
                 let data = self.t();
                 self.line(format!(
-                    "{} = getelementptr i8, ptr {}, i64 8",
+                    "{} = getelementptr i8, ptr {}, i64 16",
                     data, value.regs[0]
                 ));
                 return Ok(EV {
@@ -2345,19 +2580,12 @@ impl<'a> Emit<'a> {
         elem: &CType,
         trusted: Option<String>,
     ) -> Result<Vec<String>, String> {
-        let stride = lty(self.p, elem)?.len() as i64;
+        let components = layout_components(self.p, elem)?;
         let logical = match trusted {
             Some(n) => n,
             None => {
-                let lenr = self.t();
-                self.line(format!("{} = load i64, ptr {}", lenr, base));
-                let logical = if stride == 1 {
-                    lenr.clone()
-                } else {
-                    let d = self.t();
-                    self.line(format!("{} = sdiv i64 {}, {}", d, lenr, stride));
-                    d
-                };
+                let logical = self.t();
+                self.line(format!("{} = load i64, ptr {}", logical, base));
                 let bad = self.t();
                 self.line(format!("{} = icmp uge i64 {}, {}", bad, idx, logical));
                 let lb = self.l();
@@ -2371,38 +2599,86 @@ impl<'a> Emit<'a> {
             }
         };
         let mut out = Vec::new();
-        if stride > 1 && self.soa {
-            let lane = self.t();
-            self.line(format!("{} = mul i64 {}, 8", lane, idx));
-            let lane8 = self.t();
-            self.line(format!("{} = add i64 {}, 8", lane8, lane));
-            for c in 0..stride {
-                let plane = self.t();
-                self.line(format!("{} = mul i64 {}, {}", plane, logical, 8 * c));
-                let off = self.t();
-                self.line(format!("{} = add i64 {}, {}", off, lane8, plane));
+        let data = self.t();
+        self.line(format!("{} = getelementptr i8, ptr {}, i64 16", data, base));
+        if components.len() == 1 {
+            let offset = self.t();
+            self.line(format!(
+                "{} = mul i64 {}, {}",
+                offset,
+                idx,
+                components[0].bytes()
+            ));
+            let addr = self.t();
+            self.line(format!(
+                "{} = getelementptr i8, ptr {}, i64 {}",
+                addr, data, offset
+            ));
+            out.push(addr);
+        } else if self.soa {
+            let mut plane = "0".to_string();
+            for component in components {
+                let lane = self.t();
+                self.line(format!("{} = mul i64 {}, {}", lane, idx, component.bytes()));
+                let offset = self.t();
+                self.line(format!("{} = add i64 {}, {}", offset, plane, lane));
                 let addr = self.t();
                 self.line(format!(
                     "{} = getelementptr i8, ptr {}, i64 {}",
-                    addr, base, off
+                    addr, data, offset
                 ));
                 out.push(addr);
+
+                let raw = self.t();
+                self.line(format!(
+                    "{} = mul i64 {}, {}",
+                    raw,
+                    logical,
+                    component.bytes()
+                ));
+                let padded = self.t();
+                self.line(format!("{} = add i64 {}, 7", padded, raw));
+                let span = self.t();
+                self.line(format!("{} = and i64 {}, -8", span, padded));
+                let next = self.t();
+                self.line(format!("{} = add i64 {}, {}", next, plane, span));
+                plane = next;
             }
         } else {
             let off = self.t();
-            self.line(format!("{} = mul i64 {}, {}", off, idx, stride * 8));
-            for c in 0..stride {
+            self.line(format!(
+                "{} = mul i64 {}, {}",
+                off,
+                idx,
+                components.len() * 8
+            ));
+            for c in 0..components.len() {
                 let offc = self.t();
-                self.line(format!("{} = add i64 {}, {}", offc, off, 8 + 8 * c));
+                self.line(format!("{} = add i64 {}, {}", offc, off, 8 * c));
                 let addr = self.t();
                 self.line(format!(
                     "{} = getelementptr i8, ptr {}, i64 {}",
-                    addr, base, offc
+                    addr, data, offc
                 ));
                 out.push(addr);
             }
         }
         Ok(out)
+    }
+
+    fn alloc_array_raw(&mut self, logical: &str, elem: &CType) -> Result<String, String> {
+        let components = layout_components(self.p, elem)?;
+        let f32_components = components
+            .iter()
+            .filter(|component| **component == Component::F32)
+            .count();
+        let wide_components = components.len() - f32_components;
+        let base = self.t();
+        self.line(format!(
+            "{} = call ptr @lu_arr_new_raw(i64 {}, i64 {}, i64 {}, i64 {})",
+            base, logical, f32_components, wide_components, self.soa as i64
+        ));
+        Ok(base)
     }
 
     fn emit_checked_int_div(
@@ -2677,6 +2953,163 @@ impl<'a> Emit<'a> {
                     })
                 }
             }
+            "f32x4" | "f64x2" | "i64x2" => {
+                let (ty, lane_ty, vector_type, scalar_type) = match name {
+                    "f32x4" => (CType::F32x4, CType::F32, "<4 x float>", "float"),
+                    "f64x2" => (CType::F64x2, CType::F64, "<2 x double>", "double"),
+                    _ => (CType::I64x2, CType::I64, "<2 x i64>", "i64"),
+                };
+                let mut vector = "poison".to_string();
+                for (lane, arg) in args.into_iter().enumerate() {
+                    let arg = self.coerce_ev(arg, &lane_ty)?;
+                    let next = self.t();
+                    self.line(format!(
+                        "{} = insertelement {} {}, {} {}, i64 {}",
+                        next, vector_type, vector, scalar_type, arg.regs[0], lane
+                    ));
+                    vector = next;
+                }
+                Ok(EV {
+                    ty,
+                    regs: vec![vector],
+                })
+            }
+            "f32x4_splat" | "f64x2_splat" | "i64x2_splat" => {
+                let (ty, lane_ty, vector_type, scalar_type, lanes) = match name {
+                    "f32x4_splat" => (CType::F32x4, CType::F32, "<4 x float>", "float", 4),
+                    "f64x2_splat" => (CType::F64x2, CType::F64, "<2 x double>", "double", 2),
+                    _ => (CType::I64x2, CType::I64, "<2 x i64>", "i64", 2),
+                };
+                let arg = self.coerce_ev(args[0].clone(), &lane_ty)?;
+                let inserted = self.t();
+                self.line(format!(
+                    "{} = insertelement {} poison, {} {}, i64 0",
+                    inserted, vector_type, scalar_type, arg.regs[0]
+                ));
+                let vector = self.t();
+                self.line(format!(
+                    "{} = shufflevector {} {}, {} poison, <{} x i32> zeroinitializer",
+                    vector, vector_type, inserted, vector_type, lanes
+                ));
+                Ok(EV {
+                    ty,
+                    regs: vec![vector],
+                })
+            }
+            "f32x4_add" | "f32x4_sub" | "f32x4_mul" | "f32x4_div" | "f64x2_add" | "f64x2_sub"
+            | "f64x2_mul" | "f64x2_div" | "i64x2_add" | "i64x2_sub" | "i64x2_mul" => {
+                let integer = name.starts_with('i');
+                let op = match name.rsplit('_').next().unwrap() {
+                    "add" if integer => "add",
+                    "sub" if integer => "sub",
+                    "mul" if integer => "mul",
+                    "add" => "fadd fast",
+                    "sub" => "fsub fast",
+                    "mul" => "fmul fast",
+                    _ => "fdiv fast",
+                };
+                let vector_type = lty(self.p, &args[0].ty)?[0];
+                let out = self.t();
+                self.line(format!(
+                    "{} = {} {} {}, {}",
+                    out, op, vector_type, args[0].regs[0], args[1].regs[0]
+                ));
+                Ok(EV {
+                    ty: args[0].ty.clone(),
+                    regs: vec![out],
+                })
+            }
+            "i64x2_div" => {
+                let mut lanes = Vec::new();
+                for lane in 0..2 {
+                    let lhs = self.t();
+                    self.line(format!(
+                        "{} = extractelement <2 x i64> {}, i64 {}",
+                        lhs, args[0].regs[0], lane
+                    ));
+                    let rhs = self.t();
+                    self.line(format!(
+                        "{} = extractelement <2 x i64> {}, i64 {}",
+                        rhs, args[1].regs[0], lane
+                    ));
+                    lanes.push(self.emit_checked_int_div(&lhs, &rhs, false)?.regs[0].clone());
+                }
+                let first = self.t();
+                self.line(format!(
+                    "{} = insertelement <2 x i64> poison, i64 {}, i64 0",
+                    first, lanes[0]
+                ));
+                let vector = self.t();
+                self.line(format!(
+                    "{} = insertelement <2 x i64> {}, i64 {}, i64 1",
+                    vector, first, lanes[1]
+                ));
+                Ok(EV {
+                    ty: CType::I64x2,
+                    regs: vec![vector],
+                })
+            }
+            "f32x4_sum" | "f64x2_sum" | "i64x2_sum" => {
+                let (lanes, vector_type, scalar_type, ty, op) = match name {
+                    "f32x4_sum" => (4, "<4 x float>", "float", CType::F32, "fadd fast"),
+                    "f64x2_sum" => (2, "<2 x double>", "double", CType::F64, "fadd fast"),
+                    _ => (2, "<2 x i64>", "i64", CType::I64, "add"),
+                };
+                let mut total = self.t();
+                self.line(format!(
+                    "{} = extractelement {} {}, i64 0",
+                    total, vector_type, args[0].regs[0]
+                ));
+                for lane in 1..lanes {
+                    let value = self.t();
+                    self.line(format!(
+                        "{} = extractelement {} {}, i64 {}",
+                        value, vector_type, args[0].regs[0], lane
+                    ));
+                    let next = self.t();
+                    self.line(format!(
+                        "{} = {} {} {}, {}",
+                        next, op, scalar_type, total, value
+                    ));
+                    total = next;
+                }
+                Ok(EV {
+                    ty,
+                    regs: vec![total],
+                })
+            }
+            "f32x4_extract" | "f64x2_extract" | "i64x2_extract" => {
+                let (lanes, vector_type, scalar_type, ty) = match name {
+                    "f32x4_extract" => (4, "<4 x float>", "float", CType::F32),
+                    "f64x2_extract" => (2, "<2 x double>", "double", CType::F64),
+                    _ => (2, "<2 x i64>", "i64", CType::I64),
+                };
+                let bad = self.t();
+                self.line(format!(
+                    "{} = icmp uge i64 {}, {}",
+                    bad, args[1].regs[0], lanes
+                ));
+                let fail = self.l();
+                let ok = self.l();
+                self.line(format!("br i1 {}, label %{}, label %{}", bad, fail, ok));
+                self.label(&fail);
+                self.line(format!(
+                    "call void @lu_oob(i64 {}, i64 {})",
+                    args[1].regs[0], lanes
+                ));
+                self.line("unreachable".into());
+                self.label(&ok);
+                let out = self.t();
+                self.line(format!(
+                    "{} = extractelement {} {}, i64 {}",
+                    out, vector_type, args[0].regs[0], args[1].regs[0]
+                ));
+                let _ = scalar_type;
+                Ok(EV {
+                    ty,
+                    regs: vec![out],
+                })
+            }
             "len" if args[0].ty == CType::Str => Ok(EV {
                 ty: CType::I64,
                 regs: vec![args[0].regs[1].clone()],
@@ -2711,8 +3144,8 @@ impl<'a> Emit<'a> {
                 })
             }
             "len" => {
-                let elem = match &args[0].ty {
-                    CType::Arr(e) => e.as_ref().clone(),
+                match &args[0].ty {
+                    CType::Arr(_) => {}
                     CType::CSlice(_) | CType::CMutSlice(_) => {
                         return Ok(EV {
                             ty: CType::I64,
@@ -2720,23 +3153,13 @@ impl<'a> Emit<'a> {
                         });
                     }
                     _ => return Err("`len` expects array".into()),
-                };
-                let stride = lty(self.p, &elem)?.len() as i64;
+                }
                 let n = self.t();
                 self.line(format!("{} = load i64, ptr {}", n, args[0].regs[0]));
-                if stride == 1 {
-                    Ok(EV {
-                        ty: CType::I64,
-                        regs: vec![n],
-                    })
-                } else {
-                    let d = self.t();
-                    self.line(format!("{} = sdiv i64 {}, {}", d, n, stride));
-                    Ok(EV {
-                        ty: CType::I64,
-                        regs: vec![d],
-                    })
-                }
+                Ok(EV {
+                    ty: CType::I64,
+                    regs: vec![n],
+                })
             }
             "arr" => {
                 let n = &args[0].regs[0];
@@ -2776,12 +3199,7 @@ impl<'a> Emit<'a> {
                     }
                     t @ (CType::F32 | CType::Rec(_) | CType::Str) => {
                         let elem = t.clone();
-                        let stride = lty(self.p, &elem)?.len() as i64;
-                        let base = self.t();
-                        self.line(format!(
-                            "{} = call ptr @lu_arr_new_raw(i64 {}, i64 {})",
-                            base, n, stride
-                        ));
+                        let base = self.alloc_array_raw(n, &elem)?;
                         // fill loop over logical elements, SoA planes by default
                         let iptr = self.t();
                         self.line(format!("{} = alloca i64", iptr));
