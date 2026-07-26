@@ -1,9 +1,19 @@
 # M8 Implementation Plan: C ABI / FFI (import + export)
 
+> **Superseded.** M8 shipped. This document is kept as the historical plan and
+> is no longer maintained against the tree: it describes intended edit sites
+> and a type mapping as they were forecast before implementation, and the
+> shipped boundary has since grown beyond it (direct `f32`, borrowed
+> `c_slice`/`c_mut_slice`, portable by-value `@c_layout` records, typed
+> `c_fn` callbacks, length-delimited `str` returns, owning array results).
+> For what actually exists and how it is verified, read
+> [ROADMAP-AUDIT.md](ROADMAP-AUDIT.md); for the user-facing surface, read the
+> C ABI section of [README.md](README.md).
+
 Execution plan for the first [ROADMAP.md](ROADMAP.md) milestone. Written for
-an implementing agent; all file paths are real edit sites verified against the
-current tree (Cargo workspace where `crates/*` are `#[path]` shims into
-`src/`, so `src/*.rs` remain the sources of truth).
+an implementing agent; all file paths were real edit sites verified against
+the tree as of 2026-07-23 (Cargo workspace where `crates/*` are `#[path]`
+shims into `src/`, so `src/*.rs` remain the sources of truth).
 
 ## Pre-flight (blocking)
 

@@ -252,7 +252,7 @@ source with machine provenance and the semantic assumptions behind the number.
 | [SPEC.md](SPEC.md) | The frozen lulang v0.1 specification |
 | [experiments/RESULTS.md](experiments/RESULTS.md) | Measurements validating the semantics thesis |
 | [ROADMAP.md](ROADMAP.md) | Ecosystem plan |
-| [M8-PLAN.md](M8-PLAN.md) | C ABI milestone plan |
+| [M8-PLAN.md](M8-PLAN.md) | C ABI milestone plan; superseded, kept as history |
 | [KNOWN-ISSUES.md](KNOWN-ISSUES.md) | Fixed regressions, with repros |
 | [ROADMAP-AUDIT.md](ROADMAP-AUDIT.md) | Requirement-by-requirement verification evidence |
 
