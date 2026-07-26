@@ -3,8 +3,8 @@
 State of the compiler regressions and design constraints found while
 pre-flighting M8 and the shared SIMD middle-end. Fixed entries retain their
 repros so a reintroduction is recognizable. Nothing is currently open: the last
-constraint (issue 6, uniform 8-byte array slots blocking f32 vectors) closed
-with the packed-layout migration.
+entry (issue 7, quadratic interpreter array stores) closed with the SSA
+liveness pass in `src/interp.rs`.
 
 ## 1. FIXED — JIT assumed topological block order after IR inlining
 
@@ -166,6 +166,58 @@ selfhost emit packed `f32x4` loads byte-for-byte. WASM coverage sums a packed
 Note for anyone touching `src/lu_runtime.c`: `selfhost/build.sh` caches the
 compiled runtime object at `$TMPDIR/lu_selfhost_runtime.o` and does not notice
 that the source changed. Delete it before bootstrapping after a runtime edit.
+
+## 7. FIXED — interpreter deep-copied the array on every element store
+
+**Symptom:** the reference interpreter was quadratic in array length. Element
+assignment loops that the other three tiers finish in milliseconds ran for
+minutes, and the full benchmark inputs were not interpretable at all.
+
+**Repro** (each row is 2× the elements of the row above; time grows 4×):
+
+```sh
+target/release/lu interp corpus/dot.lu   # n = 100k: 105.3 s (JIT: 12 ms)
+```
+
+| n | before | after |
+|---|---|---|
+| 12 500 | 1.40 s | 0.01 s |
+| 25 000 | 5.97 s | 0.01 s |
+| 50 000 | 23.72 s | 0.02 s |
+| 100 000 (`corpus/dot.lu`) | 105.3 s | 0.04 s |
+
+**Cause:** `a[i] = x` lowers to a `Load` of the array followed by `SetIndex`
+(the compiled backends need the loaded pointer; the interpreter updates through
+`root` and never reads `base`). The `Load` result stayed in the SSA value table
+for the rest of the function, as did the `arr()` result already stored to the
+local, so `Rc::make_mut` in `set_index` always saw a shared `Rc` —
+`strong_count` measured 3 on the first store and 2 on every store after — and
+copied the entire `Vec<Value>` per element written. The value table had no
+notion of liveness: nothing was ever released.
+
+**Fix (landed, in `src/interp.rs`):** a per-function `Liveness` analysis
+(upward-exposed uses, backward dataflow to a fixpoint over the CFG) records
+which values take their last read at each instruction; `execute` releases those
+slots, and the arms that mutate — `Store`, `SetIndex`, `SetField`, and calls —
+release *before* the update so the owning local is the sole reference and the
+write happens in place. Restricting `gen` to upward-exposed uses is what lets a
+value defined and consumed inside a loop body die there rather than being held
+live around the back edge. Liveness is computed once per function in
+`Interp::new`, so recursive calls (self-hosted interpreter towers) pay only a
+lookup.
+
+The guard is `tests/interp_perf.rs`, which interprets 8 000 and 32 000 stores
+and fails if 4× the work costs more than 8× the time (the regression measures
+15.7×). Verified: `cargo test --release` (all 19 suites, 88 tests),
+`tools/verify_corpus.py` four-tier agreement, and a cross-tier value-semantics
+check (copy-on-assign, callee copies, record-held arrays, aliasing after a
+write loop) where interpreter, JIT, and AOT print identical results.
+
+Now that interpretation is linear, the full benchmark inputs run through the
+reference tier in seconds (`bench_dot` 6.9 s, `bench_qnorm` 18.6 s,
+`bench_slerp` 8.1 s, `alcubierre` 5.2 s). `tools/verify_corpus.py` still
+interprets mechanically scaled inputs to keep the correctness gate quick; that
+scaling is now a speed choice rather than a necessity.
 
 ## Incident note: lost uncommitted jit.rs delta
 

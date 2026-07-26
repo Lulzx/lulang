@@ -20,6 +20,10 @@ name = "frontend_perf"
 path = "../../tests/frontend_perf.rs"
 
 [[test]]
+name = "interp_perf"
+path = "../../tests/interp_perf.rs"
+
+[[test]]
 name = "ffi_export"
 path = "../../tests/ffi_export.rs"
 

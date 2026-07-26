@@ -556,7 +556,9 @@ mod tests {
     }
 }
 
-fn operands(k: &InstKind) -> Vec<ValueId> {
+/// Every value an instruction reads. Used by IR validation and by the
+/// interpreter's liveness analysis.
+pub fn operands(k: &InstKind) -> Vec<ValueId> {
     match k {
         InstKind::Store { value, .. }
         | InstKind::Unary { value, .. }

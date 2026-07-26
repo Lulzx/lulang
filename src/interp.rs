@@ -1,4 +1,5 @@
 use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::rc::Rc;
 
@@ -24,6 +25,9 @@ pub enum Value {
 
 pub struct Interp<'a> {
     ir: &'a LoweredProgram,
+    /// Liveness per function, keyed by the address of the `ir::Function` that
+    /// `execute` is handed. Computed once so recursive calls only pay a lookup.
+    liveness: HashMap<usize, Rc<Liveness>>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,9 +107,140 @@ fn approx_eq(a: f64, b: f64) -> bool {
     (a - b).abs() <= ATOL + RTOL * a.abs().max(b.abs())
 }
 
+/// Per-instruction last-use sets, so `execute` can release SSA slots the moment
+/// they die.
+///
+/// This is what keeps element assignment O(1). `a[i] = x` lowers to a `Load` of
+/// the array followed by `SetIndex`; the `Load` result is an extra `Rc` alias in
+/// the value table, so `Rc::make_mut` in `set_index` would see a shared array and
+/// deep-copy all of it on *every* store — quadratic in the array length. Dropping
+/// the alias before the update leaves the owning local as the sole reference and
+/// the write happens in place.
+struct Liveness {
+    /// `dying[block][instruction]`: values whose last read is that instruction.
+    dying: Vec<Vec<Vec<ir::ValueId>>>,
+}
+
+impl Liveness {
+    fn analyze(function: &ir::Function) -> Liveness {
+        let blocks = &function.blocks;
+        let count = function.values.len();
+
+        // Upward-exposed uses (read before any definition in the block) and the
+        // values each block defines. Restricting `gen` to upward-exposed uses is
+        // what lets a value defined and consumed inside a loop body die there
+        // instead of being kept live around the back edge.
+        let mut gen = vec![vec![false; count]; blocks.len()];
+        let mut defs = vec![vec![false; count]; blocks.len()];
+        for (b, block) in blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                for value in ir::operands(&inst.kind) {
+                    if !defs[b][value as usize] {
+                        gen[b][value as usize] = true;
+                    }
+                }
+                if let Some(result) = inst.result {
+                    defs[b][result as usize] = true;
+                }
+            }
+            for value in terminator_operands(&block.terminator) {
+                if !defs[b][value as usize] {
+                    gen[b][value as usize] = true;
+                }
+            }
+        }
+
+        // Backward dataflow to a fixpoint:
+        //   live_out[b] = ∪ live_in[successors]
+        //   live_in[b]  = gen[b] ∪ (live_out[b] \ defs[b])
+        let mut live_in = vec![vec![false; count]; blocks.len()];
+        let mut live_out = vec![vec![false; count]; blocks.len()];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in (0..blocks.len()).rev() {
+                let mut out = vec![false; count];
+                for successor in successors(&blocks[b].terminator) {
+                    for v in 0..count {
+                        out[v] |= live_in[successor as usize][v];
+                    }
+                }
+                let mut inn = vec![false; count];
+                for v in 0..count {
+                    inn[v] = gen[b][v] || (out[v] && !defs[b][v]);
+                }
+                if out != live_out[b] || inn != live_in[b] {
+                    live_out[b] = out;
+                    live_in[b] = inn;
+                    changed = true;
+                }
+            }
+        }
+
+        // A value dies at its last read inside the block, unless it escapes the
+        // block (live-out) or is read by the terminator.
+        let mut dying = Vec::with_capacity(blocks.len());
+        for (b, block) in blocks.iter().enumerate() {
+            let mut per_inst = vec![Vec::new(); block.instructions.len()];
+            let mut later_use = vec![false; count];
+            for value in terminator_operands(&block.terminator) {
+                later_use[value as usize] = true;
+            }
+            for (i, inst) in block.instructions.iter().enumerate().rev() {
+                for value in ir::operands(&inst.kind) {
+                    let slot = value as usize;
+                    if !later_use[slot] && !live_out[b][slot] {
+                        per_inst[i].push(value);
+                    }
+                    later_use[slot] = true;
+                }
+            }
+            dying.push(per_inst);
+        }
+        Liveness { dying }
+    }
+
+    fn dying(&self, block: usize, instruction: usize) -> &[ir::ValueId] {
+        &self.dying[block][instruction]
+    }
+}
+
+fn successors(terminator: &Terminator) -> Vec<ir::BlockId> {
+    match terminator {
+        Terminator::Jump(target) => vec![*target],
+        Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+        Terminator::Return(_) | Terminator::Unreachable => Vec::new(),
+    }
+}
+
+fn terminator_operands(terminator: &Terminator) -> Vec<ir::ValueId> {
+    match terminator {
+        Terminator::Branch { condition, .. } => vec![*condition],
+        Terminator::Return(value) => vec![*value],
+        Terminator::Jump(_) | Terminator::Unreachable => Vec::new(),
+    }
+}
+
+fn release(values: &mut [Value], dying: &[ir::ValueId]) {
+    for &value in dying {
+        values[value as usize] = Value::Unit;
+    }
+}
+
 impl<'a> Interp<'a> {
     pub fn new(ir: &'a LoweredProgram) -> Self {
-        Interp { ir }
+        let mut liveness = HashMap::new();
+        for function in ir.functions.iter().chain(ir.main.iter()) {
+            liveness.insert(
+                function as *const ir::Function as usize,
+                Rc::new(Liveness::analyze(function)),
+            );
+        }
+        Interp { ir, liveness }
     }
 
     pub fn run_main(&self) -> Result<(), String> {
@@ -388,10 +523,16 @@ impl<'a> Interp<'a> {
             locals[local as usize] = coerce(value, &function.locals[local as usize].ty)?;
         }
         let mut values = vec![Value::Unit; function.values.len()];
+        let liveness = self
+            .liveness
+            .get(&(function as *const ir::Function as usize))
+            .cloned()
+            .unwrap_or_else(|| Rc::new(Liveness::analyze(function)));
         let mut block_id = function.entry;
         loop {
             let block = &function.blocks[block_id as usize];
-            for inst in &block.instructions {
+            for (inst_id, inst) in block.instructions.iter().enumerate() {
+                let dying = liveness.dying(block_id as usize, inst_id);
                 let result = match &inst.kind {
                     InstKind::Constant(c) => Some(match c {
                         Constant::I64(v) => Value::Int(*v),
@@ -403,10 +544,12 @@ impl<'a> Interp<'a> {
                     }),
                     InstKind::Load(local) => Some(locals[*local as usize].clone()),
                     InstKind::Store { local, value, .. } => {
-                        locals[*local as usize] = coerce(
-                            values[*value as usize].clone(),
-                            &function.locals[*local as usize].ty,
-                        )?;
+                        // Release before the write: if this store is the stored
+                        // value's last use, the local becomes its sole owner.
+                        let stored = values[*value as usize].clone();
+                        release(&mut values, dying);
+                        locals[*local as usize] =
+                            coerce(stored, &function.locals[*local as usize].ty)?;
                         None
                     }
                     InstKind::Unary { op, value } => {
@@ -437,6 +580,9 @@ impl<'a> Interp<'a> {
                             .iter()
                             .map(|v| values[*v as usize].clone())
                             .collect::<Vec<_>>();
+                        // Drop dying arguments before the call so a callee that
+                        // mutates a temporary array owns it outright.
+                        release(&mut values, dying);
                         let result = match callee {
                             Callee::Function(id) => {
                                 let callee = &self.ir.functions[*id as usize];
@@ -507,23 +653,22 @@ impl<'a> Interp<'a> {
                         ..
                     } => {
                         let index = as_i64(&values[*index as usize])?;
-                        set_index(
-                            &mut locals[*root as usize],
-                            path,
-                            index as usize,
-                            values[*value as usize].clone(),
-                        )?;
+                        let element = values[*value as usize].clone();
+                        // The `base` operand is only an alias of the array the
+                        // root local already owns; dropping it here is what lets
+                        // `set_index` write in place instead of copying.
+                        release(&mut values, dying);
+                        set_index(&mut locals[*root as usize], path, index as usize, element)?;
                         None
                     }
                     InstKind::SetField { root, path, value } => {
-                        set_field(
-                            &mut locals[*root as usize],
-                            path,
-                            values[*value as usize].clone(),
-                        )?;
+                        let field = values[*value as usize].clone();
+                        release(&mut values, dying);
+                        set_field(&mut locals[*root as usize], path, field)?;
                         None
                     }
                 };
+                release(&mut values, dying);
                 if let (Some(id), Some(result)) = (inst.result, result) {
                     values[id as usize] = coerce(result, &inst.ty)?;
                 }
