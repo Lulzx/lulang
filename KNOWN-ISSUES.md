@@ -2,9 +2,9 @@
 
 State of the compiler regressions and design constraints found while
 pre-flighting M8 and the shared SIMD middle-end. Fixed entries retain their
-repros so a reintroduction is recognizable. Nothing is currently open: the last
-entry (issue 7, quadratic interpreter array stores) closed with the SSA
-liveness pass in `src/interp.rs`.
+repros so a reintroduction is recognizable. One entry is open: issue 8,
+nondeterministic LLVM emission, which predates the Cranelift AOT tier and costs
+byte-reproducible `lu build` output without affecting program behavior.
 
 ## 1. FIXED — JIT assumed topological block order after IR inlining
 
@@ -218,6 +218,46 @@ reference tier in seconds (`bench_dot` 6.9 s, `bench_qnorm` 18.6 s,
 `bench_slerp` 8.1 s, `alcubierre` 5.2 s). `tools/verify_corpus.py` still
 interprets mechanically scaled inputs to keep the correctness gate quick; that
 scaling is now a speed choice rather than a necessity.
+
+## 8. OPEN — the Rust LLVM emitter is not deterministic
+
+**Symptom:** the same source, the same binary, the same environment, three
+different outputs:
+
+```sh
+for i in 1 2 3; do
+  target/release/lu build --emit-llvm -o /tmp/d$i.ll selfhost/codegen.lu
+done
+md5 /tmp/d1.ll /tmp/d2.ll /tmp/d3.ll   # three different hashes
+```
+
+The diff is small (~124 lines on a 9.6 MB module) and semantically empty —
+two temporaries swap numbers and their uses follow:
+
+```
+28503c28503
+<   %t4892 = load ptr, ptr %t65
+---
+>   %t4892 = load ptr, ptr %t64
+```
+
+**Cause:** not yet located. The shape (adjacent temporaries permuting) points
+at iteration over an unordered collection during emission — `src/llvm.rs`
+carries several `HashMap`/`HashSet`s, as does the shared `analyze_cfg`.
+
+**Scope:** found while confirming that `LU_INLINE` cannot reach the LLVM tier.
+Reproduced unchanged at commit `43ae1a2`, so it predates the Cranelift AOT
+work. Program behavior is unaffected — `tools/verify_corpus.py` agrees across
+all four tiers on every run — and the self-hosted bootstrap fixpoint is
+unaffected because it compares output from `selfhost/codegen.lu`, which is
+deterministic (the same file emitted through the JIT at inline budgets 256 and
+3000 is byte-identical). What it costs is byte-reproducible host `lu build`
+output, which the project otherwise takes seriously enough to gate the
+bootstrap on.
+
+**Suggested fix:** switch the emission-order-visible maps to `BTreeMap`/
+`IndexMap`, or seed a deterministic hasher, then add a regression that emits
+the same module twice and compares bytes.
 
 ## Incident note: lost uncommitted jit.rs delta
 

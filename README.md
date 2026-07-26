@@ -92,9 +92,9 @@ in-memory JIT behind `lu run`, and object emission behind `lu build --fast`.
 They differ only in how a program's edges are resolved — the JIT bakes host
 addresses for string literals and resolves externs in process, while object
 output emits data symbols and leaves externs to the linker. `--fast` skips
-LLVM entirely and builds the self-hosted compiler about 3× faster
-(1.72 s → 0.57 s), at the cost of Cranelift's code quality rather than
-`clang -O3`'s: the benchmark kernels run 1.15–3.0× slower than a `lu build`
+LLVM entirely and builds the self-hosted compiler 5.8× faster
+(1.73 s → 0.30 s), at the cost of Cranelift's code quality rather than
+`clang -O3`'s: the benchmark kernels run 1.06–2.8× slower than a `lu build`
 binary. It is the dev-loop build; the measured numbers below come from
 `lu build`.
 
@@ -106,7 +106,15 @@ through floating point. wasm builds enable SIMD128. Also present: branch-free
 inline sin/cos/acos kernels (musl polynomials emitted as Cranelift IR),
 if-conversion of speculation-safe `if`s, LICM including pure math libcalls,
 and SoA field planes for record arrays. Each is ablatable — `LU_MATH=call`,
-`LU_IFCONV=off`, `LU_LICM=off`, `LU_SIMD=off`, `LU_LAYOUT=aos`.
+`LU_IFCONV=off`, `LU_LICM=off`, `LU_SIMD=off`, `LU_LAYOUT=aos`, `LU_INLINE=n`.
+
+The Cranelift tiers inline before code generation, bounded by a per-function
+budget of 256 IR instructions. Measurement set that number: inlining pays for
+the user-operator chain in `bench_slerp` (21% if disabled outright) and is
+fully paid off by ~128 instructions, while every instruction past that is
+compile time the JIT re-pays on every run. The LLVM tier does not use this
+inliner at all; it emits one LLVM function per lulang function and lets
+`clang -O3` decide.
 
 Arrays are values in every tier. Persistent stores retain independent values;
 immutable parameters borrow and `inout` parameters are exclusive. The runtime
@@ -130,8 +138,9 @@ record arrays, hoisted bounds checks, and C runtime ABI.
 `selfhost/build.sh --bootstrap` compiles codegen.lu with the interpreter, uses
 the result to compile codegen.lu again, and repeats. Stage-2 and stage-3 IR
 must be byte-identical; stage 1 is checked against them too. Self-compilation
-takes 6.5 s interpreted and 60 ms compiled. The verified stage-2 binary is
-installed as `target/release/luc`.
+takes 1.6 s through the JIT and 0.21 s compiled (best-of-5; the JIT figure was
+3.5 s before the inline budget was measured down to 256). The verified stage-2
+binary is installed as `target/release/luc`.
 
 A fixpoint only proves self-consistency, so it is not the correctness
 argument. The independently written Rust tiers are the oracle: every corpus

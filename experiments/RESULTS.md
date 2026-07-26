@@ -391,3 +391,82 @@ outside the backend" is that *our frontend is already there* — 10 ms against
 clang's 260 ms of header parsing — and that the remaining time is backend time,
 which you pay in any compiler that optimizes. A tier that skips optimization
 buys latency by giving up the thing the other tier is for.
+
+---
+
+# Experiment 5 — what the inliner is actually worth
+
+*2026-07-26, Apple M4 Pro. Runtime numbers are hyperfine means over 20 runs with
+all budgets **interleaved in one invocation** — this machine's P-core/E-core
+scheduling drifts enough between separate invocations to invent 10% effects.
+Build latency is best-of-5. `LU_INLINE=n` caps the per-function inline budget in
+IR instructions; the default was 3000.*
+
+The Cranelift tiers inline before code generation; the LLVM tier does not (it
+emits one LLVM function per lulang function and lets `clang -O3` decide), so
+this knob moves `lu run` and `lu build --fast` only. Every inlined instruction
+is one Cranelift compiles, which makes the budget a direct trade of compile
+time against runtime.
+
+## Runtime: inlining pays for one kernel, and cheaply
+
+| Budget | bench_slerp | bench_qnorm | bench_dot |
+|---|---|---|---|
+| 0 | 37.3 ms (**1.21×**) | 30.4 ms (0.97×) | 25.1 ms (1.02×) |
+| 128 | 31.5 ms (1.02×) | 31.3 ms (1.00×) | 24.4 ms (1.00×) |
+| 256 | 30.5 ms (0.99×) | 30.9 ms (0.99×) | 25.0 ms (1.02×) |
+| 1000 | 31.1 ms (1.01×) | 31.3 ms (1.00×) | 25.1 ms (1.03×) |
+| 3000 | 30.8 ms (1.00×) | 31.3 ms (1.00×) | 24.5 ms (1.00×) |
+
+Only `bench_slerp` — the user-operator chain (`·`, `‖·‖`, `scale`) that
+motivated codegen inlining in M2 — cares at all, and its entire 21% is
+recovered by 128 instructions. `qnorm` and `dot` are flat everywhere: their
+loop bodies are already whole after `sum` vectorization. Nothing in the corpus
+distinguishes 256 from 3000.
+
+## Compile time: the budget is most of the large-program cost
+
+| Program | LU_INLINE=0 | 128 | 256 | 1000 | 3000 |
+|---|---|---|---|---|---|
+| `lu build --fast selfhost/codegen.lu` | 0.26 s | 0.28 s | 0.30 s | 0.39 s | 0.57 s |
+| `lu build --fast selfhost/interp.lu` | 0.16 s | 0.17 s | 0.18 s | 0.24 s | 0.35 s |
+| `lu run selfhost/interp.lu` (whole process) | 142 ms | 151 ms | **164 ms** | 244 ms | **351 ms** |
+
+Small kernels are unaffected (30 ms at every budget) — there is nothing to
+inline past a few sites. Large programs pay linearly, and the JIT pays it on
+every single run.
+
+## The change
+
+Default budget 3000 → **256**. On this corpus that is free: every kernel is
+within noise of the old default, while `lu build --fast` on the self-hosted
+compiler drops 0.57 s → 0.30 s (1.9×) and `lu run` on it drops 351 ms → 164 ms
+(2.1×). `LU_INLINE` remains as the ablation knob, joining `LU_MATH`,
+`LU_IFCONV`, `LU_LICM`, `LU_SIMD`, and `LU_LAYOUT`.
+
+Updated tier comparison at the new default:
+
+| Program | `lu build` (LLVM) | `lu build --fast` | ratio |
+|---|---|---|---|
+| `corpus/dot.lu` | 0.06 s | 0.03 s | 2.0× |
+| `selfhost/interp.lu` | 1.15 s | 0.19 s | 6.1× |
+| `selfhost/codegen.lu` | 1.73 s | 0.30 s | **5.8×** |
+
+| Kernel | `lu build` | `lu build --fast` | LLVM's edge |
+|---|---|---|---|
+| bench_dot | 13.7 ms | 25.7 ms | 1.88× |
+| bench_qnorm | 28.7 ms | 30.4 ms | 1.06× |
+| bench_slerp | 11.2 ms | 31.7 ms | 2.82× |
+
+## Note: the LLVM emitter is not deterministic
+
+While confirming that `LU_INLINE` cannot reach the LLVM tier, `lu build
+--emit-llvm selfhost/codegen.lu` turned out to produce a different `.ll` on
+every run — three runs, three hashes, differing only in temporary numbering
+(`%t64`/`%t65` swapped and the uses that follow). Reproduced unchanged at
+commit `43ae1a2`, so it predates the Cranelift AOT work; the cause is
+presumably an unordered collection in emission. It does not affect program
+behavior, and the self-hosted bootstrap fixpoint is unaffected because that
+compares output from `selfhost/codegen.lu`, not the Rust emitter. It does mean
+host `lu build` output is not byte-reproducible. Filed as issue 8 in
+KNOWN-ISSUES.md.

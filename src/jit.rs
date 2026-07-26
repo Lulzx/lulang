@@ -24,6 +24,16 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use std::collections::HashMap;
 
+/// Default per-function inline budget, in IR instructions.
+///
+/// Measured on the corpus (experiment 5 in `experiments/RESULTS.md`): inlining
+/// pays for exactly one thing, the operator-chain tax in `bench_slerp`, and it
+/// is paid off by ~128 instructions. Past that, more inlining costs compile
+/// time and buys nothing — the previous 3000 made `lu run selfhost/interp.lu`
+/// 2.1× slower for runtime performance within noise of this budget.
+/// `LU_INLINE` overrides it.
+const INLINE_BUDGET: usize = 256;
+
 const RTOL: f64 = 9.094947017729282e-13; // 2^-40
 const ATOL: f64 = 7.888609052210118e-31; // 2^-100
 
@@ -71,6 +81,7 @@ pub struct Jit<'a, M: Module> {
     ifconv: bool,
     do_licm: bool,
     inline_math: bool,
+    inline_budget: usize,
     fns: HashMap<String, FnInfo>,
     externs: Vec<FnInfo>,
     imports: HashMap<&'static str, FuncId>,
@@ -86,6 +97,10 @@ struct Passes {
     ifconv: bool,
     do_licm: bool,
     inline_math: bool,
+    /// Instructions the inliner may paste into one function before it stops.
+    /// Every inlined instruction is one Cranelift compiles and one clang never
+    /// sees, so this trades build latency against runtime directly.
+    inline_budget: usize,
 }
 
 impl Passes {
@@ -106,6 +121,10 @@ impl Passes {
             inline_math: std::env::var("LU_MATH")
                 .map(|value| value != "call")
                 .unwrap_or(true),
+            inline_budget: std::env::var("LU_INLINE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(INLINE_BUDGET),
         }
     }
 }
@@ -339,6 +358,7 @@ impl<'a, M: Module> Jit<'a, M> {
             ifconv: passes.ifconv,
             do_licm: passes.do_licm,
             inline_math: passes.inline_math,
+            inline_budget: passes.inline_budget,
             fns: HashMap::new(),
             externs: Vec::new(),
             imports: HashMap::new(),
@@ -355,7 +375,8 @@ impl<'a, M: Module> Jit<'a, M> {
         self.declare_fns()?;
         let p = self.p;
         for (index, f) in p.fns.iter().enumerate() {
-            let mut function = inline_calls(&ir.functions[index], &ir.functions, 3000);
+            let mut function =
+                inline_calls(&ir.functions[index], &ir.functions, self.inline_budget);
             if self.ifconv {
                 if_convert(&mut function);
             }
@@ -364,7 +385,7 @@ impl<'a, M: Module> Jit<'a, M> {
         let mut main = inline_calls(
             ir.main.as_ref().ok_or("no `main` block in program")?,
             &ir.functions,
-            3000,
+            self.inline_budget,
         );
         if self.ifconv {
             if_convert(&mut main);
