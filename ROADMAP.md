@@ -44,6 +44,13 @@ than exposing internals.
 | 10 | Flagship demo (`luphysics`) — **shipped** | High visibility | Medium |
 | 11 | `lu doc` + benchmark observatory — **shipped** | High credibility | Medium |
 | 12 | Autodiff (`ludiff`, forward-mode duals first) — **shipped** | High technical value | High |
+| 13 | Packed array layout + `f32x4` SIMD — **complete** | Internal; unblocks the numerics claim | Medium |
+
+Item 13 is not an ecosystem item — it is compiler-internal and invisible at
+the boundary. It is tracked here because it was the last entry blocking a
+claim the ecosystem rests on: that a numerics language can vectorize `f32`
+work. Evidence is in [ROADMAP-AUDIT.md](ROADMAP-AUDIT.md) and issue 6 of
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ### Post-C-ABI ecosystem program
 
