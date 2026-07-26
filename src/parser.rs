@@ -81,10 +81,19 @@ impl Parser {
         for s in ["==", "!=", "<", "<=", ">", ">=", "~=", "\u{2248}"] {
             prec.insert(s.to_string(), 3);
         }
-        prec.insert("+".into(), 5);
-        prec.insert("-".into(), 5);
+        // Bitwise binds tighter than comparison and looser than arithmetic,
+        // as in Rust: | < ^ < & < shifts < +- < */%. User-defined operators
+        // anchor by copying one of these values, so the relative order is what
+        // matters, not the absolute numbers.
+        prec.insert("|".into(), 4);
+        prec.insert("^".into(), 5);
+        prec.insert("&".into(), 6);
+        prec.insert("<<".into(), 7);
+        prec.insert(">>".into(), 7);
+        prec.insert("+".into(), 8);
+        prec.insert("-".into(), 8);
         for s in ["*", "/", "%"] {
-            prec.insert(s.to_string(), 6);
+            prec.insert(s.to_string(), 9);
         }
         Parser {
             toks,

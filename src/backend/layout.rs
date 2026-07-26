@@ -4,6 +4,7 @@ use crate::check::{resolve_type, Type};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Component {
     I64,
+    I8,
     F32,
     F64,
     Ptr,
@@ -15,6 +16,7 @@ pub enum Component {
 impl Component {
     pub fn bytes(self) -> usize {
         match self {
+            Component::I8 => 1,
             Component::F32 => 4,
             Component::I64 | Component::F64 | Component::Ptr => 8,
             Component::F32x4 | Component::F64x2 | Component::I64x2 => 16,
@@ -24,6 +26,7 @@ impl Component {
 
 pub fn components(p: &Program, ty: &Type) -> Result<Vec<Component>, String> {
     Ok(match ty {
+        Type::I8 => vec![Component::I8],
         Type::F32 => vec![Component::F32],
         Type::F64 => vec![Component::F64],
         Type::F32x4 => vec![Component::F32x4],

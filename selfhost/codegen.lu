@@ -1958,6 +1958,22 @@ fn elabel(l: str) {
   putnl()
 }
 
+// Mirrors `rhs.parse::<i64>().ok().filter(|d| *d != 0 && *d != -1)` in
+// src/llvm.rs: true when the divisor is an integer literal that can trip
+// neither the zero nor the i64::MIN/-1 trap, so a bare sdiv/srem is safe.
+fn is_safe_divisor(s: str): bool {
+  if len(s) == 0 or len(s) > 19 { return false }
+  if s == "0" or s == "-1" { return false }
+  var i = 0
+  if s[0] == '-' { i = 1 }
+  if i >= len(s) { return false }
+  while i < len(s) {
+    if s[i] < '0' or s[i] > '9' { return false }
+    i = i + 1
+  }
+  return true
+}
+
 fn newt(inout g: G): str {
   g.tmp = g.tmp + 1
   return concat("%t", i2s(g.tmp))
@@ -3299,10 +3315,39 @@ fn emit_bin(p: P, inout g: G, op: str, l: i64, r: i64): R {
     if lv.t == 0 and rv.t == 0 {
       if op == "/" or op == "%" {
         var callee = "lu_i64_rem"
-        if op == "/" { callee = "lu_i64_div" }
-        let t = newt(g)
-        eline(c8(t, " = call i64 @", callee, "(i64 ", g.rs[lv.o], ", i64 ", g.rs[rv.o], ")"))
-        return rpush1(g, 0, t)
+        var inst = "srem"
+        if op == "/" {
+          callee = "lu_i64_div"
+          inst = "sdiv"
+        }
+        let ls = g.rs[lv.o]
+        let rs = g.rs[rv.o]
+        // `out` is allocated first so temp numbering matches the host emitter.
+        let out = newt(g)
+        if is_safe_divisor(rs) {
+          eline(c8(out, " = ", inst, " i64 ", ls, ", ", rs, ""))
+          return rpush1(g, 0, out)
+        }
+        let zero = newt(g)
+        eline(c4(zero, " = icmp eq i64 ", rs, ", 0"))
+        let m1 = newt(g)
+        eline(c4(m1, " = icmp eq i64 ", rs, ", -1"))
+        let mn = newt(g)
+        eline(c4(mn, " = icmp eq i64 ", ls, ", -9223372036854775808"))
+        let ov = newt(g)
+        eline(c5(ov, " = and i1 ", m1, ", ", mn))
+        let bad = newt(g)
+        eline(c5(bad, " = or i1 ", zero, ", ", ov))
+        let lt = newl(g)
+        let lo = newl(g)
+        eline(c6("br i1 ", bad, ", label %", lt, ", label %", lo))
+        elabel(lt)
+        let disc = newt(g)
+        eline(c8(disc, " = call i64 @", callee, "(i64 ", ls, ", i64 ", rs, ")"))
+        eline("unreachable")
+        elabel(lo)
+        eline(c8(out, " = ", inst, " i64 ", ls, ", ", rs, ""))
+        return rpush1(g, 0, out)
       }
       var o2 = "srem"
       if op == "+" { o2 = "add" }
@@ -4335,6 +4380,8 @@ fn emit_module(p: P, inout g: G, triple: str) {
   putnl()
   puts("declare ptr @lu_arr_new_i64(i64, i64)")
   putnl()
+  puts("declare ptr @lu_arr_new_i8(i64, i64)")
+  putnl()
   puts("declare void @lu_oob(i64, i64) #1")
   putnl()
   puts("declare i64 @lu_i64_div(i64, i64)")
@@ -4354,6 +4401,14 @@ fn emit_module(p: P, inout g: G, triple: str) {
   puts("declare ptr @lu_chr(i64)")
   putnl()
   puts("declare ptr @lu_concat(ptr, i64, ptr, i64)")
+  putnl()
+  puts("declare ptr @lu_str_from_bytes(ptr, i64, i64)")
+  putnl()
+  puts("declare ptr @lu_str_from_i8(ptr, i64, i64)")
+  putnl()
+  puts("declare void @lu_put_bytes(ptr, i64, i64)")
+  putnl()
+  puts("declare void @lu_put_i8(ptr, i64, i64)")
   putnl()
   puts("attributes #0 = { nounwind willreturn memory(none) }")
   putnl()

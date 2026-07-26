@@ -9,6 +9,8 @@ const ATOL: f64 = 7.888609052210118e-31; // 2^-100
 #[derive(Clone, Debug)]
 pub enum Value {
     Int(i64),
+    /// One-byte integer; widens to `Int` in every arithmetic context.
+    Int8(i8),
     Float32(f32),
     Float(f64),
     F32x4([f32; 4]),
@@ -39,6 +41,7 @@ pub struct PropertyStatus {
 
 fn as_f64(v: &Value) -> Result<f64, String> {
     match v {
+        Value::Int8(i) => Ok(*i as f64),
         Value::Float32(f) => Ok(*f as f64),
         Value::Float(f) => Ok(*f),
         Value::Int(i) => Ok(*i as f64),
@@ -61,6 +64,7 @@ fn coerce(value: Value, ty: &crate::check::Type) -> Result<Value, String> {
 fn as_i64(v: &Value) -> Result<i64, String> {
     match v {
         Value::Int(i) => Ok(*i),
+        Value::Int8(i) => Ok(*i as i64),
         v => Err(format!("expected integer, got {:?}", v)),
     }
 }
@@ -479,6 +483,7 @@ impl<'a> Interp<'a> {
         use crate::check::Type::*;
         match ty {
             I64 => "i64".into(),
+            I8 => "i8".into(),
             F32 => "f32".into(),
             F64 => "f64".into(),
             F32x4 => "f32x4".into(),
@@ -715,6 +720,19 @@ impl<'a> Interp<'a> {
     fn binary(&self, op: BinaryOp, lhs: &Value, rhs: &Value) -> Result<Value, String> {
         use BinaryOp::*;
         match op {
+            // Bitwise is i64-only (the checker enforces it). `>>` is
+            // arithmetic, and shift counts are taken modulo 64 -- the hardware
+            // behaviour, and defined rather than UB.
+            And | Or | Xor | Shl | Shr => {
+                let (a, b) = (as_i64(lhs)?, as_i64(rhs)?);
+                Ok(Value::Int(match op {
+                    And => a & b,
+                    Or => a | b,
+                    Xor => a ^ b,
+                    Shl => a.wrapping_shl(b as u32),
+                    _ => a.wrapping_shr(b as u32),
+                }))
+            }
             Add | Sub | Mul | Div | Rem => match (lhs, rhs) {
                 (Value::Int(a), Value::Int(b)) => {
                     let value = match op {
@@ -853,6 +871,45 @@ impl<'a> Interp<'a> {
                 let c = as_i64(args.first().ok_or("`chr` needs 1 arg".to_string())?)?;
                 Ok(Value::Str(Rc::new(vec![c as u8])))
             }
+            "putbytes" => {
+                let (Value::Arr(cells), lo, hi) =
+                    (&args[0], as_i64(&args[1])?, as_i64(&args[2])?)
+                else {
+                    return Err("`putbytes` expects ([i64]|[i8], i64, i64)".into());
+                };
+                if lo < 0 || hi < lo || hi > cells.len() as i64 {
+                    return Err(format!(
+                        "putbytes range {}..{} out of bounds (length {})",
+                        lo, hi, cells.len()
+                    ));
+                }
+                let mut bytes = Vec::with_capacity((hi - lo) as usize);
+                for cell in &cells[lo as usize..hi as usize] {
+                    bytes.push(as_i64(cell)? as u8);
+                }
+                std::io::stdout().write_all(&bytes).map_err(|e| e.to_string())?;
+                Ok(Value::Unit)
+            }
+            "str_from_bytes" => {
+                let (Value::Arr(cells), lo, hi) =
+                    (&args[0], as_i64(&args[1])?, as_i64(&args[2])?)
+                else {
+                    return Err("`str_from_bytes` expects ([i64], i64, i64)".into());
+                };
+                if lo < 0 || hi < lo || hi > cells.len() as i64 {
+                    return Err(format!(
+                        "str_from_bytes range {}..{} out of bounds (length {})",
+                        lo,
+                        hi,
+                        cells.len()
+                    ));
+                }
+                let mut bytes = Vec::with_capacity((hi - lo) as usize);
+                for cell in &cells[lo as usize..hi as usize] {
+                    bytes.push(as_i64(cell)? as u8);
+                }
+                Ok(Value::Str(Rc::new(bytes)))
+            }
             "concat" => match (&args[0], &args[1]) {
                 (Value::Str(a), Value::Str(b)) => {
                     let mut bytes = Vec::with_capacity(a.len() + b.len());
@@ -911,6 +968,7 @@ impl<'a> Interp<'a> {
             }
             "float" => Ok(Value::Float(as_f64(&args[0])?)),
             "f32" => Ok(Value::Float32(as_f64(&args[0])? as f32)),
+            "i8" => Ok(Value::Int8(as_i64(&args[0])? as i8)),
             "int" => match &args[0] {
                 Value::Enum(_, tag) => Ok(Value::Int(*tag)),
                 v => Ok(Value::Int(as_f64(v)? as i64)),
@@ -1049,6 +1107,7 @@ impl<'a> Interp<'a> {
     fn display(&self, v: &Value) -> String {
         match v {
             Value::Int(i) => i.to_string(),
+            Value::Int8(i) => i.to_string(),
             Value::Float32(f) => format!("{}", f),
             Value::Float(f) => format!("{}", f),
             Value::F32x4(v) => format!(

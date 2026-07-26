@@ -512,6 +512,134 @@ main {
     }
 }
 
+/// `str_from_bytes` is the language's only linear way to turn computed bytes
+/// into a str; `chr` + `concat` is quadratic. It takes the low byte of each
+/// i64 element and is bounds-checked on both ends.
+#[test]
+fn str_from_bytes_builds_and_checks_its_range() {
+    let source = "\
+main {
+  var b = arr(5, 0)
+  b[0] = 'h'
+  b[1] = 'e'
+  b[2] = 'l'
+  b[3] = 'l'
+  b[4] = 'o'
+  puts(str_from_bytes(b, 0, 5))
+  putnl()
+  puts(str_from_bytes(b, 1, 3))
+  putnl()
+  print(len(str_from_bytes(b, 0, 0)), str_from_bytes(b, 0, 5) == \"hello\")
+  var t = arr(1, 0)
+  t[0] = 256 + 'A'
+  print(str_from_bytes(t, 0, 1) == \"A\")
+}
+";
+    assert_modes(source, b"hello\nel\n0 true\ntrue\n");
+
+    for range in ["0, 9", "-1, 2", "3, 1"] {
+        let bad = format!("main {{ var b = arr(4, 65)  puts(str_from_bytes(b, {range})) }}\n");
+        for mode in ["interp", "run"] {
+            let output = run(mode, &bad);
+            assert!(
+                !output.status.success(),
+                "{mode} accepted str_from_bytes range {range}"
+            );
+        }
+    }
+}
+
+/// A variable divisor is guarded inline and divided with a real instruction
+/// rather than an opaque runtime call. The guard must still catch both traps,
+/// and the results must match the helper's sign rules exactly.
+#[test]
+fn variable_divisors_divide_inline_and_still_trap() {
+    let source = "\
+fn opaque(x: i64): i64 { return x }
+main {
+  print(7 / opaque(2), 7 % opaque(2), -7 / opaque(2), -7 % opaque(2))
+  print(7 / opaque(-2), 7 % opaque(-2), -7 / opaque(-2), -7 % opaque(-2))
+  print(7 / opaque(1), -7 / opaque(1), 7 / opaque(7))
+}
+";
+    assert_modes(source, b"3 1 -3 -1\n-3 1 3 -1\n7 -7 1\n");
+
+    for expr in [
+        "7 / opaque(0)",
+        "7 % opaque(0)",
+        "(-9223372036854775807 - 1) / opaque(-1)",
+        "(-9223372036854775807 - 1) % opaque(-1)",
+    ] {
+        let bad = format!("fn opaque(x: i64): i64 {{ return x }}\nmain {{ print({expr}) }}\n");
+        for mode in ["interp", "run"] {
+            let output = run(mode, &bad);
+            assert!(!output.status.success(), "{mode} accepted `{expr}`");
+        }
+    }
+}
+
+/// Zero-initialized arrays take a `calloc` path so large allocations are not
+/// eagerly memset. The observable contents must be unchanged, and a non-zero
+/// init (including -0.0, whose bits are not all zero) must still be filled.
+#[test]
+fn zero_initialized_arrays_still_read_back_as_zero() {
+    let source = "\
+main {
+  var a = arr(1000, 0)
+  var f = arr(1000, 0.0)
+  var g = arr(4, -0.0)
+  var h = arr(4, 7)
+  print(a[0], a[999], f[0], f[999])
+  print(g[0], g[3], h[0], h[3])
+  print(sum(i in 0..1000) a[i], sum(i in 0..1000) f[i])
+}
+";
+    assert_modes(source, b"0 0 0 0\n-0 -0 7 7\n0 0\n");
+}
+
+/// `i8` is a one-byte storage type: it widens to i64 in every arithmetic,
+/// comparison, and reduction context, narrows only through `i8(x)`, and stores
+/// one byte per array element.
+#[test]
+fn i8_is_a_byte_wide_storage_type() {
+    let source = "\
+fn dbl(x: i8): i64 { return x + x }
+fn narrow(x: i64): i8 { return i8(x) }
+main {
+  print(dbl(i8(21)), narrow(300), dbl(narrow(300)))
+  var a = arr(4, i8(0))
+  a[0] = i8(127)
+  a[1] = i8(128)
+  a[2] = i8(-1)
+  print(a[0], a[1], a[2], a[0] + a[1], a[2] * 3)
+  print(a[0] > a[1], a[2] < 0, a[0] == 127)
+  print(float(a[0]) / 2.0, int(a[2]))
+  print(sum(i in 0..4) a[i])
+  var b = arr(3, i8(7))
+  print(b[0], b[2], len(b))
+}
+";
+    assert_modes(
+        source,
+        b"42 44 88\n127 -128 -1 -1 -3\ntrue true true\n63.5 -1\n-2\n7 7 3\n",
+    );
+}
+
+/// i8 is deliberately not allowed in records or across the C boundary yet:
+/// record arrays allocate through a layout ABI that only knows 4- and 8-byte
+/// components. Both must be rejected rather than silently miscompiled.
+#[test]
+fn i8_is_rejected_where_it_is_not_supported() {
+    let record = "type R { a: i8, b: i64 }\nmain { var r = R { i8(1), 2 }  print(r.b) }\n";
+    let output = run("check", record);
+    assert!(!output.status.success(), "accepted an i8 record field");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be i8"));
+
+    let boundary = "extern fn f(x: c_slice[i8]): i64\nmain { var a = arr(4, i8(0))  print(f(a)) }\n";
+    let output = run("check", boundary);
+    assert!(!output.status.success(), "accepted i8 at the C boundary");
+}
+
 /// `break` leaves the innermost loop; `continue` skips to the next iteration
 /// and, in a `for`, must still advance the index (it targets the latch block,
 /// not the condition head).
@@ -556,5 +684,57 @@ main {
         let output = run("check", bad);
         assert!(!output.status.success(), "accepted `{bad}` outside a loop");
         assert!(String::from_utf8_lossy(&output.stderr).contains("outside of a loop"));
+    }
+}
+
+/// Bitwise operators are i64-only, `>>` is arithmetic, shift counts are masked
+/// to 0..63, and precedence is | < ^ < & < shifts < additive < multiplicative
+/// (so bitwise binds tighter than comparison, unlike C).
+#[test]
+fn bitwise_operators_and_their_precedence() {
+    let source = "\
+main {
+  print(12 & 10, 12 | 10, 12 ^ 10)
+  print(1 << 10, 1024 >> 3, -8 >> 1)
+  print(1 << 3 == 8, 12 & 10 == 8)
+  print(1 << 2 + 1, 3 & 1 + 1)
+  print(1 | 2 ^ 3 & 3)
+  print(1 << 62, -1 >> 60)
+}
+";
+    assert_modes(
+        source,
+        b"8 14 6\n1024 128 -4\ntrue true\n8 2\n1\n4611686018427387904 -1\n",
+    );
+
+    let output = run("check", "main { print(1.5 & 2) }\n");
+    assert!(!output.status.success(), "accepted a float bitwise operand");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("needs two i64 operands"));
+}
+
+/// `putbytes` writes a span of an `[i64]` or `[i8]` straight to stdout with no
+/// intermediate str, and is bounds-checked.
+#[test]
+fn putbytes_writes_spans_without_allocating() {
+    let source = "\
+main {
+  var a = arr(5, i8(0))
+  a[0] = i8('h')
+  a[1] = i8('i')
+  a[2] = i8(10)
+  putbytes(a, 0, 3)
+  var b = arr(3, 0)
+  b[0] = 'o'
+  b[1] = 'k'
+  b[2] = 10
+  putbytes(b, 0, 3)
+}
+";
+    assert_modes(source, b"hi\nok\n");
+
+    let bad = "main { var a = arr(3, i8(0))  putbytes(a, 0, 9) }\n";
+    for mode in ["interp", "run"] {
+        let output = run(mode, bad);
+        assert!(!output.status.success(), "{mode} accepted an out-of-range putbytes");
     }
 }

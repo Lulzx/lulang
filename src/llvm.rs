@@ -42,6 +42,7 @@ fn abi_ret_comps<'x>(p: &Program, f: &FnDecl) -> Result<Vec<&'x str>, String> {
 fn llvm_component(component: Component) -> &'static str {
     match component {
         Component::I64 => "i64",
+        Component::I8 => "i8",
         Component::F32 => "float",
         Component::F64 => "double",
         Component::Ptr => "ptr",
@@ -561,12 +562,14 @@ fn build_output(
          declare i64 @lu_str_eq(ptr, i64, ptr, i64) #0\n\
          declare ptr @lu_str_copy(ptr, i64)\n\
          declare ptr @lu_arr_new_f64(i64, double)\ndeclare ptr @lu_arr_new_i64(i64, i64)\n\
+         declare ptr @lu_arr_new_i8(i64, i64)\n\
          declare void @lu_oob(i64, i64) #1\n\
          declare i64 @lu_i64_div(i64, i64)\ndeclare i64 @lu_i64_rem(i64, i64)\n\
          declare i64 @lu_nargs()\ndeclare ptr @lu_arg(i64)\n\
          declare ptr @lu_read_file(ptr, i64)\ndeclare i64 @lu_last_len()\n\
          declare void @lu_write_file(ptr, i64, ptr, i64)\n\
          declare ptr @lu_chr(i64)\ndeclare ptr @lu_concat(ptr, i64, ptr, i64)\n\
+         declare ptr @lu_str_from_bytes(ptr, i64, i64)\ndeclare ptr @lu_str_from_i8(ptr, i64, i64)\ndeclare void @lu_put_bytes(ptr, i64, i64)\ndeclare void @lu_put_i8(ptr, i64, i64)\n\
          attributes #0 = { nounwind willreturn memory(none) }\n\
          attributes #1 = { noreturn }\n\
          !0 = !{}\n\n",
@@ -1977,7 +1980,49 @@ impl<'a> Emit<'a> {
 
     fn emit_ir_binary(&mut self, op: BinaryOp, lhs: EV, rhs: EV) -> Result<EV, String> {
         use BinaryOp::*;
+        if matches!(op, And | Or | Xor | Shl | Shr) {
+            // i64-only (checker-enforced). `>>` is arithmetic; shift counts are
+            // masked to 0..63 so an out-of-range count is defined rather than
+            // LLVM poison.
+            let lhs = self.coerce_ev(lhs, &CType::I64)?;
+            let rhs = self.coerce_ev(rhs, &CType::I64)?;
+            let amount = if matches!(op, Shl | Shr) {
+                let masked = self.t();
+                self.line(format!("{} = and i64 {}, 63", masked, rhs.regs[0]));
+                masked
+            } else {
+                rhs.regs[0].clone()
+            };
+            let opcode = match op {
+                And => "and",
+                Or => "or",
+                Xor => "xor",
+                Shl => "shl",
+                _ => "ashr",
+            };
+            let out = self.t();
+            self.line(format!(
+                "{} = {} i64 {}, {}",
+                out, opcode, lhs.regs[0], amount
+            ));
+            return Ok(EV {
+                ty: CType::I64,
+                regs: vec![out],
+            });
+        }
         if matches!(op, Add | Sub | Mul | Div | Rem) {
+            // `i8` is a storage type: widen to i64 before any arithmetic, or the
+            // "not both i64" fallthrough below would treat it as floating point.
+            let lhs = if lhs.ty == CType::I8 {
+                self.coerce_ev(lhs, &CType::I64)?
+            } else {
+                lhs
+            };
+            let rhs = if rhs.ty == CType::I8 {
+                self.coerce_ev(rhs, &CType::I64)?
+            } else {
+                rhs
+            };
             if lhs.ty == CType::I64 && rhs.ty == CType::I64 {
                 if matches!(op, Div | Rem) {
                     return self.emit_checked_int_div(&lhs.regs[0], &rhs.regs[0], op == Rem);
@@ -2054,6 +2099,17 @@ impl<'a> Emit<'a> {
         // which always had it right. Str is handled above; the checker only
         // admits numeric operands to the ordering relations, so `ptr` remains
         // an equality-only concern.
+        // Widen i8 operands before comparing, matching the arithmetic path.
+        let lhs = if lhs.ty == CType::I8 {
+            self.coerce_ev(lhs, &CType::I64)?
+        } else {
+            lhs
+        };
+        let rhs = if rhs.ty == CType::I8 {
+            self.coerce_ev(rhs, &CType::I64)?
+        } else {
+            rhs
+        };
         // `~=` keeps its relative-epsilon float semantics on every operand type.
         if matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
             && !matches!(lhs.ty, CType::F32 | CType::F64)
@@ -2493,6 +2549,13 @@ impl<'a> Emit<'a> {
                 self.line(format!("{} = sitofp i64 {} to double", t, v.regs[0]));
                 Ok(t)
             }
+            CType::I8 => {
+                let wide = self.t();
+                self.line(format!("{} = sext i8 {} to i64", wide, v.regs[0]));
+                let t = self.t();
+                self.line(format!("{} = sitofp i64 {} to double", t, wide));
+                Ok(t)
+            }
             CType::F32 => {
                 let t = self.t();
                 self.line(format!("{} = fpext float {} to double", t, v.regs[0]));
@@ -2513,6 +2576,30 @@ impl<'a> Emit<'a> {
                 out
             }
             (CType::F64, CType::I64) => self.to_f64(&value)?,
+            (CType::I64, CType::I8) => {
+                let out = self.t();
+                self.line(format!("{} = sext i8 {} to i64", out, value.regs[0]));
+                out
+            }
+            (CType::I8, CType::I64) => {
+                let out = self.t();
+                self.line(format!("{} = trunc i64 {} to i8", out, value.regs[0]));
+                out
+            }
+            (CType::F64, CType::I8) => {
+                let wide = self.t();
+                self.line(format!("{} = sext i8 {} to i64", wide, value.regs[0]));
+                let out = self.t();
+                self.line(format!("{} = sitofp i64 {} to double", out, wide));
+                out
+            }
+            (CType::F32, CType::I8) => {
+                let wide = self.t();
+                self.line(format!("{} = sext i8 {} to i64", wide, value.regs[0]));
+                let out = self.t();
+                self.line(format!("{} = sitofp i64 {} to float", out, wide));
+                out
+            }
             (CType::F32, CType::F64) => {
                 let out = self.t();
                 self.line(format!(
@@ -2700,15 +2787,42 @@ impl<'a> Emit<'a> {
                 regs: vec![out],
             });
         }
+        // Variable divisor: guard the two trapping cases inline and do the
+        // division with a real instruction on the fast path. The trap edge
+        // calls the same helper, which detects the case and exits with the
+        // documented message, so diagnostics are unchanged — but the common
+        // path is no longer an opaque call into another translation unit.
         let callee = if remainder {
             "lu_i64_rem"
         } else {
             "lu_i64_div"
         };
+        let zero = self.t();
+        self.line(format!("{} = icmp eq i64 {}, 0", zero, rhs));
+        let minus_one = self.t();
+        self.line(format!("{} = icmp eq i64 {}, -1", minus_one, rhs));
+        let int_min = self.t();
+        self.line(format!(
+            "{} = icmp eq i64 {}, -9223372036854775808",
+            int_min, lhs
+        ));
+        let overflow = self.t();
+        self.line(format!("{} = and i1 {}, {}", overflow, minus_one, int_min));
+        let bad = self.t();
+        self.line(format!("{} = or i1 {}, {}", bad, zero, overflow));
+        let trap = self.l();
+        let ok = self.l();
+        self.line(format!("br i1 {}, label %{}, label %{}", bad, trap, ok));
+        self.label(&trap);
+        let discarded = self.t();
         self.line(format!(
             "{} = call i64 @{}(i64 {}, i64 {})",
-            out, callee, lhs, rhs
+            discarded, callee, lhs, rhs
         ));
+        self.line("unreachable".into());
+        self.label(&ok);
+        let op = if remainder { "srem" } else { "sdiv" };
+        self.line(format!("{} = {} i64 {}, {}", out, op, lhs, rhs));
         Ok(EV {
             ty: CType::I64,
             regs: vec![out],
@@ -2732,6 +2846,11 @@ impl<'a> Emit<'a> {
                         }
                         CType::I64 => {
                             self.line(format!("call void @lu_print_i64(i64 {})", v.regs[0]))
+                        }
+                        CType::I8 => {
+                            let wide = self.t();
+                            self.line(format!("{} = sext i8 {} to i64", wide, v.regs[0]));
+                            self.line(format!("call void @lu_print_i64(i64 {})", wide))
                         }
                         CType::Bool => {
                             self.line(format!("call void @lu_print_bool(i64 {})", v.regs[0]))
@@ -2846,6 +2965,39 @@ impl<'a> Emit<'a> {
                     regs: vec![p, l],
                 })
             }
+            "putbytes" => {
+                let callee = if matches!(&args[0].ty, CType::Arr(e) if **e == CType::I8) {
+                    "lu_put_i8"
+                } else {
+                    "lu_put_bytes"
+                };
+                self.line(format!(
+                    "call void @{}(ptr {}, i64 {}, i64 {})",
+                    callee, args[0].regs[0], args[1].regs[0], args[2].regs[0]
+                ));
+                Ok(EV {
+                    ty: CType::Unit,
+                    regs: vec![],
+                })
+            }
+            "str_from_bytes" => {
+                let callee = if matches!(&args[0].ty, CType::Arr(e) if **e == CType::I8) {
+                    "lu_str_from_i8"
+                } else {
+                    "lu_str_from_bytes"
+                };
+                let p = self.t();
+                self.line(format!(
+                    "{} = call ptr @{}(ptr {}, i64 {}, i64 {})",
+                    p, callee, args[0].regs[0], args[1].regs[0], args[2].regs[0]
+                ));
+                let l = self.t();
+                self.line(format!("{} = call i64 @lu_last_len()", l));
+                Ok(EV {
+                    ty: CType::Str,
+                    regs: vec![p, l],
+                })
+            }
             "concat" => {
                 let p = self.t();
                 self.line(format!(
@@ -2941,7 +3093,11 @@ impl<'a> Emit<'a> {
                 })
             }
             "f32" => self.coerce_ev(args[0].clone(), &CType::F32),
+            "i8" => self.coerce_ev(args[0].clone(), &CType::I8),
             "int" => {
+                if args[0].ty == CType::I8 {
+                    return self.coerce_ev(args[0].clone(), &CType::I64);
+                }
                 if matches!(args[0].ty, CType::F32 | CType::F64) {
                     let t = self.t();
                     let source = if args[0].ty == CType::F32 {
@@ -3193,6 +3349,21 @@ impl<'a> Emit<'a> {
                         ));
                         Ok(EV {
                             ty: CType::Arr(Box::new(CType::I64)),
+                            regs: vec![t],
+                        })
+                    }
+                    CType::I8 => {
+                        let wide = self.t();
+                        self.line(format!(
+                            "{} = sext i8 {} to i64",
+                            wide, args[1].regs[0]
+                        ));
+                        self.line(format!(
+                            "{} = call ptr @lu_arr_new_i8(i64 {}, i64 {})",
+                            t, n, wide
+                        ));
+                        Ok(EV {
+                            ty: CType::Arr(Box::new(CType::I8)),
                             regs: vec![t],
                         })
                     }

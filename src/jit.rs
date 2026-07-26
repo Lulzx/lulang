@@ -43,6 +43,7 @@ fn comps(p: &Program, t: &CType) -> Result<Vec<cranelift_codegen::ir::Type>, Str
     Ok(layout_components(p, t)?
         .into_iter()
         .map(|component| match component {
+            Component::I8 => types::I8,
             Component::F32 => types::F32,
             Component::F64 => types::F64,
             Component::I64 | Component::Ptr => types::I64,
@@ -185,6 +186,7 @@ impl<'a> Jit<'a, JITModule> {
             ("lu_print_nl", runtime::lu_print_nl as *const u8),
             ("lu_arr_new_f64", runtime::lu_arr_new_f64 as *const u8),
             ("lu_arr_new_i64", runtime::lu_arr_new_i64 as *const u8),
+            ("lu_arr_new_i8", runtime::lu_arr_new_i8 as *const u8),
             ("lu_arr_new_raw", runtime::lu_arr_new_raw as *const u8),
             ("lu_arr_share", runtime::lu_arr_share as *const u8),
             ("lu_arr_cow", runtime::lu_arr_cow as *const u8),
@@ -206,6 +208,10 @@ impl<'a> Jit<'a, JITModule> {
             ("lu_last_len", runtime::lu_last_len as *const u8),
             ("lu_chr", runtime::lu_chr as *const u8),
             ("lu_concat", runtime::lu_concat as *const u8),
+            ("lu_str_from_bytes", runtime::lu_str_from_bytes as *const u8),
+            ("lu_str_from_i8", runtime::lu_str_from_i8 as *const u8),
+            ("lu_put_bytes", runtime::lu_put_bytes as *const u8),
+            ("lu_put_i8", runtime::lu_put_i8 as *const u8),
         ];
         for (n, ptr) in syms {
             jb.symbol(*n, *ptr);
@@ -405,6 +411,7 @@ impl<'a, M: Module> Jit<'a, M> {
             ("lu_print_nl", 0, &[], false),
             ("lu_arr_new_f64", 1, &[types::I64, types::F64], false),
             ("lu_arr_new_i64", 1, &[types::I64, types::I64], false),
+            ("lu_arr_new_i8", 1, &[types::I64, types::I64], false),
             (
                 "lu_arr_new_raw",
                 1,
@@ -446,6 +453,20 @@ impl<'a, M: Module> Jit<'a, M> {
                 &[types::I64, types::I64, types::I64, types::I64],
                 false,
             ),
+            (
+                "lu_str_from_bytes",
+                1,
+                &[types::I64, types::I64, types::I64],
+                false,
+            ),
+            (
+                "lu_str_from_i8",
+                1,
+                &[types::I64, types::I64, types::I64],
+                false,
+            ),
+            ("lu_put_bytes", 0, &[types::I64, types::I64, types::I64], false),
+            ("lu_put_i8", 0, &[types::I64, types::I64, types::I64], false),
         ];
         for (name, kind, params, pure) in specs {
             let mut sig = self.module.make_signature();
@@ -781,6 +802,16 @@ impl<'a, 'b> Gen<'a, 'b> {
             }
             (CType::F64, CType::I64) => {
                 vec![self.b.ins().fcvt_from_sint(types::F64, values[0])]
+            }
+            (CType::I64, CType::I8) => vec![self.b.ins().sextend(types::I64, values[0])],
+            (CType::I8, CType::I64) => vec![self.b.ins().ireduce(types::I8, values[0])],
+            (CType::F64, CType::I8) => {
+                let wide = self.b.ins().sextend(types::I64, values[0]);
+                vec![self.b.ins().fcvt_from_sint(types::F64, wide)]
+            }
+            (CType::F32, CType::I8) => {
+                let wide = self.b.ins().sextend(types::I64, values[0]);
+                vec![self.b.ins().fcvt_from_sint(types::F32, wide)]
             }
             (CType::F32, CType::F64) => vec![self.b.ins().fdemote(types::F32, values[0])],
             (CType::F64, CType::F32) => vec![self.b.ins().fpromote(types::F64, values[0])],
@@ -1737,6 +1768,10 @@ impl<'a, 'b> Gen<'a, 'b> {
     fn f64_of(&mut self, t: &CType, v: Value) -> Value {
         match t {
             CType::I64 => self.b.ins().fcvt_from_sint(types::F64, v),
+            CType::I8 => {
+                let wide = self.b.ins().sextend(types::I64, v);
+                self.b.ins().fcvt_from_sint(types::F64, wide)
+            }
             CType::F32 => self.b.ins().fpromote(types::F64, v),
             _ => v,
         }
@@ -1751,7 +1786,37 @@ impl<'a, 'b> Gen<'a, 'b> {
         rv: Vec<Value>,
     ) -> Result<(CType, Vec<Value>), String> {
         use BinaryOp::*;
+        // See src/llvm.rs: i64-only, arithmetic `>>`, shift count masked.
+        if matches!(op, And | Or | Xor | Shl | Shr) {
+            let lv = self.coerce(&CType::I64, &lt, lv)?;
+            let rv = self.coerce(&CType::I64, &rt, rv)?;
+            let amount = if matches!(op, Shl | Shr) {
+                self.b.ins().band_imm(rv[0], 63)
+            } else {
+                rv[0]
+            };
+            let v = match op {
+                And => self.b.ins().band(lv[0], amount),
+                Or => self.b.ins().bor(lv[0], amount),
+                Xor => self.b.ins().bxor(lv[0], amount),
+                Shl => self.b.ins().ishl(lv[0], amount),
+                _ => self.b.ins().sshr(lv[0], amount),
+            };
+            return Ok((CType::I64, vec![v]));
+        }
         if matches!(op, Add | Sub | Mul | Div | Rem) {
+            // `i8` is a storage type: widen to i64 before any arithmetic, or the
+            // "not both i64" fallthrough below would treat it as floating point.
+            let (lt, lv) = if lt == CType::I8 {
+                (CType::I64, self.coerce(&CType::I64, &CType::I8, lv)?)
+            } else {
+                (lt, lv)
+            };
+            let (rt, rv) = if rt == CType::I8 {
+                (CType::I64, self.coerce(&CType::I64, &CType::I8, rv)?)
+            } else {
+                (rt, rv)
+            };
             if lt == CType::I64 && rt == CType::I64 {
                 let v = match op {
                     Add => self.b.ins().iadd(lv[0], rv[0]),
@@ -1812,6 +1877,17 @@ impl<'a, 'b> Gen<'a, 'b> {
             let bit = self.b.ins().fcmp(FloatCC::LessThanOrEqual, diff, tol);
             return Ok((CType::Bool, vec![self.b.ins().uextend(types::I64, bit)]));
         }
+        // Widen i8 operands before comparing, for the same reason as arithmetic.
+        let (lt, lv) = if lt == CType::I8 {
+            (CType::I64, self.coerce(&CType::I64, &CType::I8, lv)?)
+        } else {
+            (lt, lv)
+        };
+        let (rt, rv) = if rt == CType::I8 {
+            (CType::I64, self.coerce(&CType::I64, &CType::I8, rv)?)
+        } else {
+            (rt, rv)
+        };
         let both_int = matches!(
             lt,
             CType::I64 | CType::Bool | CType::Enum(_) | CType::CPtr(_)
@@ -2200,6 +2276,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                         CType::I64 => {
                             self.call_import("lu_print_i64", &[vals[0]]);
                         }
+                        CType::I8 => {
+                            let wide = self.b.ins().sextend(types::I64, vals[0]);
+                            self.call_import("lu_print_i64", &[wide]);
+                        }
                         CType::Bool => {
                             self.call_import("lu_print_bool", &[vals[0]]);
                         }
@@ -2263,6 +2343,28 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let l = self.call_import("lu_last_len", &[])[0];
                 Ok((CType::Str, vec![p, l]))
             }
+            "putbytes" => {
+                let callee = if matches!(&atys[0], CType::Arr(e) if **e == CType::I8) {
+                    "lu_put_i8"
+                } else {
+                    "lu_put_bytes"
+                };
+                self.call_import(callee, &[avals[0][0], avals[1][0], avals[2][0]]);
+                Ok((CType::Unit, vec![]))
+            }
+            "str_from_bytes" => {
+                let callee = if matches!(&atys[0], CType::Arr(e) if **e == CType::I8) {
+                    "lu_str_from_i8"
+                } else {
+                    "lu_str_from_bytes"
+                };
+                let p = self.call_import(
+                    callee,
+                    &[avals[0][0], avals[1][0], avals[2][0]],
+                )[0];
+                let l = self.call_import("lu_last_len", &[])[0];
+                Ok((CType::Str, vec![p, l]))
+            }
             "concat" => {
                 let p = self.call_import(
                     "lu_concat",
@@ -2313,7 +2415,15 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let value = self.coerce(&CType::F32, &atys[0], avals[0].clone())?;
                 Ok((CType::F32, value))
             }
+            "i8" => {
+                let value = self.coerce(&CType::I8, &atys[0], avals[0].clone())?;
+                Ok((CType::I8, value))
+            }
             "int" => {
+                if atys[0] == CType::I8 {
+                    let v = self.coerce(&CType::I64, &CType::I8, avals[0].clone())?;
+                    return Ok((CType::I64, v));
+                }
                 let v = if matches!(atys[0], CType::F32 | CType::F64) {
                     self.b.ins().fcvt_to_sint(types::I64, avals[0][0])
                 } else {
@@ -2461,6 +2571,11 @@ impl<'a, 'b> Gen<'a, 'b> {
                     CType::I64 => {
                         let p = self.call_import("lu_arr_new_i64", &[n, avals[1][0]])[0];
                         Ok((CType::Arr(Box::new(CType::I64)), vec![p]))
+                    }
+                    CType::I8 => {
+                        let wide = self.b.ins().sextend(types::I64, avals[1][0]);
+                        let p = self.call_import("lu_arr_new_i8", &[n, wide])[0];
+                        Ok((CType::Arr(Box::new(CType::I8)), vec![p]))
                     }
                     t @ (CType::Bool | CType::Enum(_)) => {
                         let elem = t.clone();

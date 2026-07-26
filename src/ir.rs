@@ -37,6 +37,11 @@ pub enum BinaryOp {
     Le,
     Gt,
     Ge,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
     ApproxEq,
 }
 
@@ -1065,6 +1070,11 @@ impl<'a> Builder<'a> {
                         "%" => BinaryOp::Rem,
                         "==" => BinaryOp::Eq,
                         "!=" => BinaryOp::Ne,
+                        "&" => BinaryOp::And,
+                        "|" => BinaryOp::Or,
+                        "^" => BinaryOp::Xor,
+                        "<<" => BinaryOp::Shl,
+                        ">>" => BinaryOp::Shr,
                         "<" => BinaryOp::Lt,
                         "<=" => BinaryOp::Le,
                         ">" => BinaryOp::Gt,

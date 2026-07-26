@@ -5,6 +5,9 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type {
     I64,
+    /// One-byte integer. A storage type: it widens to `i64` in arithmetic and
+    /// narrows only through the explicit `i8(x)` conversion.
+    I8,
     F32,
     F64,
     F32x4,
@@ -80,6 +83,7 @@ pub fn resolve_type(p: &Program, s: &str) -> Result<Type, String> {
         "f64x2" => Ok(Type::F64x2),
         "i64x2" => Ok(Type::I64x2),
         "i64" | "i32" => Ok(Type::I64),
+        "i8" => Ok(Type::I8),
         "bool" => Ok(Type::Bool),
         "str" => Ok(Type::Str),
         "()" => Ok(Type::Unit),
@@ -182,6 +186,8 @@ fn is_builtin(name: &str) -> bool {
             | "arg"
             | "chr"
             | "concat"
+            | "str_from_bytes"
+            | "putbytes"
             | "read_file"
             | "write_file"
             | "sqrt"
@@ -196,6 +202,7 @@ fn is_builtin(name: &str) -> bool {
             | "atan2"
             | "float"
             | "f32"
+            | "i8"
             | "int"
             | "len"
             | "substr"
@@ -243,6 +250,15 @@ impl<'a> Checker<'a> {
         for (record_index, record) in p.types.iter().enumerate() {
             for (field, source) in &record.fields {
                 match c.resolve(source)? {
+                    Type::I8 => {
+                        return Err(format!(
+                            "record field `{}.{}` cannot be i8 yet: record arrays \
+                             allocate through a layout ABI that only knows 4- and \
+                             8-byte components. Use i64, or an `[i8]` alongside \
+                             the record.",
+                            record.name, field
+                        ))
+                    }
                     Type::CSlice(_) => {
                         return Err(format!(
                             "record field `{}.{}` cannot store a borrowed c_slice",
@@ -394,6 +410,7 @@ impl<'a> Checker<'a> {
             "f64x2" => Ok(Type::F64x2),
             "i64x2" => Ok(Type::I64x2),
             "i64" | "i32" => Ok(Type::I64),
+            "i8" => Ok(Type::I8),
             "bool" => Ok(Type::Bool),
             "str" => Ok(Type::Str),
             "()" => Ok(Type::Unit),
@@ -640,6 +657,7 @@ impl<'a> Checker<'a> {
     fn name(&self, t: &Type) -> String {
         match t {
             Type::I64 => "i64".into(),
+            Type::I8 => "i8".into(),
             Type::F32 => "f32".into(),
             Type::F64 => "f64".into(),
             Type::F32x4 => "f32x4".into(),
@@ -933,7 +951,17 @@ impl<'a> Checker<'a> {
     }
 
     fn numeric(&self, t: &Type) -> bool {
-        matches!(t, Type::I64 | Type::F32 | Type::F64)
+        matches!(t, Type::I64 | Type::I8 | Type::F32 | Type::F64)
+    }
+
+    /// `i8` is a storage type: every arithmetic and comparison context sees it
+    /// as `i64`. Narrowing back is only ever explicit, through `i8(x)`.
+    fn widen(&self, t: &Type) -> Type {
+        if *t == Type::I8 {
+            Type::I64
+        } else {
+            t.clone()
+        }
     }
 
     fn check_expr(&self, eid: ExprId, scopes: &mut Vec<Scope>) -> Result<Type, String> {
@@ -998,6 +1026,18 @@ impl<'a> Checker<'a> {
                         } else {
                             Type::I64
                         })
+                    }
+                    "&" | "|" | "^" | "<<" | ">>" => {
+                        let (lw, rw) = (self.widen(&lt), self.widen(&rt));
+                        if lw != Type::I64 || rw != Type::I64 {
+                            return Err(format!(
+                                "`{}` needs two i64 operands, got {} and {}",
+                                op,
+                                self.name(&lt),
+                                self.name(&rt)
+                            ));
+                        }
+                        Ok(Type::I64)
                     }
                     "==" | "!=" => {
                         if lt == rt || (self.numeric(&lt) && self.numeric(&rt)) {
@@ -1163,7 +1203,10 @@ impl<'a> Checker<'a> {
                 if !self.numeric(&t) {
                     return Err(format!("`sum` body must be numeric, got {}", self.name(&t)));
                 }
-                Ok(t)
+                // An i8 body accumulates in i64: a reduction over bytes would
+                // otherwise overflow almost immediately, and the IR has no i8
+                // accumulator.
+                Ok(self.widen(&t))
             }
             Expr::Call(name, args) => {
                 let ats: Result<Vec<Type>, String> =
@@ -1235,6 +1278,30 @@ impl<'a> Checker<'a> {
                         }
                         Ok(Type::Str)
                     }
+                    "str_from_bytes" => {
+                        need(3)?;
+                        if !matches!(&ats[0], Type::Arr(e) if **e == Type::I64 || **e == Type::I8)
+                        {
+                            return Err(
+                                "`str_from_bytes` expects an [i64] or [i8] first arg".into()
+                            );
+                        }
+                        if ats[1] != Type::I64 || ats[2] != Type::I64 {
+                            return Err("`str_from_bytes` bounds must be i64".into());
+                        }
+                        Ok(Type::Str)
+                    }
+                    "putbytes" => {
+                        need(3)?;
+                        if !matches!(&ats[0], Type::Arr(e) if **e == Type::I64 || **e == Type::I8)
+                        {
+                            return Err("`putbytes` expects an [i64] or [i8] first arg".into());
+                        }
+                        if ats[1] != Type::I64 || ats[2] != Type::I64 {
+                            return Err("`putbytes` bounds must be i64".into());
+                        }
+                        Ok(Type::Unit)
+                    }
                     "read_file" => {
                         need(1)?;
                         if ats[0] != Type::Str {
@@ -1270,6 +1337,13 @@ impl<'a> Checker<'a> {
                         } else {
                             Type::F64
                         })
+                    }
+                    "i8" => {
+                        need(1)?;
+                        if ats[0] != Type::I64 && ats[0] != Type::I8 {
+                            return Err("`i8` expects an i64".into());
+                        }
+                        Ok(Type::I8)
                     }
                     "float" => {
                         need(1)?;

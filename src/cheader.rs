@@ -70,6 +70,7 @@ fn json_string(value: &str) -> String {
 fn lu_type_name(program: &LoweredProgram, ty: &Type) -> String {
     match ty {
         Type::I64 => "i64".into(),
+        Type::I8 => "i8".into(),
         Type::F32 => "f32".into(),
         Type::F64 => "f64".into(),
         Type::F32x4 => "f32x4".into(),

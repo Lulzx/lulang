@@ -82,11 +82,34 @@ static char *arr_alloc(long long n, long long data_bytes) {
   return p;
 }
 
+/* Zero-initialized allocation. `calloc` lets the OS hand back lazily-zeroed
+   pages for large arrays instead of eagerly touching every element, which is
+   what a C program writing `calloc` gets. `arr(n, 0)` is by far the common
+   case, so it is worth not memsetting hundreds of megabytes. */
+static char *arr_alloc_zeroed(long long n, long long data_bytes) {
+  if (n < 0 || data_bytes < 0 ||
+      (unsigned long long)data_bytes > SIZE_MAX - 16) {
+    fprintf(stderr, "error: invalid array length %lld with %lld data bytes\n",
+            n, data_bytes);
+    exit(1);
+  }
+  char *p = calloc(1, 16 + (size_t)data_bytes);
+  if (!p) {
+    fprintf(stderr, "error: out of memory allocating array of %lld elements\n", n);
+    exit(1);
+  }
+  ((long long *)p)[0] = n;
+  ((long long *)p)[1] = data_bytes;
+  return p;
+}
+
 char *lu_arr_new_f64(long long n, double init) {
   if (n < 0 || (unsigned long long)n > (SIZE_MAX - 16) / 8) {
     fprintf(stderr, "error: invalid array length %lld\n", n);
     exit(1);
   }
+  /* +0.0 is all-zero bits; -0.0 is not, so it takes the fill path. */
+  if (init == 0.0 && !signbit(init)) return arr_alloc_zeroed(n, n * 8);
   char *p = arr_alloc(n, n * 8);
   double *d = (double *)(p + 16);
   for (long long i = 0; i < n; i++) d[i] = init;
@@ -98,9 +121,21 @@ char *lu_arr_new_i64(long long n, long long init) {
     fprintf(stderr, "error: invalid array length %lld\n", n);
     exit(1);
   }
+  if (init == 0) return arr_alloc_zeroed(n, n * 8);
   char *p = arr_alloc(n, n * 8);
   long long *d = (long long *)(p + 16);
   for (long long i = 0; i < n; i++) d[i] = init;
+  return p;
+}
+
+char *lu_arr_new_i8(long long n, long long init) {
+  if (n < 0 || (unsigned long long)n > SIZE_MAX - 16) {
+    fprintf(stderr, "error: invalid array length %lld\n", n);
+    exit(1);
+  }
+  if ((signed char)init == 0) return arr_alloc_zeroed(n, n);
+  char *p = arr_alloc(n, n);
+  memset(p + 16, (int)(unsigned char)init, (size_t)n);
   return p;
 }
 
@@ -439,6 +474,88 @@ const char *lu_chr(long long c) {
   char *p = malloc(1);
   p[0] = (char)c;
   g_last_len = 1;
+  return p;
+}
+
+/* Build a str from `arr[lo..hi]`, taking the low byte of each i64 element.
+   `arr` is an ordinary compiler-owned [i64]: logical length at offset 0,
+   contiguous elements from offset 16 (a single-component element type is
+   never SoA-split). This is the language's only linear way to turn computed
+   bytes into a str -- chr+concat is quadratic. */
+const char *lu_str_from_bytes(const char *arr, long long lo, long long hi) {
+  long long n = ((const long long *)arr)[0];
+  if (lo < 0 || hi < lo || hi > n) {
+    fprintf(stderr,
+            "error: str_from_bytes range %lld..%lld out of bounds (length %lld)\n",
+            lo, hi, n);
+    exit(1);
+  }
+  const long long *data = (const long long *)(arr + 16);
+  size_t len = (size_t)(hi - lo);
+  char *p = malloc(len + 1);
+  if (!p) {
+    fprintf(stderr, "error: out of memory in str_from_bytes\n");
+    exit(1);
+  }
+  for (size_t i = 0; i < len; i++) p[i] = (char)data[lo + (long long)i];
+  p[len] = 0;
+  g_last_len = (long long)len;
+  return p;
+}
+
+/* `str_from_bytes` over an [i8]: the elements are already bytes, so this is a
+   straight memcpy rather than a narrowing loop. */
+/* Write arr[lo..hi] straight to stdout. `puts(str_from_bytes(...))` has to
+   materialize a str first, which is one allocation per line of output; this is
+   the same write with none. */
+void lu_put_i8(const char *arr, long long lo, long long hi) {
+  long long n = ((const long long *)arr)[0];
+  if (lo < 0 || hi < lo || hi > n) {
+    fprintf(stderr,
+            "error: putbytes range %lld..%lld out of bounds (length %lld)\n",
+            lo, hi, n);
+    exit(1);
+  }
+  fwrite(arr + 16 + lo, 1, (size_t)(hi - lo), stdout);
+}
+
+void lu_put_bytes(const char *arr, long long lo, long long hi) {
+  long long n = ((const long long *)arr)[0];
+  if (lo < 0 || hi < lo || hi > n) {
+    fprintf(stderr,
+            "error: putbytes range %lld..%lld out of bounds (length %lld)\n",
+            lo, hi, n);
+    exit(1);
+  }
+  const long long *data = (const long long *)(arr + 16);
+  /* Narrow into a block and write once; a putchar per element is an order of
+     magnitude slower for large spans. */
+  char block[4096];
+  long long i = lo;
+  while (i < hi) {
+    size_t k = 0;
+    while (i < hi && k < sizeof block) block[k++] = (char)data[i++];
+    fwrite(block, 1, k, stdout);
+  }
+}
+
+const char *lu_str_from_i8(const char *arr, long long lo, long long hi) {
+  long long n = ((const long long *)arr)[0];
+  if (lo < 0 || hi < lo || hi > n) {
+    fprintf(stderr,
+            "error: str_from_bytes range %lld..%lld out of bounds (length %lld)\n",
+            lo, hi, n);
+    exit(1);
+  }
+  size_t len = (size_t)(hi - lo);
+  char *p = malloc(len + 1);
+  if (!p) {
+    fprintf(stderr, "error: out of memory in str_from_bytes\n");
+    exit(1);
+  }
+  memcpy(p, arr + 16 + lo, len);
+  p[len] = 0;
+  g_last_len = (long long)len;
   return p;
 }
 

@@ -75,6 +75,86 @@ pub extern "C" fn lu_chr(c: i64) -> *const u8 {
     p
 }
 
+/// See `lu_str_from_bytes` in `src/lu_runtime.c` -- same contract, same layout
+/// assumption (length at offset 0, contiguous elements from offset 16).
+pub extern "C" fn lu_arr_new_i8(n: i64, init: i64) -> *mut u8 {
+    if n < 0 {
+        eprintln!("error: invalid array length {n}");
+        std::process::exit(1);
+    }
+    let bytes = n as usize;
+    let mut v = vec![0u8; 16 + bytes];
+    v[0..8].copy_from_slice(&n.to_le_bytes());
+    v[8..16].copy_from_slice(&(n).to_le_bytes());
+    if init as i8 != 0 {
+        for slot in &mut v[16..] {
+            *slot = init as u8;
+        }
+    }
+    let p = v.as_mut_ptr();
+    std::mem::forget(v);
+    p
+}
+
+pub extern "C" fn lu_put_i8(arr: *const u8, lo: i64, hi: i64) {
+    let n = unsafe { *(arr as *const i64) };
+    if lo < 0 || hi < lo || hi > n {
+        eprintln!("error: putbytes range {lo}..{hi} out of bounds (length {n})");
+        std::process::exit(1);
+    }
+    let src = unsafe { std::slice::from_raw_parts(arr.add(16 + lo as usize), (hi - lo) as usize) };
+    use std::io::Write as _;
+    std::io::stdout().write_all(src).ok();
+}
+
+pub extern "C" fn lu_put_bytes(arr: *const u8, lo: i64, hi: i64) {
+    let n = unsafe { *(arr as *const i64) };
+    if lo < 0 || hi < lo || hi > n {
+        eprintln!("error: putbytes range {lo}..{hi} out of bounds (length {n})");
+        std::process::exit(1);
+    }
+    let data = unsafe { arr.add(16) as *const i64 };
+    let mut out = Vec::with_capacity((hi - lo) as usize);
+    for i in lo..hi {
+        out.push(unsafe { *data.add(i as usize) } as u8);
+    }
+    use std::io::Write as _;
+    std::io::stdout().write_all(&out).ok();
+}
+
+pub extern "C" fn lu_str_from_i8(arr: *const u8, lo: i64, hi: i64) -> *const u8 {
+    let n = unsafe { *(arr as *const i64) };
+    if lo < 0 || hi < lo || hi > n {
+        eprintln!("error: str_from_bytes range {lo}..{hi} out of bounds (length {n})");
+        std::process::exit(1);
+    }
+    let len = (hi - lo) as usize;
+    let src = unsafe { std::slice::from_raw_parts(arr.add(16 + lo as usize), len) };
+    let bytes = src.to_vec();
+    unsafe { LAST_LEN = len as i64 };
+    let p = bytes.as_ptr();
+    std::mem::forget(bytes);
+    p
+}
+
+pub extern "C" fn lu_str_from_bytes(arr: *const u8, lo: i64, hi: i64) -> *const u8 {
+    let n = unsafe { *(arr as *const i64) };
+    if lo < 0 || hi < lo || hi > n {
+        eprintln!("error: str_from_bytes range {lo}..{hi} out of bounds (length {n})");
+        std::process::exit(1);
+    }
+    let data = unsafe { (arr.add(16)) as *const i64 };
+    let len = (hi - lo) as usize;
+    let mut bytes = Vec::with_capacity(len);
+    for i in 0..len {
+        bytes.push(unsafe { *data.add(lo as usize + i) } as u8);
+    }
+    unsafe { LAST_LEN = len as i64 };
+    let p = bytes.as_ptr();
+    std::mem::forget(bytes);
+    p
+}
+
 pub extern "C" fn lu_concat(ap: *const u8, al: i64, bp: *const u8, bl: i64) -> *const u8 {
     let a = unsafe { std::slice::from_raw_parts(ap, al as usize) };
     let b = unsafe { std::slice::from_raw_parts(bp, bl as usize) };
