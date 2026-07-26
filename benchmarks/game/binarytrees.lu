@@ -23,19 +23,9 @@ fn parse_int(s: str): i64 {
   return acc
 }
 
-fn shift_left(v: i64, k: i64): i64 {
-  var out = v
-  var i = 0
-  while i < k {
-    out = out * 2
-    i = i + 1
-  }
-  return out
-}
-
 // Nodes needed for a perfect tree of the given depth: 2^(depth+1) - 1.
 fn tree_nodes(depth: i64): i64 {
-  return shift_left(1, depth + 1) - 1
+  return (1 << (depth + 1)) - 1
 }
 
 // Bump-allocate a perfect tree of `depth`, returning its root index.
@@ -93,7 +83,7 @@ main {
 
   var depth = min_depth
   while depth <= max_depth {
-    let iterations = shift_left(1, max_depth - depth + min_depth)
+    let iterations = 1 << (max_depth - depth + min_depth)
     var check = 0
     var i = 0
     while i < iterations {

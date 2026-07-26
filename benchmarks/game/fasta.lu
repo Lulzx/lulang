@@ -1,0 +1,154 @@
+// The Computer Language Benchmarks Game — fasta
+//   https://benchmarksgame-team.pages.debian.net/benchmarksgame/description/fasta.html
+//
+// Generate three FASTA sections: the ALU sequence repeated to 2N bases, then
+// 3N and 5N bases drawn from two weighted alphabets by a linear congruential
+// generator. Lines are 60 characters.
+//
+//   lu build benchmarks/game/fasta.lu && ./fasta 25000000
+//
+// Output is ~250 MB at the official N, so it is written through an `[i8]`
+// byte buffer and `putbytes`, which fwrites the span directly -- no str is
+// materialized and nothing is allocated per line.
+
+fn parse_int(s: str): i64 {
+  var acc = 0
+  var i = 0
+  while i < len(s) {
+    let d = s[i] - '0'
+    if d >= 0 and d <= 9 { acc = acc * 10 + d }
+    i = i + 1
+  }
+  return acc
+}
+
+fn line_width(): i64 { return 60 }
+
+// Emit whole lines out of `buf`, which holds `n` pending bytes, and return the
+// number of bytes left over (always < 60, moved to the front).
+fn flush_lines(inout buf: [i8], n: i64): i64 {
+  var start = 0
+  while n - start >= line_width() {
+    putbytes(buf, start, start + line_width())
+    putnl()
+    start = start + line_width()
+  }
+  var rest = 0
+  while start + rest < n {
+    buf[rest] = buf[start + rest]
+    rest = rest + 1
+  }
+  return rest
+}
+
+// ---- section 1: the ALU sequence, repeated ------------------------------
+
+fn repeat_fasta(alu: str, total: i64) {
+  let width = line_width()
+  var buf = arr(width * 1024, i8(0))
+  var pending = 0
+  var pos = 0
+  var written = 0
+  while written < total {
+    buf[pending] = i8(alu[pos])
+    pending = pending + 1
+    pos = pos + 1
+    if pos == len(alu) { pos = 0 }
+    written = written + 1
+    if pending == width * 1024 { pending = flush_lines(buf, pending) }
+  }
+  if pending > 0 {
+    putbytes(buf, 0, pending)
+    putnl()
+  }
+}
+
+// ---- sections 2 and 3: weighted random ----------------------------------
+
+fn next_seed(seed: i64): i64 { return (seed * 3877 + 29573) % 139968 }
+
+// `chars` and `cumulative` describe the weighted alphabet. The threshold test
+// is done in f64 exactly as the reference does it (`r < cumulative[i]` with
+// `r = seed / 139968`); scaling it to integers changes which side of a
+// non-integral threshold a seed falls on, and the output stops matching.
+fn random_fasta(chars: [i64], cumulative: [f64], total: i64, seed_in: i64): i64 {
+  let width = line_width()
+  var buf = arr(width * 1024, i8(0))
+  var pending = 0
+  var seed = seed_in
+  var written = 0
+  while written < total {
+    seed = next_seed(seed)
+    let r = float(seed) / 139968.0
+    var k = 0
+    while k < len(cumulative) - 1 and r >= cumulative[k] { k = k + 1 }
+    buf[pending] = i8(chars[k])
+    pending = pending + 1
+    written = written + 1
+    if pending == width * 1024 { pending = flush_lines(buf, pending) }
+  }
+  if pending > 0 {
+    putbytes(buf, 0, pending)
+    putnl()
+  }
+  return seed
+}
+
+// Running sum of the probability table, exactly as the reference accumulates
+// it, so the thresholds are bit-for-bit the same doubles.
+fn cumulate(probs: [f64], n: i64): [f64] {
+  var out = arr(n, 0.0)
+  var acc = 0.0
+  for i in 0..n {
+    acc = acc + probs[i]
+    out[i] = acc
+  }
+  return out
+}
+
+main {
+  var n = 1000
+  if nargs() > 0 { n = parse_int(arg(0)) }
+
+  let alu = concat(concat(concat(
+    "GGCCGGGCGCGGTGGCTCACGCCTGTAATCCCAGCACTTTGGGAGGCCGAGGCGGGCGGA",
+    "TCACCTGAGGTCAGGAGTTCGAGACCAGCCTGGCCAACATGGTGAAACCCCGTCTCTACT"),
+    concat(
+    "AAAAATACAAAAATTAGCCGGGCGTGGTGGCGCGCGCCTGTAATCCCAGCTACTCGGGAG",
+    "GCTGAGGCAGGAGAATCGCTTGAACCCGGGAGGCGGAGGTTGCAGTGAGCCGAGATCGCG")),
+    concat(
+    "CCACTGCACTCCAGCCTGGGCGACAGAGCGAGACTCCGTCTCAAAAA", ""))
+
+  puts(">ONE Homo sapiens alu")
+  putnl()
+  repeat_fasta(alu, n * 2)
+
+  var iub_chars = arr(15, 0)
+  iub_chars[0] = 'a'   iub_chars[1] = 'c'   iub_chars[2] = 'g'
+  iub_chars[3] = 't'   iub_chars[4] = 'B'   iub_chars[5] = 'D'
+  iub_chars[6] = 'H'   iub_chars[7] = 'K'   iub_chars[8] = 'M'
+  iub_chars[9] = 'N'   iub_chars[10] = 'R'  iub_chars[11] = 'S'
+  iub_chars[12] = 'V'  iub_chars[13] = 'W'  iub_chars[14] = 'Y'
+  var iub_probs = arr(15, 0.02)
+  iub_probs[0] = 0.27  iub_probs[1] = 0.12  iub_probs[2] = 0.12
+  iub_probs[3] = 0.27
+  let iub = cumulate(iub_probs, 15)
+
+  var homo_chars = arr(4, 0)
+  homo_chars[0] = 'a'  homo_chars[1] = 'c'
+  homo_chars[2] = 'g'  homo_chars[3] = 't'
+  var homo_probs = arr(4, 0.0)
+  homo_probs[0] = 0.3029549426680
+  homo_probs[1] = 0.1979883004921
+  homo_probs[2] = 0.1975473066391
+  homo_probs[3] = 0.3015094502008
+  let homo = cumulate(homo_probs, 4)
+
+  puts(">TWO IUB ambiguity codes")
+  putnl()
+  let seed = random_fasta(iub_chars, iub, n * 3, 42)
+
+  puts(">THREE Homo sapiens frequency")
+  putnl()
+  let _final = random_fasta(homo_chars, homo, n * 5, seed)
+}

@@ -10,3 +10,11 @@ c/fannkuchredux
 c/mandelbrot
 c/binarytrees
 c/*-ffm
+fasta
+revcomp
+knucleotide
+c/fasta
+c/revcomp
+c/knucleotide
+input-*.fasta
+baselines.json

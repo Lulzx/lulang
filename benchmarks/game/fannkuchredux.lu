@@ -6,9 +6,6 @@
 // flip count.
 //
 //   lu build benchmarks/game/fannkuchredux.lu && ./fannkuchredux 12
-//
-// The language has no `break`, so the permutation-advance loop below carries
-// explicit `advanced` / `done` flags instead of breaking out.
 
 fn parse_int(s: str): i64 {
   var acc = 0
@@ -70,25 +67,21 @@ main {
     permcount = permcount + 1
 
     // incremental generation of the next permutation
-    var advanced = false
-    while not advanced and not done {
+    while true {
       if r == n {
         done = true
-      } else {
-        let perm0 = perm1[0]
-        var i = 0
-        while i < r {
-          perm1[i] = perm1[i + 1]
-          i = i + 1
-        }
-        perm1[r] = perm0
-        count[r] = count[r] - 1
-        if count[r] > 0 {
-          advanced = true
-        } else {
-          r = r + 1
-        }
+        break
       }
+      let perm0 = perm1[0]
+      var i = 0
+      while i < r {
+        perm1[i] = perm1[i + 1]
+        i = i + 1
+      }
+      perm1[r] = perm0
+      count[r] = count[r] - 1
+      if count[r] > 0 { break }
+      r = r + 1
     }
   }
 

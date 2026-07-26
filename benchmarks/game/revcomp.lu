@@ -1,0 +1,93 @@
+// The Computer Language Benchmarks Game — reverse-complement
+//   https://benchmarksgame-team.pages.debian.net/benchmarksgame/description/revcomp.html
+//
+// Read FASTA on stdin, and for each sequence write the reverse complement,
+// 60 characters per line. Headers pass through untouched.
+//
+//   ./fasta 25000000 > revcomp-input.txt
+//   lu build benchmarks/game/revcomp.lu && ./revcomp revcomp-input.txt
+//
+// The language has no stdin builtin, so the input path is an argument and the
+// file is read with `read_file`. That is the same work the reference does with
+// a single slurping read.
+//
+// The sequence buffer is `[i8]`, one byte per base, matching the C twin's
+// `char *`. With `[i64]` this program moved eight times the memory and ran at
+// half C's speed; the benchmark is bandwidth-bound, not compute-bound.
+
+fn line_width(): i64 { return 60 }
+
+// IUB complement table, indexed by byte. Built once.
+fn complement_table(): [i8] {
+  var t = arr(256, i8(0))
+  for i in 0..256 { t[i] = i8(i) }
+  let from = "ABCDGHKMNRSTVWYabcdghkmnrstvwy"
+  let to = "TVGHCDMKNYSABWRTVGHCDMKNYSABWR"
+  for i in 0..len(from) {
+    t[from[i]] = i8(to[i])
+    // lower-case inputs complement to the same upper-case letters
+  }
+  return t
+}
+
+// Reverse-complement seq[lo..hi] in place, then emit it in 60-byte lines.
+fn emit_revcomp(inout seq: [i8], lo: i64, hi: i64, table: [i8]) {
+  var i = lo
+  var j = hi - 1
+  while i < j {
+    let a = table[int(seq[i])]
+    let b = table[int(seq[j])]
+    seq[i] = b
+    seq[j] = a
+    i = i + 1
+    j = j - 1
+  }
+  if i == j { seq[i] = table[int(seq[i])] }
+
+  var start = lo
+  while start < hi {
+    var stop = start + line_width()
+    if stop > hi { stop = hi }
+    putbytes(seq, start, stop)
+    putnl()
+    start = stop
+  }
+}
+
+main {
+  if nargs() == 0 {
+    puts("usage: revcomp <fasta-file>")
+    putnl()
+    return
+  }
+  let text = read_file(arg(0))
+  let n = len(text)
+  let table = complement_table()
+
+  // Copy the payload into a mutable byte buffer, remembering where each
+  // sequence starts and ends. Header lines are emitted as they are seen.
+  var seq = arr(n, i8(0))
+  var count = 0
+  var seq_start = 0
+  var i = 0
+  while i < n {
+    if text[i] == '>' {
+      if count > seq_start { emit_revcomp(seq, seq_start, count, table) }
+      var j = i
+      while j < n and text[j] != '\n' { j = j + 1 }
+      puts(substr(text, i, j))
+      putnl()
+      i = j + 1
+      seq_start = count
+    } else {
+      var j = i
+      while j < n and text[j] != '\n' {
+        seq[count] = i8(text[j])
+        count = count + 1
+        j = j + 1
+      }
+      i = j + 1
+    }
+  }
+  if count > seq_start { emit_revcomp(seq, seq_start, count, table) }
+}

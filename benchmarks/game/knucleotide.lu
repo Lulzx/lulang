@@ -1,0 +1,235 @@
+// The Computer Language Benchmarks Game — k-nucleotide
+//   https://benchmarksgame-team.pages.debian.net/benchmarksgame/description/knucleotide.html
+//
+// Read the THREE section of a FASTA file, then report 1- and 2-nucleotide
+// frequencies and the counts of six specific fragments.
+//
+//   ./fasta 25000000 > knucleotide-input.txt
+//   lu build benchmarks/game/knucleotide.lu && ./knucleotide knucleotide-input.txt
+//
+// The language has no map type, so this is an open-addressed hash table over
+// parallel `[i64]` arrays. Each k-mer is packed two bits per base into one
+// i64 key, which is exact for the k <= 18 the benchmark asks for. The
+// sequence itself is `[i8]` -- one byte per base, like the C twin's
+// `signed char *`.
+
+fn line_width(): i64 { return 60 }
+
+// a c g t -> 0 1 2 3
+fn code_of(b: i64): i64 {
+  if b == 'a' or b == 'A' { return 0 }
+  if b == 'c' or b == 'C' { return 1 }
+  if b == 'g' or b == 'G' { return 2 }
+  return 3
+}
+
+fn base_of(code: i64): i64 {
+  if code == 0 { return 'A' }
+  if code == 1 { return 'C' }
+  if code == 2 { return 'G' }
+  return 'T'
+}
+
+// ---- open-addressed table: key -> count ---------------------------------
+//
+// `slot_key` holds the packed k-mer and `slot_count` its tally; a count of 0
+// means the slot is free, so no separate occupancy array is needed (key 0 is
+// the legitimate k-mer "AAA…", but its count is never 0 once inserted).
+
+// Distinct k-mers are bounded both by the key space (4^k) and by the number of
+// windows in the sequence (n). Sizing off 4^k alone overflows for large k and,
+// worse, a table that fills completely makes the linear probe spin forever.
+fn table_capacity(k: i64, n: i64): i64 {
+  var space = 1
+  var i = 0
+  var capped = false
+  while i < k and not capped {
+    space = space * 4
+    if space > n { capped = true }
+    i = i + 1
+  }
+  var want = n
+  if space < want { want = space }
+  var cap = 16
+  while cap < want * 2 { cap = cap * 2 }
+  return cap
+}
+
+fn mix(key: i64, cap: i64): i64 {
+  // Multiplicative scatter. The language has no shifts or xor, so this is a
+  // plain wrapping multiply folded into the capacity. `%` can be negative when
+  // the multiply wraps past i64::MIN, hence the correction.
+  var h = key * 2654435761 % cap
+  if h < 0 { h = h + cap }
+  return h
+}
+
+fn table_bump(inout slot_key: [i64], inout slot_count: [i64], cap: i64, key: i64) {
+  var i = mix(key, cap)
+  while slot_count[i] != 0 and slot_key[i] != key {
+    i = i + 1
+    if i == cap { i = 0 }
+  }
+  slot_key[i] = key
+  slot_count[i] = slot_count[i] + 1
+}
+
+fn table_get(slot_key: [i64], slot_count: [i64], cap: i64, key: i64): i64 {
+  var i = mix(key, cap)
+  while slot_count[i] != 0 {
+    if slot_key[i] == key { return slot_count[i] }
+    i = i + 1
+    if i == cap { i = 0 }
+  }
+  return 0
+}
+
+// ---- counting ------------------------------------------------------------
+
+fn pack(seq: [i8], start: i64, k: i64): i64 {
+  var key = 0
+  for i in 0..k { key = key * 4 + seq[start + i] }
+  return key
+}
+
+fn unpack(key: i64, k: i64): str {
+  var out = arr(k, 0)
+  var rest = key
+  var i = k - 1
+  while i >= 0 {
+    out[i] = base_of(rest % 4)
+    rest = rest / 4
+    i = i - 1
+  }
+  return str_from_bytes(out, 0, k)
+}
+
+// ---- fixed-decimal percentage (C `%.3f`) --------------------------------
+
+fn put_pct(count: i64, total: i64) {
+  let scaled = int(floor(float(count) * 100000.0 / float(total) + 0.5))
+  puti(scaled / 1000)
+  puts(".")
+  let frac = scaled % 1000
+  puti(frac / 100 % 10)
+  puti(frac / 10 % 10)
+  puti(frac % 10)
+}
+
+// Print every k-mer of length k, sorted by descending count then by name.
+fn report_frequencies(seq: [i8], n: i64, k: i64) {
+  let cap = table_capacity(k, n)
+  var slot_key = arr(cap, 0)
+  var slot_count = arr(cap, 0)
+
+  var i = 0
+  while i + k <= n {
+    table_bump(slot_key, slot_count, cap, pack(seq, i, k))
+    i = i + 1
+  }
+
+  // collect the occupied slots
+  var keys = arr(cap, 0)
+  var counts = arr(cap, 0)
+  var m = 0
+  var s = 0
+  while s < cap {
+    if slot_count[s] != 0 {
+      keys[m] = slot_key[s]
+      counts[m] = slot_count[s]
+      m = m + 1
+    }
+    s = s + 1
+  }
+
+  // insertion sort: descending count, then ascending key (which is the same
+  // as ascending name, since the packing is big-endian in base 4)
+  var a = 1
+  while a < m {
+    let ck = keys[a]
+    let cc = counts[a]
+    var b = a - 1
+    while b >= 0 and (counts[b] < cc or (counts[b] == cc and keys[b] > ck)) {
+      keys[b + 1] = keys[b]
+      counts[b + 1] = counts[b]
+      b = b - 1
+    }
+    keys[b + 1] = ck
+    counts[b + 1] = cc
+    a = a + 1
+  }
+
+  let total = n - k + 1
+  var r = 0
+  while r < m {
+    puts(unpack(keys[r], k))
+    puts(" ")
+    put_pct(counts[r], total)
+    putnl()
+    r = r + 1
+  }
+  putnl()
+}
+
+fn report_count(seq: [i8], n: i64, fragment: str) {
+  let k = len(fragment)
+  let cap = table_capacity(k, n)
+  var slot_key = arr(cap, 0)
+  var slot_count = arr(cap, 0)
+
+  var i = 0
+  while i + k <= n {
+    table_bump(slot_key, slot_count, cap, pack(seq, i, k))
+    i = i + 1
+  }
+
+  var key = 0
+  for j in 0..k { key = key * 4 + code_of(fragment[j]) }
+  puti(table_get(slot_key, slot_count, cap, key))
+  puts("\t")
+  puts(fragment)
+  putnl()
+}
+
+main {
+  if nargs() == 0 {
+    puts("usage: knucleotide <fasta-file>")
+    putnl()
+    return
+  }
+  let text = read_file(arg(0))
+  let n = len(text)
+
+  // skip to the THREE section, then read its bases as 2-bit codes
+  var i = 0
+  var found = false
+  while i < n and not found {
+    if text[i] == '>' and i + 6 <= n and substr(text, i, i + 6) == ">THREE" {
+      found = true
+      while i < n and text[i] != '\n' { i = i + 1 }
+      i = i + 1
+    } else {
+      while i < n and text[i] != '\n' { i = i + 1 }
+      i = i + 1
+    }
+  }
+
+  var seq = arr(n, i8(0))
+  var count = 0
+  while i < n {
+    let b = text[i]
+    if b != '\n' {
+      seq[count] = i8(code_of(b))
+      count = count + 1
+    }
+    i = i + 1
+  }
+
+  report_frequencies(seq, count, 1)
+  report_frequencies(seq, count, 2)
+  report_count(seq, count, "GGT")
+  report_count(seq, count, "GGTA")
+  report_count(seq, count, "GGTATT")
+  report_count(seq, count, "GGTATTTTAATT")
+  report_count(seq, count, "GGTATTTTAATTTATAGT")
+}

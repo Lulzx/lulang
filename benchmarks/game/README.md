@@ -14,9 +14,19 @@ language rather than a different algorithm.
 | [fannkuch-redux](fannkuchredux.lu) | 12 | reference-exact output |
 | [mandelbrot](mandelbrot.lu) | 16 000 | byte-identical to the C reference |
 | [binary-trees](binarytrees.lu) | 21 | reference-exact output |
+| [fasta](fasta.lu) | 25 000 000 | byte-identical to the C reference |
+| [reverse-complement](revcomp.lu) | 25 000 000 | byte-identical to the C reference |
+| [k-nucleotide](knucleotide.lu) | 2 500 000 | reference-exact output |
 
-The other five Benchmarks Game programs are **not** implemented; see
+Two Benchmarks Game programs are **not** implemented; see
 [Not implemented](#not-implemented) for why.
+
+`revcomp` and `knucleotide` read a FASTA file produced by our own `fasta`, as
+the benchmark specifies. The language has no stdin builtin, so both take the
+path as an argument instead of reading a pipe; the C twins do the same, so the
+comparison is unaffected. `knucleotide` runs at a reduced N because an exact
+count of every distinct 18-mer over 125 M bases needs a multi-gigabyte table in
+either language; 2 500 000 keeps it honest and comparable.
 
 ## Running
 
@@ -36,6 +46,21 @@ Variants measured:
 - `lulang-jit` — `lu run` (Cranelift, includes compile time in the process)
 - `c-O3` — `clang -O3 -march=native`
 - `c-O3-fastmath` — same plus `-ffast-math`
+
+The C twins do not change between lulang iterations, so their timings are
+cached in `baselines.json`, keyed by program, N, variant, and a hash of the
+binary. A recompiled or edited twin re-times itself automatically. Pass
+`--refresh-baseline` to force a re-measure — worth doing whenever the machine
+may have shifted, because the C column is what makes a lulang delta readable as
+signal rather than drift.
+
+Variants are timed **round-robin** (run 1 of each, then run 2 of each), not one
+variant's repeats at a time. This matters more than it sounds: with sequential
+repeats, a thermal ramp lands entirely on whichever variant went first, and
+fannkuch-redux read 0.92× that way against 0.98–0.99× interleaved on the same
+binaries. Several apparent regressions in this file's history were exactly
+that; mandelbrot likewise read 0.92× on one run and 0.99× on a re-measure, with
+C moving 4% on identical code in between.
 
 `c-O3-fastmath` is the honest baseline for the floating-point programs, because
 lulang's approximate-FP contract is a *language* rule, not a compiler flag: the
@@ -70,25 +95,28 @@ a mismatch. Full record in `results.json`.
 
 | program | N | lulang AOT | C -O3 | C -O3 -ffast-math | lulang vs C -O3 |
 | --- | --- | --- | --- | --- | --- |
-| n-body | 50 000 000 | 1.688s | 1.987s | 1.841s | **1.18×** |
-| spectral-norm | 5 500 | 0.665s | 1.026s | 0.620s | **1.54×** |
-| fannkuch-redux | 12 | 23.050s | 22.509s | 22.906s | 0.98× |
-| mandelbrot | 16 000 | 8.566s | 8.960s | 8.135s | 1.05× |
-| binary-trees | 21 | 1.191s | 1.313s | 1.306s | 1.10× |
+| spectral-norm | 5 500 | 0.746s | 1.183s | 0.732s | **1.59×** |
+| n-body | 50 000 000 | 1.883s | 2.381s | 2.314s | **1.26×** |
+| fasta | 25 000 000 | 2.644s | 3.121s | 2.896s | **1.18×** |
+| binary-trees | 21 | 1.570s | 1.722s | 1.675s | **1.10×** |
+| mandelbrot | 16 000 | 11.043s | 10.969s | 10.391s | 0.99× |
+| fannkuch-redux | 12 | 29.091s | 28.437s | 28.328s | 0.98× |
+| reverse-complement | 25 000 000 | 0.687s | 0.580s | 0.584s | 0.84× |
+| k-nucleotide | 2 500 000 | 1.659s | 1.238s | 1.198s | 0.75× |
 
-(Ratios above 1.00× mean lulang is faster.)
+Four wins, two ties, two losses. Both losses are analysed below.
 
 **This does not reproduce the 2.08× geomean in the top-level README.** That
 figure comes from the dot/slerp corpus, which is pure vectorizable reduction
 code over `f64` arrays — the shape lulang is built for. The Benchmarks Game
 programs are branch-heavy, integer-heavy, and output-heavy, and on them lulang
-lands between 0.98× and 1.54× of straightforward C. Both numbers are real; they
+lands between 0.75× and 1.59× of straightforward C. Both numbers are real; they
 measure different workloads, and the repo's headline claim should be read as
 scoped to the corpus it was measured on.
 
 Writing these programs surfaced two real compiler bugs — one of them a
-**wrong-answer** bug — plus one missed optimisation, all since fixed. Earlier
-revisions of this table (0.73×–1.10×, then 0.74×–1.33×, then 0.97×–1.57×) are
+**wrong-answer** bug — three missed optimisations, and five missing language
+features, all since addressed. Earlier revisions of this table (0.73×–1.10×, then 0.74×–1.33×, then 0.97×–1.57×) are
 preserved in the sections below so the effect of each change is visible.
 
 ### Fixed: integer division was an out-of-line call
@@ -221,28 +249,90 @@ The self-hosted compiler (`selfhost/codegen.lu`) emits the same metadata — the
 `selfhost_sync` test compares host and self-hosted IR byte-for-byte and caught
 the drift immediately.
 
-## What the language made awkward
+### Added: `str_from_bytes`, the language's first linear string builder
 
-These are real findings from writing the programs, not complaints — each one is
-a place where the benchmark had to be shaped around a missing feature.
+The three string programs were previously listed here as not implementable.
+`concat` copies both operands, so building output a byte at a time was
+quadratic, and there was no way at all to turn a computed byte buffer into a
+`str`. `str_from_bytes(a: [i64], lo, hi): str` takes the low byte of each
+element in one allocation and one pass. It is checked on both ends and
+implemented in all three tiers.
 
-**No bitwise operators.** `mandelbrot` packs one bit per pixel and
-`binary-trees` needs `1 << k`. Both are written arithmetically: `byte * 2 + bit`
-to shift left, and a multiply loop for `1 << k`. The mandelbrot inner loop is
-unaffected (the packing is not hot), but `shift_left` is a loop where every
-other language has one instruction.
+That unblocked fasta, reverse-complement, and k-nucleotide, and fasta now beats
+its C twin (1.15×) despite writing 250 MB.
+
+### Fixed: `calloc` for zero-initialized arrays, inline divide for variable divisors
+
+Profiling k-nucleotide found two more.
+
+`arr(n, 0)` allocated with `malloc` and then ran a scalar fill loop, so a
+268 MB hash table was eagerly written before a single lookup — where the C
+twin's `calloc` gets lazily-zeroed pages from the OS. `lu_arr_new_i64` and
+`lu_arr_new_f64` now take a `calloc` path when the initializer is zero. `-0.0`
+still takes the fill path, since its bits are not all zero.
+
+The constant-divisor fix further up left every *variable* divisor still calling
+`@lu_i64_rem` — which is exactly what `key * 2654435761 % cap` does on every
+hash probe. The two trapping cases are now guarded inline and the division is a
+real `sdiv`/`srem`; the trap edge calls the same helper, so diagnostics are
+unchanged. `selfhost/codegen.lu` emits byte-identical IR for both paths.
+
+Together these took k-nucleotide from 0.55s to 0.47s at N=1 000 000.
+
+## Language features this exercise added
+
+Writing these programs turned up five things the language could not express, or
+could only express quadratically. All five are now in, across the interpreter,
+the Cranelift JIT, and the LLVM AOT tier.
+
+**`str_from_bytes(a, lo, hi): str` and `putbytes(a, lo, hi)`.** `concat` copies
+both operands, so accumulating output a byte at a time was quadratic, and there
+was no way at all to turn a computed byte buffer into output. `str_from_bytes`
+builds a str in one allocation and one pass; `putbytes` writes the span
+straight to stdout with no allocation at all, which is what fasta and
+reverse-complement use (one `fwrite` per line instead of one malloc per line).
+Both accept `[i64]` or `[i8]` and are bounds-checked.
+
+**`i8`.** A one-byte storage type. It widens to `i64` in every arithmetic,
+comparison, and `sum` context and narrows only through the explicit `i8(x)`, so
+it behaves like the existing `f32`→`f64` promotion. Arrays store one byte per
+element — 100 M elements take 192 MB as `[i8]` against 1527 MB as `[i64]`.
+
+  It is deliberately **not** allowed in records or across the C boundary yet:
+  record arrays allocate through `lu_arr_new_raw`, whose layout ABI only knows
+  4- and 8-byte components, and widening that reaches the SoA planes, the ABI
+  manifests, and the generated headers. Both cases are rejected with an
+  explicit error rather than silently miscompiled.
+
+**`break` and `continue`.** Previously every early exit was a hand-rolled
+`done`/`advanced` flag pair. `continue` in a `for` targets a dedicated latch
+block so the index still advances; using the condition head would have made it
+an infinite loop. Both are rejected outside a loop.
+
+**Bitwise `& | ^ << >>`.** i64-only, `>>` is arithmetic, and shift counts are
+masked to 0..63 so an out-of-range shift is defined rather than LLVM poison.
+Precedence is `|` < `^` < `&` < shifts < additive < multiplicative, so bitwise
+binds *tighter* than comparison — the Rust order, not C's famous footgun where
+`a & b == c` parses as `a & (b == c)`. Verified against Python for both values
+and grouping.
+
+mandelbrot now packs bits with `(byte << 1) | bit`, binary-trees uses
+`1 << k` instead of a multiply loop, and fannkuch-redux's permutation advance
+is a plain `break` instead of two flags.
+
+## What the language still makes awkward
 
 **No indexed field assignment.** `bodies[i].vx = …` is rejected — "field
 assignment root must be a variable". n-body therefore uses parallel arrays.
-That happens to be the layout the compiler wants anyway, so the program is not
-worse for it, but the natural array-of-records spelling is unavailable. Nested
-indexed assignment (`grid[i][j] = …`) is rejected for the same reason, so 2-D
-data needs flat arrays and manual index arithmetic.
+That happens to be the layout the compiler wants anyway, but the natural
+array-of-records spelling is unavailable, and nested indexed assignment
+(`grid[i][j] = …`) is rejected for the same reason, so 2-D data needs flat
+arrays and manual index arithmetic.
 
-**No `break` or `continue`.** fannkuch-redux's permutation advance is a loop
-with an early exit in every other implementation; here it carries explicit
-`advanced` / `done` flags. binary-trees and mandelbrot needed the same
-treatment for their early-exit loops.
+**Indexing does not widen `i8`.** `table[seq[i]]` is a type error where
+`seq` is `[i8]`; it has to be written `table[int(seq[i])]`. Every other context
+widens i8 automatically. Threading the widening through the IR index path is
+the obvious follow-up.
 
 **No top-level constants.** `let N_BODIES = 5` at file scope is a parse error,
 so compile-time constants are written as zero-argument functions that inline
@@ -254,31 +344,57 @@ constants are transcribed in plain decimal form.
 **Newline-sensitive signatures.** A function signature cannot be split across
 lines; `fn energy(` followed by a newline fails to parse.
 
-**No string builder.** `concat` copies both operands, so accumulating output
-byte-by-byte is quadratic. mandelbrot writes each byte with `puts(chr(b))`
-instead, which is fine because stdout is C-buffered, but a program that must
-build a large string in memory has no linear way to do it. This is the single
-biggest gap, and it is what rules out three of the five missing programs.
+**No stdin.** reverse-complement and k-nucleotide take a file path instead of
+reading a pipe. The C twins do the same, so the comparison is unaffected.
 
 **Good news on `inout`.** Passing a large array `inout` through a recursive
 outlined call is O(1) — measured, not assumed — so binary-trees' arena
 recursion costs nothing extra. Value semantics did not force a copy anywhere in
-these five programs.
+these eight programs.
+
+## Where the two losses come from
+
+### reverse-complement (0.84×): mostly closed by `i8`
+
+This was the worst result in the table at **0.50×**, and the cause was not code
+generation: lulang's only integer array was `[i64]`, so each DNA base occupied
+8 bytes where the C twin used 1. The benchmark is memory-bandwidth-bound — read
+a 250 MB file, complement it in place, write it back — so lulang moved 8× the
+bytes and landed at half the speed. No optimiser pass could have reached it.
+
+Adding `i8` and `putbytes` took it to **0.84×**: 0.50× → 0.67× from the dense
+buffer, then → 0.84× from writing spans directly instead of building a str per
+line. What is left is the extra copy from the `read_file` str into the `[i8]`
+buffer, plus the per-access bounds checks the C twin does not have.
+
+### k-nucleotide (0.75×): bounds checks in the probe loop
+
+Both languages now store the sequence as one byte per base — `[i8]` against
+`signed char *` — so memory traffic matches and the gap is per-operation
+overhead.
+`table_bump`'s probe loop and `pack`'s inner loop index arrays through computed
+subscripts (`seq[start + i]`, `slot_count[i]`), which the existing
+`trusted`-range hoist does not recognise: it only handles arrays indexed
+directly by a `for`-range variable. So every access keeps a compare-and-branch
+the C twin does not have.
+
+Extending the hoist to affine indices (`start + i` where `start` is
+loop-invariant) is a real and general optimiser improvement, and is the obvious
+next step. It is not done here.
+
+Profiling this program is what found the `calloc` and variable-divisor wins
+below, which took it from 0.55s to 0.47s at N=1 000 000; the rest is the
+bounds checks.
 
 ## Not implemented
 
 | program | blocker |
 | --- | --- |
-| fasta | 25 MB of generated output with no linear string builder |
-| reverse-complement | same, plus in-place block reversal of a 25 MB buffer |
-| k-nucleotide | needs a hash map; would be a hand-rolled open-addressed table over `[i64]`, measuring our table rather than the language |
 | pidigits | needs arbitrary-precision integers; no 128-bit multiply and no bitwise ops makes a limb library slow and large |
 | regex-redux | needs a regex engine; every published entry links PCRE or equivalent |
 
-The last three would compare a library we wrote in lulang against C's GMP and
-PCRE, which is not a language comparison. The first two are blocked on the
-string-builder gap above and would become straightforward if lulang gained a
-growable byte buffer.
+Both would compare a library we wrote in lulang against C's GMP and PCRE, which
+is not a language comparison.
 
 ## Caveats on comparing with the published table
 

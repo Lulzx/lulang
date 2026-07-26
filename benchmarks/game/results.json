@@ -6,66 +6,94 @@
     "cpu_count": 12,
     "clang": "Apple clang version 21.0.0 (clang-2100.1.1.101)"
   },
-  "runs": 1,
+  "runs": 3,
   "results": [
     {
       "program": "nbody",
-      "n": "500000",
+      "n": "50000000",
       "agree": true,
-      "output_sha256": "7fee18aa4de449f07aa173bae7a37df103ff0317ed8055566e6f3c9358c09b2c",
+      "output_sha256": "3e6c9ef9d26cfe312a4cd8e1b81b3f671b88fbce84de543e8c23c206a942504d",
       "times": {
-        "lulang-aot": 0.4748130000079982,
-        "lulang-jit": 0.4751400420209393,
-        "c-O3": 0.43920491699827835,
-        "c-O3-fastmath": 0.4478888330049813
+        "lulang-aot": 1.882734665996395,
+        "c-O3": 2.380828583991388,
+        "c-O3-fastmath": 2.314009249996161
       }
     },
     {
       "program": "spectralnorm",
-      "n": "500",
+      "n": "5500",
       "agree": true,
-      "output_sha256": "8fdf61c16abc8435add5a81e7f774b75b689673474c916e8859ebe8f8a528277",
+      "output_sha256": "f9d5b5e3eb7657cf1bbba4cc856651864df9cd9fd9a6be9b9bc5fcbb67150deb",
       "times": {
-        "lulang-aot": 0.46965329098748043,
-        "lulang-jit": 0.017034417018294334,
-        "c-O3": 0.47746408300008625,
-        "c-O3-fastmath": 0.43414704099996015
+        "lulang-aot": 0.7459554999950342,
+        "c-O3": 1.1829718329827301,
+        "c-O3-fastmath": 0.7315525840094779
       }
     },
     {
       "program": "fannkuchredux",
-      "n": "9",
+      "n": "12",
       "agree": true,
-      "output_sha256": "8240a83dc671a1906b1f4ce51a46866362bec862c62128f4429ec1f3e7bf1bb8",
+      "output_sha256": "4265a65135c506a68d90d6474003fb9030b7ee244a06c046bd89b3932a28ce20",
       "times": {
-        "lulang-aot": 0.5155072920024395,
-        "lulang-jit": 0.1670149170095101,
-        "c-O3": 0.44231295798090287,
-        "c-O3-fastmath": 0.5120701249979902
+        "lulang-aot": 29.091370707988972,
+        "c-O3": 28.43687299999874,
+        "c-O3-fastmath": 28.32764945802046
       }
     },
     {
       "program": "mandelbrot",
-      "n": "1000",
+      "n": "16000",
       "agree": true,
-      "output_sha256": "227d5af646f69e966ecb8ac6fc65ef8b36ae9df2aa58623d10139b204cafddd8",
+      "output_sha256": "5de04b12e11bcfd32c505d582433075b26278566b551ef3ae15b1ce9007e7029",
       "times": {
-        "lulang-aot": 0.5372859589988366,
-        "lulang-jit": 0.09344075000262819,
-        "c-O3": 0.5201281670015305,
-        "c-O3-fastmath": 0.5109662910108455
+        "lulang-aot": 11.042974417010555,
+        "c-O3": 10.968753499997547,
+        "c-O3-fastmath": 10.390987749997294
       }
     },
     {
       "program": "binarytrees",
-      "n": "14",
+      "n": "21",
       "agree": true,
-      "output_sha256": "b0af3a8c1c6ccf57c7f99716bffd9c6f7365dac78fc307ef6c1903ba1a1b87a3",
+      "output_sha256": "341de11a51feab3d8122b4b5d6a68b038a2d14434aa9bc2372f39300bf5f48e1",
       "times": {
-        "lulang-aot": 0.42845066700829193,
-        "lulang-jit": 0.09415470800013281,
-        "c-O3": 0.4314735420048237,
-        "c-O3-fastmath": 0.428818082989892
+        "lulang-aot": 1.5699301660060883,
+        "c-O3": 1.7223848749999888,
+        "c-O3-fastmath": 1.6747375420236494
+      }
+    },
+    {
+      "program": "fasta",
+      "n": "25000000",
+      "agree": true,
+      "output_sha256": "d4ad09d634859412a69fb5c5721b19d6f3c2b81f32e276bab24b870e7fa980f0",
+      "times": {
+        "lulang-aot": 2.64419612500933,
+        "c-O3": 3.1208027499960735,
+        "c-O3-fastmath": 2.89563454099698
+      }
+    },
+    {
+      "program": "revcomp",
+      "n": "25000000",
+      "agree": true,
+      "output_sha256": "e5730d4fd55c464f276e5c6062c80f46e0a735281de15d8c957e2731a9baf70e",
+      "times": {
+        "lulang-aot": 0.6868872079940047,
+        "c-O3": 0.5803374999959487,
+        "c-O3-fastmath": 0.5842232500144746
+      }
+    },
+    {
+      "program": "knucleotide",
+      "n": "2500000",
+      "agree": true,
+      "output_sha256": "6db529a39e08a232e12dd59f3bc3c4edd6a4c3c8f5bb3bc6eb3ab7963709a00c",
+      "times": {
+        "lulang-aot": 1.6591599579842295,
+        "c-O3": 1.23805287500727,
+        "c-O3-fastmath": 1.197776957997121
       }
     }
   ]

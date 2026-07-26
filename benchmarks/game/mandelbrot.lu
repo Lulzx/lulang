@@ -6,9 +6,8 @@
 //
 //   lu build benchmarks/game/mandelbrot.lu && ./mandelbrot 16000 > out.pbm
 //
-// The language has no bitwise operators, so bits are packed arithmetically:
-// `byte = byte * 2 + bit` shifts left by one, and a short final byte in a row
-// is padded by multiplying by the remaining power of two.
+// Bits are packed with `<<` and `|`; a short final byte in a row is padded by
+// shifting left by the remaining count.
 
 fn parse_int(s: str): i64 {
   var acc = 0
@@ -21,34 +20,19 @@ fn parse_int(s: str): i64 {
   return acc
 }
 
-fn shift_left(v: i64, k: i64): i64 {
-  var out = v
-  var i = 0
-  while i < k {
-    out = out * 2
-    i = i + 1
-  }
-  return out
-}
-
 // 1 if c stays bounded through 50 iterations, 0 if it escapes
 fn in_set(cr: f64, ci: f64): i64 {
   var zr = 0.0
   var zi = 0.0
   var i = 0
-  var escaped = false
-  while i < 50 and not escaped {
+  while i < 50 {
     let zr2 = zr * zr
     let zi2 = zi * zi
-    if zr2 + zi2 > 4.0 {
-      escaped = true
-    } else {
-      zi = 2.0 * zr * zi + ci
-      zr = zr2 - zi2 + cr
-      i = i + 1
-    }
+    if zr2 + zi2 > 4.0 { return 0 }
+    zi = 2.0 * zr * zi + ci
+    zr = zr2 - zi2 + cr
+    i = i + 1
   }
-  if escaped { return 0 }
   return 1
 }
 
@@ -73,7 +57,7 @@ main {
     var nbits = 0
     for x in 0..w {
       let cr = 2.0 * float(x) / fw - 1.5
-      byte = byte * 2 + in_set(cr, ci)
+      byte = (byte << 1) | in_set(cr, ci)
       nbits = nbits + 1
       if nbits == 8 {
         puts(chr(byte))
@@ -83,7 +67,7 @@ main {
     }
     // pad a partial trailing byte with zero bits on the right
     if nbits > 0 {
-      puts(chr(shift_left(byte, 8 - nbits)))
+      puts(chr(byte << (8 - nbits)))
     }
   }
 }
