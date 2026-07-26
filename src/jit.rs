@@ -18,7 +18,9 @@ use crate::check::{resolve_type, Type as CType};
 use crate::ir::{self, BinaryOp, Callee, Constant, InstKind, LoweredProgram, Terminator, UnaryOp};
 use crate::runtime;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{
+    types, AbiParam, InstBuilder, InstructionData, MemFlags, Opcode, Value, ValueDef,
+};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -2022,7 +2024,31 @@ impl<'a, 'b> Gen<'a, 'b> {
         Ok((ret, self.b.inst_results(call).to_vec()))
     }
 
+    /// The i64 constant `v` was defined by, or `None` if it is not a literal.
+    fn const_i64(&self, v: Value) -> Option<i64> {
+        match self.b.func.dfg.value_def(v) {
+            ValueDef::Result(inst, _) => match self.b.func.dfg.insts[inst] {
+                InstructionData::UnaryImm {
+                    opcode: Opcode::Iconst,
+                    imm,
+                } => Some(imm.bits()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn checked_int_div(&mut self, lhs: Value, rhs: Value, remainder: bool) -> Value {
+        // See the matching comment in `emit_checked_int_div` (src/llvm.rs): a
+        // literal divisor that is neither 0 nor -1 can trip neither of the
+        // SPEC 3.1 traps, so the runtime helper is pure overhead there.
+        if self.const_i64(rhs).is_some_and(|d| d != 0 && d != -1) {
+            return if remainder {
+                self.b.ins().srem(lhs, rhs)
+            } else {
+                self.b.ins().sdiv(lhs, rhs)
+            };
+        }
         let name = if remainder {
             "lu_i64_rem"
         } else {

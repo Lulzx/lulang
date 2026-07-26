@@ -394,3 +394,50 @@ fn check_mode_validates_without_executing_main() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown variable"));
 }
+
+/// A literal divisor that is neither 0 nor -1 lowers to a plain `sdiv`/`srem`
+/// instead of a call into the runtime helper (the helper is an opaque
+/// cross-translation-unit call, so it blocked strength reduction and
+/// vectorization of any loop containing an integer divide). The results must
+/// stay identical to the helper's, including the sign rules and the
+/// `i64::MIN` edges.
+#[test]
+fn constant_divisors_match_the_runtime_helper() {
+    // `opaque` keeps the divisor out of reach of constant folding, so each
+    // pair compares the new inline path against the helper path.
+    let source = "\
+fn opaque(x: i64): i64 { return x }
+main {
+  print(7 / 2, 7 % 2, -7 / 2, -7 % 2, 7 / -2, 7 % -2, -7 / -2, -7 % -2)
+  print(7 / opaque(2), 7 % opaque(2), -7 / opaque(2), -7 % opaque(2), 7 / opaque(-2), 7 % opaque(-2), -7 / opaque(-2), -7 % opaque(-2))
+  print((-9223372036854775807 - 1) / 2, (-9223372036854775807 - 1) % 2)
+  print((-9223372036854775807 - 1) / opaque(2), (-9223372036854775807 - 1) % opaque(2))
+}
+";
+    let expected = b"3 1 -3 -1 -3 1 3 -1\n\
+3 1 -3 -1 -3 1 3 -1\n\
+-4611686018427387904 0\n\
+-4611686018427387904 0\n";
+    assert_modes(source, expected);
+}
+
+/// The traps from SPEC 3.1 must survive the inline-divide path: a zero
+/// divisor and `i64::MIN / -1` are both excluded from it and still abort.
+#[test]
+fn integer_division_traps_still_fire() {
+    for expr in [
+        "1 / 0",
+        "1 % 0",
+        "(-9223372036854775807 - 1) / -1",
+        "(-9223372036854775807 - 1) % -1",
+    ] {
+        let source = format!("main {{ print({expr}) }}\n");
+        for mode in ["interp", "run"] {
+            let output = run(mode, &source);
+            assert!(
+                !output.status.success(),
+                "{mode} accepted `{expr}` instead of trapping"
+            );
+        }
+    }
+}

@@ -2654,6 +2654,21 @@ impl<'a> Emit<'a> {
         remainder: bool,
     ) -> Result<EV, String> {
         let out = self.t();
+        // SPEC 3.1 makes integer `/` and `%` trap on a zero divisor and on
+        // `i64::MIN / -1`; the runtime helper implements both. A literal
+        // divisor that is neither 0 nor -1 can trigger neither trap, so the
+        // helper call is pure overhead there — and being an opaque call into
+        // another translation unit it also blocks strength reduction of the
+        // constant and vectorization of any loop containing the division.
+        // Emit the plain instruction in that provably-safe case.
+        if let Some(divisor) = rhs.parse::<i64>().ok().filter(|d| *d != 0 && *d != -1) {
+            let op = if remainder { "srem" } else { "sdiv" };
+            self.line(format!("{} = {} i64 {}, {}", out, op, lhs, divisor));
+            return Ok(EV {
+                ty: CType::I64,
+                regs: vec![out],
+            });
+        }
         let callee = if remainder {
             "lu_i64_rem"
         } else {
