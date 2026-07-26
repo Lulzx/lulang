@@ -759,3 +759,48 @@ main {
 ";
     assert_modes(source, b"-2 -3 99 99\n");
 }
+
+/// The trusted-range hoist recognises affine indices, not just an array
+/// indexed directly by the loop variable: `a[c + i]` and `a[i + c]`, where the
+/// loop never writes `c`, are checked once over `[lower+c, upper+c)` instead of
+/// once per element. The checks must still fire for every out-of-range case,
+/// including a negative offset and a range that runs off the end.
+#[test]
+fn affine_indices_hoist_their_bounds_check() {
+    let source = "\
+fn sum_at(a: [i64], start: i64, k: i64): i64 {
+  var acc = 0
+  for i in 0..k { acc = acc + a[start + i] }
+  return acc
+}
+fn sum_at2(a: [i64], start: i64, k: i64): i64 {
+  var acc = 0
+  for i in 0..k { acc = acc + a[i + start] }
+  return acc
+}
+main {
+  var a = arr(10, 0)
+  for i in 0..10 { a[i] = i }
+  print(sum_at(a, 0, 10), sum_at(a, 3, 4), sum_at2(a, 3, 4), sum_at(a, 9, 1))
+  print(sum_at(a, 0, 0), sum_at(a, 10, 0))
+}
+";
+    assert_modes(source, b"45 18 18 9\n0 0\n");
+
+    let prelude = "\
+fn sum_at(a: [i64], start: i64, k: i64): i64 { var acc = 0  for i in 0..k { acc = acc + a[start + i] }  return acc }
+fn sum_at2(a: [i64], start: i64, k: i64): i64 { var acc = 0  for i in 0..k { acc = acc + a[i + start] }  return acc }
+";
+    for call in [
+        "sum_at(a, 8, 5)",
+        "sum_at(a, -1, 3)",
+        "sum_at2(a, 8, 5)",
+        "sum_at(a, 5, 100)",
+    ] {
+        let bad = format!("{prelude}main {{ var a = arr(10, 0)  print({call}) }}\n");
+        for mode in ["interp", "run"] {
+            let output = run(mode, &bad);
+            assert!(!output.status.success(), "{mode} accepted `{call}`");
+        }
+    }
+}

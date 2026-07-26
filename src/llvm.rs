@@ -1676,22 +1676,43 @@ impl<'a> Emit<'a> {
         let lower = Self::ir_value(values, loop_info.lower)?.regs[0].clone();
         let upper = Self::ir_value(values, loop_info.upper)?.regs[0].clone();
         let arrays = loop_info.arrays.clone();
-        for array in arrays {
+        for (array, offset) in arrays {
             let ty = function.locals[array as usize].ty.clone();
             let CType::Arr(_) = ty else { continue };
             let base = self.load_var(&Self::ir_local(array))?.regs[0].clone();
             let logical = self.load_array_len(&base);
+            // `a[c + i]` is checked over the shifted range [lower+c, upper+c).
+            // `c` is re-loaded here rather than reusing the add's operand from
+            // the body, which is not in scope at the preheader.
+            let (lo, hi) = match offset {
+                None => (lower.clone(), upper.clone()),
+                Some(offset_local) => {
+                    let c = self.load_var(&Self::ir_local(offset_local))?.regs[0].clone();
+                    let lo = self.t();
+                    self.line(format!("{} = add i64 {}, {}", lo, lower, c));
+                    let hi = self.t();
+                    self.line(format!("{} = add i64 {}, {}", hi, upper, c));
+                    (lo, hi)
+                }
+            };
             let negative = self.t();
-            self.line(format!("{} = icmp slt i64 {}, 0", negative, lower));
+            self.line(format!("{} = icmp slt i64 {}, 0", negative, lo));
+            // A wrapped `upper + c` shows up as a negative bound; catching it
+            // here is what keeps the shifted check sound under wrapping i64
+            // addition.
+            let wrapped = self.t();
+            self.line(format!("{} = icmp slt i64 {}, 0", wrapped, hi));
             let over = self.t();
-            self.line(format!("{} = icmp sgt i64 {}, {}", over, upper, logical));
+            self.line(format!("{} = icmp sgt i64 {}, {}", over, hi, logical));
+            let bad0 = self.t();
+            self.line(format!("{} = or i1 {}, {}", bad0, negative, wrapped));
             let bad = self.t();
-            self.line(format!("{} = or i1 {}, {}", bad, negative, over));
+            self.line(format!("{} = or i1 {}, {}", bad, bad0, over));
             let fail = self.l();
             let ok = self.l();
             self.line(format!("br i1 {}, label %{}, label %{}", bad, fail, ok));
             self.label(&fail);
-            self.line(format!("call void @lu_oob(i64 {}, i64 {})", upper, logical));
+            self.line(format!("call void @lu_oob(i64 {}, i64 {})", hi, logical));
             self.line("unreachable".into());
             self.label(&ok);
             self.cfg_trusted.insert((loop_index, array), logical);

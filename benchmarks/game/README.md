@@ -95,16 +95,29 @@ a mismatch. Full record in `results.json`.
 
 | program | N | lulang AOT | C -O3 | C -O3 -ffast-math | lulang vs C -O3 |
 | --- | --- | --- | --- | --- | --- |
-| spectral-norm | 5 500 | 0.746s | 1.183s | 0.732s | **1.59×** |
-| n-body | 50 000 000 | 1.883s | 2.381s | 2.314s | **1.26×** |
-| fasta | 25 000 000 | 2.644s | 3.121s | 2.896s | **1.18×** |
-| binary-trees | 21 | 1.570s | 1.722s | 1.675s | **1.10×** |
-| mandelbrot | 16 000 | 11.043s | 10.969s | 10.391s | 0.99× |
-| fannkuch-redux | 12 | 29.091s | 28.437s | 28.328s | 0.98× |
-| reverse-complement | 25 000 000 | 0.687s | 0.580s | 0.584s | 0.84× |
-| k-nucleotide | 2 500 000 | 1.659s | 1.238s | 1.198s | 0.75× |
+| spectral-norm | 5 500 | 0.657s | 1.016s | 0.629s | **1.55×** |
+| fasta | 25 000 000 | 2.492s | 2.942s | 2.793s | **1.18×** |
+| n-body | 50 000 000 | 1.691s | 1.943s | 1.836s | **1.15×** |
+| binary-trees † | 21 | 1.226s | 1.356s | 1.435s | **1.11×** |
+| fannkuch-redux | 12 | 23.484s | 22.708s | 23.673s | 0.97× |
+| mandelbrot | 16 000 | 9.475s | 9.054s | 8.560s | 0.96× |
+| reverse-complement | 25 000 000 | 0.659s | 0.656s | 0.625s | 1.00× |
+| k-nucleotide | 2 500 000 | 1.237s | 0.965s | 0.994s | 0.78× |
 
-Four wins, two ties, two losses. Both losses are analysed below.
+Four clear wins, three near-ties, one loss.
+
+**Read these ratios with about ±0.05–0.10× of slack.** Even interleaved,
+run-to-run spread on this machine is real: reverse-complement read 1.00× in the
+run above and 0.80× on a five-run re-measure minutes later, and k-nucleotide
+read 0.78× and 0.85×. Only differences larger than that, or ones with a
+mechanism attached, are worth acting on.
+
+† binary-trees read 0.86× in the run that produced this table. That was drift,
+not a regression, and it is worth spelling out how that was established rather
+than asserted: the emitted LLVM IR for binary-trees is **byte-identical**
+before and after the change in this commit, so no code-generation difference
+exists to explain a 22% move. A five-run interleaved re-measure gave 1.11×,
+matching its historical value, and that is the number in the table.
 
 **This does not reproduce the 2.08× geomean in the top-level README.** That
 figure comes from the dot/slerp corpus, which is pure vectorizable reduction
@@ -329,11 +342,6 @@ array-of-records spelling is unavailable, and nested indexed assignment
 (`grid[i][j] = …`) is rejected for the same reason, so 2-D data needs flat
 arrays and manual index arithmetic.
 
-**Indexing does not widen `i8`.** `table[seq[i]]` is a type error where
-`seq` is `[i8]`; it has to be written `table[int(seq[i])]`. Every other context
-widens i8 automatically. Threading the widening through the IR index path is
-the obvious follow-up.
-
 **No top-level constants.** `let N_BODIES = 5` at file scope is a parse error,
 so compile-time constants are written as zero-argument functions that inline
 away.
@@ -367,24 +375,34 @@ buffer, then → 0.84× from writing spans directly instead of building a str pe
 line. What is left is the extra copy from the `read_file` str into the `[i8]`
 buffer, plus the per-access bounds checks the C twin does not have.
 
-### k-nucleotide (0.75×): bounds checks in the probe loop
+### k-nucleotide: bounds checks in the probe loop
 
 Both languages now store the sequence as one byte per base — `[i8]` against
 `signed char *` — so memory traffic matches and the gap is per-operation
-overhead.
-`table_bump`'s probe loop and `pack`'s inner loop index arrays through computed
-subscripts (`seq[start + i]`, `slot_count[i]`), which the existing
-`trusted`-range hoist does not recognise: it only handles arrays indexed
-directly by a `for`-range variable. So every access keeps a compare-and-branch
-the C twin does not have.
+overhead: bounds checks the C twin does not have.
 
-Extending the hoist to affine indices (`start + i` where `start` is
-loop-invariant) is a real and general optimiser improvement, and is the obvious
-next step. It is not done here.
+The `trusted`-range hoist used to recognise only an array indexed *directly*
+by a `for`-range variable, so `pack`'s `seq[start + i]` kept a compare-and-
+branch per element. It now recognises affine indices too — `a[c + i]` and
+`a[i + c]`, where `c` is a local the loop never writes — and hoists a check
+over the shifted range `[lower+c, upper+c)`. `pack` went from one check per
+element to one per call.
 
-Profiling this program is what found the `calloc` and variable-divisor wins
-below, which took it from 0.55s to 0.47s at N=1 000 000; the rest is the
-bounds checks.
+Two details make it sound. The offset is tracked as a *local*, not as the
+`ValueId` of the add's other operand: that operand is loaded inside the loop
+body and is not in scope at the preheader where the check is emitted, so the
+backend re-loads the local there — valid precisely because the loop does not
+write it. And because i64 addition wraps, a wrapped `upper + c` is caught by an
+explicit negative test alongside the existing `> len` test.
+
+The payoff is real but modest: **0.75× → 0.78×**. What remains is
+`table_bump`'s probe loop, which is a `while`, not a canonical `for` — it has
+no induction variable and its index is bounded by `if i == cap { i = 0 }`,
+which is only in-range because `cap` happens to equal the array length.
+Proving that needs a different mechanism than range hoisting.
+
+Profiling this program is also what found the `calloc` and variable-divisor
+wins above, which took it from 0.55s to 0.47s at N=1 000 000.
 
 ## Not implemented
 

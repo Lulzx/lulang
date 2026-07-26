@@ -23,7 +23,10 @@ pub struct CanonicalLoop {
     pub induction: LocalId,
     pub lower: ValueId,
     pub upper: ValueId,
-    pub arrays: Vec<LocalId>,
+    /// Arrays whose bounds check was hoisted, each with the loop-invariant
+    /// local added to the induction variable at the access (`a[start + i]`
+    /// gives `Some(start)`; a bare `a[i]` gives `None`).
+    pub arrays: Vec<(LocalId, Option<LocalId>)>,
     pub reduction: Option<Reduction>,
 }
 
@@ -445,21 +448,27 @@ pub fn analyze_cfg(function: &Function) -> CfgAnalysis {
                 {
                     let pair = match inst.kind {
                         InstKind::Index { base, index }
-                        | InstKind::SetIndex { base, index, .. } => {
-                            array_index_pair(base, index, induction, &definitions)
-                        }
+                        | InstKind::SetIndex { base, index, .. } => array_index_pair(
+                            base,
+                            index,
+                            induction,
+                            &definitions,
+                            function,
+                            &natural,
+                        ),
                         _ => None,
                     };
-                    if let Some(array) = pair {
-                        if !arrays.contains(&array) {
-                            arrays.push(array);
+                    if let Some((array, offset)) = pair {
+                        if !arrays.contains(&(array, offset)) {
+                            arrays.push((array, offset));
                         }
                         access_locations.push(((block_id, index), array));
                     }
                 }
             }
-            arrays.retain(|array| !local_invalidated(function, &natural, *array));
-            access_locations.retain(|(_, array)| arrays.contains(array));
+            arrays.retain(|(array, _)| !local_invalidated(function, &natural, *array));
+            access_locations
+                .retain(|(_, array)| arrays.iter().any(|(candidate, _)| candidate == array));
             let reduction = find_reduction(function, &natural, *preheader, induction, &definitions);
             let loop_index = out.loops.len();
             for (location, _) in access_locations {
@@ -607,19 +616,59 @@ fn is_i64_constant(
     )
 }
 
+/// Recognise `a[i]` and `a[c + i]` / `a[i + c]`, where `i` is the loop's
+/// induction variable and `c` is a local the loop never writes.
+///
+/// The offset is reported as a `LocalId`, not the `ValueId` of the add's other
+/// operand: that operand is loaded *inside* the loop body, so its value is not
+/// available at the preheader where the hoisted check is emitted. The backend
+/// re-loads the local there instead, which is sound precisely because the loop
+/// does not write it.
 fn array_index_pair(
     base: ValueId,
     index: ValueId,
     induction: LocalId,
     defs: &HashMap<ValueId, (BlockId, &Inst)>,
-) -> Option<LocalId> {
-    if !is_load_of(defs, index, induction) {
-        return None;
-    }
-    defs.get(&base).and_then(|(_, inst)| match inst.kind {
+    function: &Function,
+    natural: &HashSet<BlockId>,
+) -> Option<(LocalId, Option<LocalId>)> {
+    let array = defs.get(&base).and_then(|(_, inst)| match inst.kind {
         InstKind::Load(local) => Some(local),
         _ => None,
-    })
+    })?;
+
+    if is_load_of(defs, index, induction) {
+        return Some((array, None));
+    }
+
+    // `c + i` or `i + c`
+    let (_, index_inst) = defs.get(&index)?;
+    let InstKind::Binary {
+        op: BinaryOp::Add,
+        lhs,
+        rhs,
+    } = index_inst.kind
+    else {
+        return None;
+    };
+    let other = if is_load_of(defs, lhs, induction) {
+        rhs
+    } else if is_load_of(defs, rhs, induction) {
+        lhs
+    } else {
+        return None;
+    };
+    let offset = defs.get(&other).and_then(|(_, inst)| match inst.kind {
+        InstKind::Load(local) => Some(local),
+        _ => None,
+    })?;
+    if offset == induction || local_invalidated(function, natural, offset) {
+        return None;
+    }
+    if function.locals.get(offset as usize)?.ty != Type::I64 {
+        return None;
+    }
+    Some((array, Some(offset)))
 }
 
 fn local_invalidated(function: &Function, blocks: &HashSet<BlockId>, local: LocalId) -> bool {

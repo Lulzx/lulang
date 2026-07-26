@@ -909,26 +909,41 @@ impl<'a, 'b> Gen<'a, 'b> {
         let loop_info = &self.cfg.loops[loop_index];
         let (_, lower) = Self::ir_value(values, loop_info.lower)?;
         let (_, upper) = Self::ir_value(values, loop_info.upper)?;
-        for &array in &loop_info.arrays {
+        let arrays = loop_info.arrays.clone();
+        for (array, offset) in arrays {
             let (ty, vars) = self
                 .lookup(&Self::ir_local(array))
                 .ok_or("invalid trusted array local")?;
             let CType::Arr(_) = ty else { continue };
             let base = self.b.use_var(vars[0]);
             let logical = self.b.ins().load(types::I64, MemFlags::trusted(), base, 0);
+            // See the matching comment in src/llvm.rs: `a[c + i]` is checked
+            // over [lower+c, upper+c), with `c` re-loaded here.
+            let (lo, hi) = match offset {
+                None => (lower[0], upper[0]),
+                Some(offset_local) => {
+                    let (_, offset_vars) = self
+                        .lookup(&Self::ir_local(offset_local))
+                        .ok_or("invalid trusted offset local")?;
+                    let c = self.b.use_var(offset_vars[0]);
+                    (
+                        self.b.ins().iadd(lower[0], c),
+                        self.b.ins().iadd(upper[0], c),
+                    )
+                }
+            };
             let zero = self.b.ins().iconst(types::I64, 0);
-            let negative = self.b.ins().icmp(IntCC::SignedLessThan, lower[0], zero);
-            let over = self
-                .b
-                .ins()
-                .icmp(IntCC::SignedGreaterThan, upper[0], logical);
-            let bad = self.b.ins().bor(negative, over);
+            let negative = self.b.ins().icmp(IntCC::SignedLessThan, lo, zero);
+            let wrapped = self.b.ins().icmp(IntCC::SignedLessThan, hi, zero);
+            let over = self.b.ins().icmp(IntCC::SignedGreaterThan, hi, logical);
+            let bad0 = self.b.ins().bor(negative, wrapped);
+            let bad = self.b.ins().bor(bad0, over);
             let oob = self.b.create_block();
             let ok = self.b.create_block();
             self.b.ins().brif(bad, oob, &[], ok, &[]);
             self.b.switch_to_block(oob);
             let r = self.callee("lu_oob");
-            self.b.ins().call(r, &[upper[0], logical]);
+            self.b.ins().call(r, &[hi, logical]);
             self.b.ins().jump(ok, &[]);
             self.b.switch_to_block(ok);
             self.cfg_trusted.insert((loop_index, array), logical);
