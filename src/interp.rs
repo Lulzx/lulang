@@ -775,6 +775,18 @@ impl<'a> Interp<'a> {
                 Ok(Value::Bool(if op == Eq { eq } else { !eq }))
             }
             Lt | Le | Gt | Ge => {
+                // Two i64s order as i64s. Going through f64 loses the low bits
+                // of anything past 2^53, which made `i64::MAX > i64::MAX - 1`
+                // false here and in the AOT tier while the JIT said true.
+                if let (Value::Int(a), Value::Int(b)) = (lhs, rhs) {
+                    return Ok(Value::Bool(match op {
+                        Lt => a < b,
+                        Le => a <= b,
+                        Gt => a > b,
+                        Ge => a >= b,
+                        _ => unreachable!(),
+                    }));
+                }
                 let (a, b) = (as_f64(lhs)?, as_f64(rhs)?);
                 Ok(Value::Bool(match op {
                     Lt => a < b,

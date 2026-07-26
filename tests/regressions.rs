@@ -441,3 +441,32 @@ fn integer_division_traps_still_fire() {
         }
     }
 }
+
+/// Ordering comparisons on i64 must compare as integers. They used to convert
+/// both operands to f64 in the interpreter and the LLVM tier (the Cranelift
+/// tier always did it right), so every i64 past 2^53 lost its low bits and
+/// `i64::MAX > i64::MAX - 1` evaluated to false — a wrong answer *and* a
+/// tier disagreement.
+#[test]
+fn i64_ordering_does_not_round_through_f64() {
+    let source = "\
+main {
+  print(9007199254740993 > 9007199254740992)
+  print(9007199254740993 < 9007199254740992)
+  print(9007199254740993 >= 9007199254740992)
+  print(9223372036854775807 > 9223372036854775806)
+  print(-9223372036854775807 - 1 < -9223372036854775807)
+}
+";
+    assert_modes(source, b"true\nfalse\ntrue\ntrue\ntrue\n");
+}
+
+/// `~=` keeps its relative-epsilon float semantics even when both operands are
+/// integers; the integer-comparison path above must not capture it.
+#[test]
+fn approx_eq_stays_float_on_integer_operands() {
+    assert_modes(
+        "main {\n print(1 ~= 1, 1 ~= 2, 1 ~= 1.0)\n}\n",
+        b"true false true\n",
+    );
+}

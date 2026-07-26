@@ -2047,7 +2047,15 @@ impl<'a> Emit<'a> {
                 regs: vec![eq],
             });
         }
-        if matches!(op, Eq | Ne)
+        // Integer-class operands compare as integers for *every* relation, not
+        // just equality. Routing `<`/`<=`/`>`/`>=` through f64 silently loses
+        // the low bits of any i64 past 2^53, so `i64::MAX > i64::MAX - 1` came
+        // out false. This mirrors the `both_int` dispatch in `src/jit.rs`,
+        // which always had it right. Str is handled above; the checker only
+        // admits numeric operands to the ordering relations, so `ptr` remains
+        // an equality-only concern.
+        // `~=` keeps its relative-epsilon float semantics on every operand type.
+        if matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
             && !matches!(lhs.ty, CType::F32 | CType::F64)
             && !matches!(rhs.ty, CType::F32 | CType::F64)
         {
@@ -2057,13 +2065,18 @@ impl<'a> Emit<'a> {
             } else {
                 "i64"
             };
+            let pred = match op {
+                Eq => "eq",
+                Ne => "ne",
+                Lt => "slt",
+                Le => "sle",
+                Gt => "sgt",
+                Ge => "sge",
+                _ => return Err("invalid IR comparison".into()),
+            };
             self.line(format!(
                 "{} = icmp {} {} {}, {}",
-                bit,
-                if op == Eq { "eq" } else { "ne" },
-                compare_type,
-                lhs.regs[0],
-                rhs.regs[0]
+                bit, pred, compare_type, lhs.regs[0], rhs.regs[0]
             ));
             let out = self.t();
             self.line(format!("{} = zext i1 {} to i64", out, bit));
