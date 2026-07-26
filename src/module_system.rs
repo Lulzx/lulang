@@ -483,6 +483,7 @@ fn remap_stmt(statement: &mut Stmt, expr_offset: ExprId, stmt_offset: StmtId) {
         }
     };
     match statement {
+        Stmt::Break | Stmt::Continue => {}
         Stmt::Let(_, value) | Stmt::Var(_, value) | Stmt::Expr(value) => add_expr(value),
         Stmt::Assign(target, value) => {
             add_expr(target);

@@ -643,6 +643,16 @@ impl Parser {
                 out.push(chain[0]);
                 Ok(())
             }
+            Tok::Ident(k) if k == "break" => {
+                self.next();
+                out.push(self.alloc_stmt(Stmt::Break));
+                Ok(())
+            }
+            Tok::Ident(k) if k == "continue" => {
+                self.next();
+                out.push(self.alloc_stmt(Stmt::Continue));
+                Ok(())
+            }
             Tok::Ident(k) if k == "return" => {
                 self.next();
                 if matches!(self.peek(), Tok::Newline | Tok::Eof) || self.is_sym("}") {

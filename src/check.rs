@@ -161,6 +161,9 @@ pub struct Checker<'a> {
     type_ids: HashMap<String, usize>,
     sigs: HashMap<String, (Vec<Type>, Vec<bool>, Type)>,
     expr_types: RefCell<Vec<Option<Type>>>,
+    /// Nesting depth of enclosing `for`/`while`, so `break`/`continue` can be
+    /// rejected outside a loop.
+    loop_depth: std::cell::Cell<u32>,
 }
 
 type Scope = HashMap<String, (Type, bool)>; // type, is-mutable
@@ -235,6 +238,7 @@ impl<'a> Checker<'a> {
             type_ids,
             sigs: HashMap::new(),
             expr_types: RefCell::new(vec![None; p.exprs.len()]),
+            loop_depth: std::cell::Cell::new(0),
         };
         for (record_index, record) in p.types.iter().enumerate() {
             for (field, source) in &record.fields {
@@ -875,7 +879,21 @@ impl<'a> Checker<'a> {
                 if self.check_expr(*c, scopes)? != Type::Bool {
                     return Err("`while` condition must be bool".into());
                 }
-                self.check_block(body, scopes, ret)?;
+                self.loop_depth.set(self.loop_depth.get() + 1);
+                let checked = self.check_block(body, scopes, ret);
+                self.loop_depth.set(self.loop_depth.get() - 1);
+                checked?;
+                Ok(Type::Unit)
+            }
+            Stmt::Break | Stmt::Continue => {
+                if self.loop_depth.get() == 0 {
+                    let word = if matches!(self.p.stmt(sid), Stmt::Break) {
+                        "break"
+                    } else {
+                        "continue"
+                    };
+                    return Err(format!("`{word}` outside of a loop"));
+                }
                 Ok(Type::Unit)
             }
             Stmt::For(v, lo, hi, body) => {
@@ -889,7 +907,10 @@ impl<'a> Checker<'a> {
                     .last_mut()
                     .unwrap()
                     .insert(v.clone(), (Type::I64, false));
-                self.check_block(body, scopes, ret)?;
+                self.loop_depth.set(self.loop_depth.get() + 1);
+                let checked = self.check_block(body, scopes, ret);
+                self.loop_depth.set(self.loop_depth.get() - 1);
+                checked?;
                 scopes.pop();
                 Ok(Type::Unit)
             }

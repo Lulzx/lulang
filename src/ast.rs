@@ -36,6 +36,8 @@ pub enum Stmt {
     For(String, ExprId, ExprId, Vec<StmtId>),
     While(ExprId, Vec<StmtId>),
     Return(Option<ExprId>),
+    Break,
+    Continue,
     Expr(ExprId),
 }
 

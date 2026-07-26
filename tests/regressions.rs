@@ -511,3 +511,50 @@ main {
         }
     }
 }
+
+/// `break` leaves the innermost loop; `continue` skips to the next iteration
+/// and, in a `for`, must still advance the index (it targets the latch block,
+/// not the condition head).
+#[test]
+fn break_and_continue_target_the_innermost_loop() {
+    let source = "\
+main {
+  var first = -1
+  for i in 0..100 {
+    if i * i > 50 { first = i  break }
+  }
+  var odds = 0
+  for i in 0..10 {
+    if i % 2 == 0 { continue }
+    odds = odds + i
+  }
+  var j = 0
+  var acc = 0
+  while true {
+    j = j + 1
+    if j > 20 { break }
+    if j % 3 != 0 { continue }
+    acc = acc + j
+  }
+  var pairs = 0
+  for a in 0..5 {
+    for b in 0..5 {
+      if b > a { break }
+      pairs = pairs + 1
+    }
+  }
+  print(first, odds, acc, j, pairs)
+}
+";
+    assert_modes(source, b"8 25 63 21 15\n");
+
+    for bad in [
+        "main { break }\n",
+        "main { continue }\n",
+        "fn f(): i64 { break  return 1 }\nmain { print(f()) }\n",
+    ] {
+        let output = run("check", bad);
+        assert!(!output.status.success(), "accepted `{bad}` outside a loop");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("outside of a loop"));
+    }
+}

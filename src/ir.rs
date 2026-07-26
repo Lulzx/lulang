@@ -611,6 +611,10 @@ struct Builder<'a> {
     values: Vec<Type>,
     blocks: Vec<Block>,
     current: BlockId,
+    /// Enclosing loops as (continue target, break target). `for` continues to
+    /// its latch block so the index still advances; `while` continues to its
+    /// condition head.
+    loops: Vec<(BlockId, BlockId)>,
 }
 
 impl<'a> Builder<'a> {
@@ -639,6 +643,7 @@ impl<'a> Builder<'a> {
                 terminator: Terminator::Unreachable,
             }],
             current: 0,
+            loops: Vec::new(),
         };
         for (i, (name, ty)) in f.params.iter().enumerate() {
             let ty = crate::check::resolve_type(p, ty)?;
@@ -913,7 +918,10 @@ impl<'a> Builder<'a> {
                     else_block: exit,
                 });
                 self.switch(loop_body);
-                self.block(body)?;
+                self.loops.push((head, exit));
+                let lowered = self.block(body);
+                self.loops.pop();
+                lowered?;
                 if matches!(
                     self.blocks[self.current as usize].terminator,
                     Terminator::Unreachable
@@ -931,6 +939,7 @@ impl<'a> Builder<'a> {
                 self.store(index, lo);
                 let head = self.new_block();
                 let loop_body = self.new_block();
+                let latch = self.new_block();
                 let exit = self.new_block();
                 self.terminate(Terminator::Jump(head));
                 self.switch(head);
@@ -949,11 +958,18 @@ impl<'a> Builder<'a> {
                     else_block: exit,
                 });
                 self.switch(loop_body);
-                self.block(body)?;
+                self.loops.push((latch, exit));
+                let lowered = self.block(body);
+                self.loops.pop();
+                lowered?;
                 if matches!(
                     self.blocks[self.current as usize].terminator,
                     Terminator::Unreachable
                 ) {
+                    self.terminate(Terminator::Jump(latch));
+                }
+                self.switch(latch);
+                {
                     let cur = self.load(index);
                     let one = self.constant(Constant::I64(1), Type::I64);
                     let next = self.emit(
@@ -969,6 +985,22 @@ impl<'a> Builder<'a> {
                 }
                 self.scopes.pop();
                 self.switch(exit);
+                Ok(None)
+            }
+            ast::Stmt::Break | ast::Stmt::Continue => {
+                let Some(&(continue_to, break_to)) = self.loops.last() else {
+                    return Err("lowering: break/continue outside of a loop".into());
+                };
+                let target = if matches!(self.p.stmt(sid), ast::Stmt::Break) {
+                    break_to
+                } else {
+                    continue_to
+                };
+                self.terminate(Terminator::Jump(target));
+                // Statements after an unconditional jump are unreachable; give
+                // them a fresh block so lowering stays well-formed.
+                let orphan = self.new_block();
+                self.switch(orphan);
                 Ok(None)
             }
             ast::Stmt::Return(e) => {
