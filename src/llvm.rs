@@ -1895,6 +1895,11 @@ impl<'a> Emit<'a> {
                 let base_id = *base;
                 let base = value(*base)?;
                 let index = value(*index)?;
+                let index = if index.ty == CType::I8 {
+                    self.coerce_ev(index, &CType::I64)?
+                } else {
+                    index
+                };
                 let mut stored = value(*stored)?;
                 if let CType::CMutSlice(elem) = &base.ty {
                     stored = self.coerce_ev(stored, elem)?;
@@ -2205,6 +2210,12 @@ impl<'a> Emit<'a> {
         index: EV,
         trusted: Option<String>,
     ) -> Result<EV, String> {
+        // An i8 index is widened here, matching every other i8 context.
+        let index = if index.ty == CType::I8 {
+            self.coerce_ev(index, &CType::I64)?
+        } else {
+            index
+        };
         if base.ty == CType::Str {
             let bad = self.t();
             self.line(format!(

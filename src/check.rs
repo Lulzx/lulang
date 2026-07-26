@@ -779,7 +779,8 @@ impl<'a> Checker<'a> {
                         }
                     }
                     Expr::Index(a, i) => {
-                        if self.check_expr(*i, scopes)? != Type::I64 {
+                        // i8 widens here like it does everywhere else.
+                        if self.widen(&self.check_expr(*i, scopes)?) != Type::I64 {
                             return Err("array index must be i64".into());
                         }
                         match self.check_expr(*a, scopes)? {
@@ -1096,7 +1097,7 @@ impl<'a> Checker<'a> {
                 t => Err(format!("cannot access field `{}` on {}", f, self.name(&t))),
             },
             Expr::Index(a, i) => {
-                if self.check_expr(*i, scopes)? != Type::I64 {
+                if self.widen(&self.check_expr(*i, scopes)?) != Type::I64 {
                     return Err("array index must be i64".into());
                 }
                 match self.check_expr(*a, scopes)? {

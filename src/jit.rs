@@ -1507,7 +1507,9 @@ impl<'a, 'b> Gen<'a, 'b> {
             InstKind::Index { base, index } => {
                 let base_id = *base;
                 let (base_ty, base) = value(*base)?;
-                let (_, index) = value(*index)?;
+                let (index_ty, index) = value(*index)?;
+                // An i8 index widens here, matching every other i8 context.
+                let index = self.coerce(&CType::I64, &index_ty, index)?;
                 let trusted =
                     self.cfg
                         .trusted_accesses
@@ -1548,7 +1550,8 @@ impl<'a, 'b> Gen<'a, 'b> {
             } => {
                 let base_id = *base;
                 let (base_ty, base) = value(*base)?;
-                let (_, index) = value(*index)?;
+                let (index_ty, index) = value(*index)?;
+                let index = self.coerce(&CType::I64, &index_ty, index)?;
                 let (stored_ty, stored) = value(*stored)?;
                 if let CType::CMutSlice(elem) = &base_ty {
                     self.check_idx(index[0], base[1]);

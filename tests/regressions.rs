@@ -738,3 +738,24 @@ main {
         assert!(!output.status.success(), "{mode} accepted an out-of-range putbytes");
     }
 }
+
+/// An i8 value indexes arrays and strings directly; every other context
+/// already widened it.
+#[test]
+fn i8_values_can_index() {
+    let source = "\
+main {
+  var table = arr(256, i8(0))
+  for i in 0..256 { table[i] = i8(255 - i) }
+  var seq = arr(4, i8(0))
+  seq[0] = i8(1)
+  seq[1] = i8(2)
+  seq[2] = i8(3)
+  var out = arr(8, 0)
+  out[seq[2]] = 99
+  let s = \"abcdef\"
+  print(table[seq[0]], table[seq[1]], out[3], s[seq[1]])
+}
+";
+    assert_modes(source, b"-2 -3 99 99\n");
+}

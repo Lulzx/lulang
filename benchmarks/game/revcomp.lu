@@ -35,14 +35,14 @@ fn emit_revcomp(inout seq: [i8], lo: i64, hi: i64, table: [i8]) {
   var i = lo
   var j = hi - 1
   while i < j {
-    let a = table[int(seq[i])]
-    let b = table[int(seq[j])]
+    let a = table[seq[i]]
+    let b = table[seq[j]]
     seq[i] = b
     seq[j] = a
     i = i + 1
     j = j - 1
   }
-  if i == j { seq[i] = table[int(seq[i])] }
+  if i == j { seq[i] = table[seq[i]] }
 
   var start = lo
   while start < hi {
