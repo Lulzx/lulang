@@ -705,41 +705,7 @@ fn build_output(
         return Ok(out_bin);
     }
     // compile the runtime once per source revision, then just link the object
-    let rt_src = include_str!("lu_runtime.c");
-    let mut rt_hash: u64 = rt_src.bytes().fold(1469598103934665603u64, |h, b| {
-        (h ^ b as u64).wrapping_mul(1099511628211)
-    });
-    if library {
-        rt_hash ^= 0x4c55_5f4c_4942;
-    }
-    let runtime_o = std::env::temp_dir().join(format!("lu_runtime_{:016x}.o", rt_hash));
-    if !runtime_o.exists() {
-        let runtime_c = std::env::temp_dir().join(format!("lu_runtime_{}.c", pid));
-        let runtime_tmp_o =
-            std::env::temp_dir().join(format!("lu_runtime_{:016x}_{}.o", rt_hash, pid));
-        std::fs::write(&runtime_c, rt_src).map_err(|e| e.to_string())?;
-        let mut runtime_clang = std::process::Command::new("clang");
-        runtime_clang.args(["-O3", "-mcpu=native", "-c"]);
-        if library {
-            runtime_clang.args(["-DLU_LIB", "-fPIC"]);
-        }
-        let st = runtime_clang
-            .arg("-o")
-            .arg(&runtime_tmp_o)
-            .arg(&runtime_c)
-            .status()
-            .map_err(|e| format!("failed to invoke clang: {}", e))?;
-        if !st.success() {
-            return Err("clang failed compiling the runtime".into());
-        }
-        if let Err(e) = std::fs::rename(&runtime_tmp_o, &runtime_o) {
-            if !runtime_o.exists() {
-                return Err(format!("failed to install runtime object: {}", e));
-            }
-            let _ = std::fs::remove_file(&runtime_tmp_o);
-        }
-        let _ = std::fs::remove_file(&runtime_c);
-    }
+    let runtime_o = crate::backend::link::runtime_object(library)?;
     if library {
         let module_o = std::env::temp_dir().join(format!("lu_{}_{}.o", stem, pid));
         let status = std::process::Command::new("clang")

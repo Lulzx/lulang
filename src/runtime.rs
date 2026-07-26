@@ -137,7 +137,7 @@ fn arr_alloc(n: i64, data_bytes: i64) -> *mut u8 {
         *(p.add(8) as *mut i64) = data_bytes as i64;
     }
     // Fresh arrays are SSA temporaries until a language local retains them
-    // through `lu_arr_clone`.
+    // through `lu_arr_share`.
     array_refs().lock().unwrap().insert(p as usize, 0);
     p
 }
@@ -212,8 +212,9 @@ pub extern "C" fn lu_arr_new_raw(
 
 /// Share an immutable array allocation at a language value-copy boundary.
 /// Mutation goes through `lu_arr_cow`, preserving value semantics without
-/// eagerly copying large read-only compiler-state records.
-pub extern "C" fn lu_arr_clone(source: *const u8) -> *mut u8 {
+/// eagerly copying large read-only compiler-state records. Distinct from
+/// `lu_arr_clone` in the C runtime, which is the LLVM tier's eager copy.
+pub extern "C" fn lu_arr_share(source: *const u8) -> *mut u8 {
     if source.is_null() {
         return std::ptr::null_mut();
     }

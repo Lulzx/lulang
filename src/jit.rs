@@ -1,4 +1,5 @@
-// Cranelift JIT backend for `lu run`.
+// Cranelift backend. Drives `lu run` (in-memory JIT) and `lu build --fast`
+// (object emission through the same code generator).
 //
 // Records are scalarized: a Quat is four F64 SSA values, never memory — value
 // semantics means aliasing is impossible, so nothing forces records into RAM.
@@ -46,9 +47,23 @@ struct FnInfo {
     ret: CType,
 }
 
-pub struct Jit<'a> {
+/// Where `Constant::Bytes` payloads live.
+///
+/// The JIT keeps its own boxed copies alive and bakes their addresses into the
+/// generated code — optimized functions are temporary IR clones, so pointers
+/// into them would dangle. An object file cannot bake in host addresses at all,
+/// so it emits real data symbols and lets the linker resolve them.
+enum Strings {
+    Baked(Vec<Box<[u8]>>),
+    Data {
+        /// Interned by content: the same literal in two functions is one symbol.
+        ids: HashMap<Vec<u8>, cranelift_module::DataId>,
+    },
+}
+
+pub struct Jit<'a, M: Module> {
     p: &'a Program,
-    module: JITModule,
+    module: M,
     opt_isa: cranelift_codegen::isa::OwnedTargetIsa,
     soa: bool,
     simd: bool,
@@ -60,34 +75,85 @@ pub struct Jit<'a> {
     externs: Vec<FnInfo>,
     imports: HashMap<&'static str, FuncId>,
     pure_imports: std::collections::HashSet<u32>,
-    // String constants are addressed directly by generated code. Optimized
-    // functions are temporary IR clones, so keep copies alive until execution
-    // finishes instead of embedding pointers into those short-lived clones.
-    strings: Vec<Box<[u8]>>,
+    strings: Strings,
 }
 
-impl<'a> Jit<'a> {
+/// The pass switches shared by both Cranelift drivers, read once from the
+/// environment so `lu run` and `lu build --fast` generate identical code.
+struct Passes {
+    soa: bool,
+    simd: bool,
+    ifconv: bool,
+    do_licm: bool,
+    inline_math: bool,
+}
+
+impl Passes {
+    fn from_env() -> Passes {
+        Passes {
+            soa: std::env::var("LU_LAYOUT")
+                .map(|value| value != "aos")
+                .unwrap_or(true),
+            simd: std::env::var("LU_SIMD")
+                .map(|value| value != "off")
+                .unwrap_or(true),
+            ifconv: std::env::var("LU_IFCONV")
+                .map(|value| value != "off")
+                .unwrap_or(true),
+            do_licm: std::env::var("LU_LICM")
+                .map(|value| value != "off")
+                .unwrap_or(true),
+            inline_math: std::env::var("LU_MATH")
+                .map(|value| value != "call")
+                .unwrap_or(true),
+        }
+    }
+}
+
+/// An ISA at `opt_level=none` for the module, plus one at `opt_level=speed` for
+/// the per-function egraph pass we run ourselves.
+///
+/// The module ISA stays at `none` on purpose: we run the egraph optimizer
+/// manually per function and then our own LICM over its output — letting
+/// `define_function` re-run the egraph would re-elaborate instruction placement
+/// and sink hoisted code back into loops.
+fn isa_pair(
+    pic: bool,
+) -> Result<
+    (
+        cranelift_codegen::isa::OwnedTargetIsa,
+        cranelift_codegen::isa::OwnedTargetIsa,
+    ),
+    String,
+> {
+    use cranelift_codegen::settings::Configurable as _;
+    // Object output is linked into a position-independent executable, so it
+    // must reference imports through the GOT rather than baking text
+    // relocations the linker refuses.
+    let mut flags = cranelift_codegen::settings::builder();
+    let mut opt_flags = cranelift_codegen::settings::builder();
+    if pic {
+        flags.set("is_pic", "true").map_err(|e| e.to_string())?;
+        opt_flags.set("is_pic", "true").map_err(|e| e.to_string())?;
+    }
+    let isa = cranelift_native::builder()
+        .map_err(|e| e.to_string())?
+        .finish(cranelift_codegen::settings::Flags::new(flags))
+        .map_err(|e| e.to_string())?;
+    opt_flags
+        .set("opt_level", "speed")
+        .map_err(|e| e.to_string())?;
+    let opt_isa = cranelift_native::builder()
+        .map_err(|e| e.to_string())?
+        .finish(cranelift_codegen::settings::Flags::new(opt_flags))
+        .map_err(|e| e.to_string())?;
+    Ok((isa, opt_isa))
+}
+
+impl<'a> Jit<'a, JITModule> {
     pub fn run(ir: &'a LoweredProgram) -> Result<(), String> {
         let p = ir.source();
-        use cranelift_codegen::settings::Configurable as _;
-        // The module ISA stays at opt_level=none: we run the egraph optimizer
-        // manually per-function and then our own LICM pass on its output —
-        // letting define_function re-run the egraph would re-elaborate
-        // instruction placement and sink hoisted code back into loops.
-        let isa = cranelift_native::builder()
-            .map_err(|e| e.to_string())?
-            .finish(cranelift_codegen::settings::Flags::new(
-                cranelift_codegen::settings::builder(),
-            ))
-            .map_err(|e| e.to_string())?;
-        let mut opt_flags = cranelift_codegen::settings::builder();
-        opt_flags
-            .set("opt_level", "speed")
-            .map_err(|e| e.to_string())?;
-        let opt_isa = cranelift_native::builder()
-            .map_err(|e| e.to_string())?
-            .finish(cranelift_codegen::settings::Flags::new(opt_flags))
-            .map_err(|e| e.to_string())?;
+        let (isa, opt_isa) = isa_pair(false)?;
         let mut jb = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         let syms: &[(&str, *const u8)] = &[
             ("lu_print_f64", runtime::lu_print_f64 as *const u8),
@@ -99,7 +165,7 @@ impl<'a> Jit<'a> {
             ("lu_arr_new_f64", runtime::lu_arr_new_f64 as *const u8),
             ("lu_arr_new_i64", runtime::lu_arr_new_i64 as *const u8),
             ("lu_arr_new_raw", runtime::lu_arr_new_raw as *const u8),
-            ("lu_arr_clone", runtime::lu_arr_clone as *const u8),
+            ("lu_arr_share", runtime::lu_arr_share as *const u8),
             ("lu_arr_cow", runtime::lu_arr_cow as *const u8),
             ("lu_str_eq", runtime::lu_str_eq as *const u8),
             ("lu_str_copy", runtime::lu_str_copy as *const u8),
@@ -128,54 +194,8 @@ impl<'a> Jit<'a> {
             jb.symbol(&e.name, pointer as *const u8);
         }
         let module = JITModule::new(jb);
-        let soa = std::env::var("LU_LAYOUT")
-            .map(|v| v != "aos")
-            .unwrap_or(true);
-        let simd = std::env::var("LU_SIMD").map(|v| v != "off").unwrap_or(true);
-        let ifconv = std::env::var("LU_IFCONV")
-            .map(|v| v != "off")
-            .unwrap_or(true);
-        let do_licm = std::env::var("LU_LICM").map(|v| v != "off").unwrap_or(true);
-        let inline_math = std::env::var("LU_MATH")
-            .map(|v| v != "call")
-            .unwrap_or(true);
-        let mut jit = Jit {
-            p,
-            module,
-            opt_isa,
-            soa,
-            simd,
-            // Cranelift's native backends currently reject fixed vectors wider
-            // than 128 bits; LLVM AOT widens independently when the host can.
-            simd_bits: SIMD128,
-            ifconv,
-            do_licm,
-            inline_math,
-            fns: HashMap::new(),
-            externs: Vec::new(),
-            imports: HashMap::new(),
-            pure_imports: std::collections::HashSet::new(),
-            strings: Vec::new(),
-        };
-        jit.declare_imports()?;
-        jit.declare_externs()?;
-        jit.declare_fns()?;
-        for (index, f) in p.fns.iter().enumerate() {
-            let mut function = inline_calls(&ir.functions[index], &ir.functions, 3000);
-            if jit.ifconv {
-                if_convert(&mut function);
-            }
-            jit.compile_ir_fn(&function, f)?;
-        }
-        let mut main = inline_calls(
-            ir.main.as_ref().ok_or("no `main` block in program")?,
-            &ir.functions,
-            3000,
-        );
-        if jit.ifconv {
-            if_convert(&mut main);
-        }
-        let main_id = jit.compile_ir_main(&main)?;
+        let mut jit = Jit::new(p, module, opt_isa, Strings::Baked(Vec::new()));
+        let main_id = jit.compile_program(ir)?;
         jit.module
             .finalize_definitions()
             .map_err(|e| e.to_string())?;
@@ -183,6 +203,173 @@ impl<'a> Jit<'a> {
         let entry: extern "C" fn() = unsafe { std::mem::transmute(ptr) };
         entry();
         Ok(())
+    }
+}
+
+impl<'a> Jit<'a, cranelift_object::ObjectModule> {
+    /// Compile a program straight to a relocatable object, skipping LLVM.
+    ///
+    /// Code quality is Cranelift's rather than `clang -O3`'s, so this backs
+    /// `lu build --fast` (the dev loop) while `lu build` keeps the LLVM tier and
+    /// its measured numbers. Externs are left as undefined symbols for the
+    /// linker instead of being resolved in-process the way the JIT does.
+    pub fn emit_object(ir: &'a LoweredProgram, path: &std::path::Path) -> Result<(), String> {
+        let p = ir.source();
+        let (isa, opt_isa) = isa_pair(true)?;
+        let builder = cranelift_object::ObjectBuilder::new(
+            isa,
+            "lu",
+            cranelift_module::default_libcall_names(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut jit = Jit::new(
+            p,
+            cranelift_object::ObjectModule::new(builder),
+            opt_isa,
+            Strings::Data {
+                ids: HashMap::new(),
+            },
+        );
+        let main_id = jit.compile_program(ir)?;
+        jit.emit_entry(main_id)?;
+        let mut product = jit.module.finish();
+        stamp_platform(&mut product.object);
+        let object = product.emit().map_err(|error| error.to_string())?;
+        std::fs::write(path, object).map_err(|error| error.to_string())
+    }
+
+    /// `int lu_entry(void)` — the symbol `src/lu_runtime.c`'s `main` calls. The
+    /// generated main returns nothing, so the wrapper calls it and reports
+    /// success; a failing program traps or exits from inside the runtime.
+    fn emit_entry(&mut self, main_id: FuncId) -> Result<(), String> {
+        let mut sig = self.module.make_signature();
+        sig.returns.push(AbiParam::new(types::I32));
+        let entry = self
+            .module
+            .declare_function("lu_entry", Linkage::Export, &sig)
+            .map_err(|error| error.to_string())?;
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        let mut fbc = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
+            let block = b.create_block();
+            b.switch_to_block(block);
+            let callee = self.module.declare_func_in_func(main_id, b.func);
+            b.ins().call(callee, &[]);
+            let zero = b.ins().iconst(types::I32, 0);
+            b.ins().return_(&[zero]);
+            b.seal_all_blocks();
+            b.finalize();
+        }
+        self.module
+            .define_function(entry, &mut ctx)
+            .map_err(|error| error.to_string())?;
+        self.module.clear_context(&mut ctx);
+        Ok(())
+    }
+}
+
+/// Record the target platform in the object.
+///
+/// Cranelift emits no `LC_BUILD_VERSION`, and `ld` warns on every link that it
+/// is "assuming: macOS". The values only have to be plausible — the linker reads
+/// them to pick deployment defaults, and the runtime object beside us carries
+/// clang's real ones.
+#[cfg(target_os = "macos")]
+fn stamp_platform(object: &mut cranelift_object::object::write::Object<'_>) {
+    use cranelift_object::object::write::MachOBuildVersion;
+    let mut version = MachOBuildVersion::default();
+    version.platform = cranelift_object::object::macho::PLATFORM_MACOS;
+    version.minos = 11 << 16; // 11.0.0, encoded xxxx.yy.zz in nibbles
+    version.sdk = 11 << 16;
+    object.set_macho_build_version(version);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stamp_platform(_object: &mut cranelift_object::object::write::Object<'_>) {}
+
+/// `lu build --fast`: Cranelift object emission plus a link, no LLVM.
+///
+/// Returns the path of the executable. The generated code is the JIT's, so a
+/// binary built this way runs like `lu run` without the startup compile — it is
+/// the dev-loop build, not the one the benchmark numbers come from.
+pub fn build_fast(
+    ir: &LoweredProgram,
+    source_path: &str,
+    output_name: Option<&str>,
+) -> Result<String, String> {
+    let stem = std::path::Path::new(source_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("out");
+    let output = output_name.map(String::from).unwrap_or_else(|| stem.into());
+    let object = std::env::temp_dir().join(format!("lu_{}_{}.o", stem, std::process::id()));
+    Jit::emit_object(ir, &object)?;
+    let runtime = crate::backend::link::runtime_object(false)?;
+    let libraries = crate::backend::link::library_arguments(
+        ir.externs
+            .iter()
+            .filter_map(|declaration| declaration.lib.as_deref()),
+    );
+    let result =
+        crate::backend::link::link_executable(&output, &[object.clone(), runtime], &libraries);
+    let _ = std::fs::remove_file(&object);
+    result?;
+    Ok(output)
+}
+
+impl<'a, M: Module> Jit<'a, M> {
+    fn new(
+        p: &'a Program,
+        module: M,
+        opt_isa: cranelift_codegen::isa::OwnedTargetIsa,
+        strings: Strings,
+    ) -> Jit<'a, M> {
+        let passes = Passes::from_env();
+        Jit {
+            p,
+            module,
+            opt_isa,
+            soa: passes.soa,
+            simd: passes.simd,
+            // Cranelift's native backends currently reject fixed vectors wider
+            // than 128 bits; LLVM AOT widens independently when the host can.
+            simd_bits: SIMD128,
+            ifconv: passes.ifconv,
+            do_licm: passes.do_licm,
+            inline_math: passes.inline_math,
+            fns: HashMap::new(),
+            externs: Vec::new(),
+            imports: HashMap::new(),
+            pure_imports: std::collections::HashSet::new(),
+            strings,
+        }
+    }
+
+    /// Declare everything, then compile every function and `main`. Returns the
+    /// id of the compiled `main`.
+    fn compile_program(&mut self, ir: &'a LoweredProgram) -> Result<FuncId, String> {
+        self.declare_imports()?;
+        self.declare_externs()?;
+        self.declare_fns()?;
+        let p = self.p;
+        for (index, f) in p.fns.iter().enumerate() {
+            let mut function = inline_calls(&ir.functions[index], &ir.functions, 3000);
+            if self.ifconv {
+                if_convert(&mut function);
+            }
+            self.compile_ir_fn(&function, f)?;
+        }
+        let mut main = inline_calls(
+            ir.main.as_ref().ok_or("no `main` block in program")?,
+            &ir.functions,
+            3000,
+        );
+        if self.ifconv {
+            if_convert(&mut main);
+        }
+        self.compile_ir_main(&main)
     }
 
     fn declare_imports(&mut self) -> Result<(), String> {
@@ -201,7 +388,7 @@ impl<'a> Jit<'a> {
                 &[types::I64, types::I64, types::I64, types::I64],
                 false,
             ),
-            ("lu_arr_clone", 1, &[types::I64], false),
+            ("lu_arr_share", 1, &[types::I64], false),
             ("lu_arr_cow", 1, &[types::I64], false),
             (
                 "lu_str_eq",
@@ -475,7 +662,7 @@ impl<'a> Jit<'a> {
 struct Gen<'a, 'b> {
     p: &'a Program,
     b: FunctionBuilder<'b>,
-    module: &'a mut JITModule,
+    module: &'a mut dyn Module,
     fns: &'a HashMap<String, FnInfo>,
     externs: &'a [FnInfo],
     imports: &'a HashMap<&'static str, FuncId>,
@@ -494,7 +681,7 @@ struct Gen<'a, 'b> {
     cfg_trusted: HashMap<(usize, ir::LocalId), Value>,
     location: (ir::BlockId, usize),
     skipped_cfg_blocks: std::collections::HashSet<ir::BlockId>,
-    strings: &'a mut Vec<Box<[u8]>>,
+    strings: &'a mut Strings,
 }
 
 impl<'a, 'b> Gen<'a, 'b> {
@@ -1115,6 +1302,43 @@ impl<'a, 'b> Gen<'a, 'b> {
         })
     }
 
+    /// Address of a string literal's bytes.
+    ///
+    /// In the JIT that is a constant: the pool owns a copy that outlives
+    /// execution, so its address can be baked in. In an object file the bytes
+    /// become a data symbol and the address is a relocation the linker fills.
+    fn string_pointer(&mut self, bytes: &[u8]) -> Result<Value, String> {
+        match self.strings {
+            Strings::Baked(pool) => {
+                let owned = bytes.to_vec().into_boxed_slice();
+                let pointer = owned.as_ptr();
+                pool.push(owned);
+                Ok(self.b.ins().iconst(types::I64, pointer as i64))
+            }
+            Strings::Data { ids } => {
+                let next = ids.len();
+                let id = match ids.get(bytes) {
+                    Some(id) => *id,
+                    None => {
+                        let id = self
+                            .module
+                            .declare_data(&format!(".Lstr.{}", next), Linkage::Local, false, false)
+                            .map_err(|error| error.to_string())?;
+                        let mut description = cranelift_module::DataDescription::new();
+                        description.define(bytes.to_vec().into_boxed_slice());
+                        self.module
+                            .define_data(id, &description)
+                            .map_err(|error| error.to_string())?;
+                        ids.insert(bytes.to_vec(), id);
+                        id
+                    }
+                };
+                let global = self.module.declare_data_in_func(id, self.b.func);
+                Ok(self.b.ins().global_value(types::I64, global))
+            }
+        }
+    }
+
     fn gen_ir_inst(
         &mut self,
         function: &ir::Function,
@@ -1133,16 +1357,11 @@ impl<'a, 'b> Gen<'a, 'b> {
                     vec![self.b.ins().iconst(types::I64, *v as i64)],
                 ),
                 Constant::Bytes(bytes) => {
-                    let bytes = bytes.clone().into_boxed_slice();
-                    let ptr = bytes.as_ptr();
                     let len = bytes.len();
-                    self.strings.push(bytes);
+                    let pointer = self.string_pointer(bytes)?;
                     (
                         CType::Str,
-                        vec![
-                            self.b.ins().iconst(types::I64, ptr as i64),
-                            self.b.ins().iconst(types::I64, len as i64),
-                        ],
+                        vec![pointer, self.b.ins().iconst(types::I64, len as i64)],
                     )
                 }
                 Constant::Unit => (CType::Unit, vec![]),
@@ -1163,7 +1382,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let mut vals = self.coerce(want, &got, vals)?;
                 if *retain_arrays {
                     for offset in array_component_offsets(self.p, want)? {
-                        vals[offset] = self.call_import("lu_arr_clone", &[vals[offset]])[0];
+                        vals[offset] = self.call_import("lu_arr_share", &[vals[offset]])[0];
                     }
                 }
                 self.define_ir_local(*local, &vals)?;
@@ -1698,7 +1917,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             }
             let mut values = self.coerce(want, &got, vals)?;
             if decl.exported && matches!(want, CType::Arr(_)) {
-                values[0] = self.call_import("lu_arr_clone", &[values[0]])[0];
+                values[0] = self.call_import("lu_arr_share", &[values[0]])[0];
             }
             flat.extend(values);
         }

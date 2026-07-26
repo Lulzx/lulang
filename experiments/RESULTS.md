@@ -327,3 +327,67 @@ Two of AE's three alcubierre cells fall out of semantics + a thin toolchain, at
 somewhat smaller magnitudes; the JIT-vs-Bun cell required a baseline we could
 not reproduce with honest TS. Ranking the claims by robustness:
 native > compile (real but size-dependent) > JIT-vs-TS (baseline-dependent).
+
+---
+
+# Experiment 4 — where the compile time actually is, and what owning the backend buys
+
+*2026-07-26, Apple M4 Pro, Apple clang 21, hyperfine (10 runs, 2 warmups) for
+binary timings, `/usr/bin/time` best-of-3 for build latency. The runtime object
+is cached in both configurations, so every number is a warm incremental build.*
+
+## Where `lu build` spends its time
+
+The frontend was never the cost. On `selfhost/codegen.lu` (~3.5k lines of
+lulang, the largest real program in the repo):
+
+| Stage | Time |
+|---|---|
+| `lu check` (lex, parse, typecheck, lower) | 10 ms |
+| `clang -O3 -mcpu=native` on the emitted 9.6 MB `.ll` | **1.61 s** |
+| link | 90 ms |
+| **`lu build` total** | **1.72 s** |
+
+95% of a build is LLVM. The earlier "~63 ms compile" figures in Experiment 3
+are real but describe 20-line kernels, where the whole program is a handful of
+functions; the header-tax argument against C++ says nothing about what happens
+once *our own* IR gets large. It gets slow for the ordinary reason.
+
+## `lu build --fast`: Cranelift object emission
+
+Same code generator as the JIT, emitting a relocatable object instead of
+executable memory, linked against the same C runtime.
+
+| Program | `lu build` | `lu build --fast` | ratio |
+|---|---|---|---|
+| `corpus/dot.lu` | 60 ms | 30 ms | 2.0× |
+| `corpus/bench_qnorm.lu` | 60 ms | 30 ms | 2.0× |
+| `selfhost/interp.lu` | 1.12 s | 0.37 s | 3.0× |
+| `selfhost/codegen.lu` | 1.72 s | 0.57 s | **3.0×** |
+
+Of the 0.57 s, ~0.52 s is Cranelift itself (an equivalent `lu run` compile is
+0.55 s) and ~0.03 s is the link. Our own passes are a small slice: LICM costs
+60 ms, if-conversion is unmeasurable. **The remaining cost is a code generator
+doing its job, not process overhead** — so the ceiling here is ~3×, not the
+order of magnitude that "stop shelling out to clang" suggests.
+
+## What the faster build costs at runtime
+
+| Kernel | `lu build` | `lu build --fast` | LLVM's edge |
+|---|---|---|---|
+| bench_dot | 10.6 ms | 22.5 ms | 2.1× |
+| bench_qnorm | 24.5 ms | 28.1 ms | 1.15× |
+| bench_slerp | 9.4 ms | 28.1 ms | 3.0× |
+
+So `--fast` is a dev-loop build and is documented as one: 3× off the build, up
+to 3× onto the binary. Every performance claim in this file continues to come
+from `lu build`.
+
+## Verdict
+
+Owning the backend is worth about 3× on build latency for large programs and
+nothing at all for small ones. The honest version of AE's "1000× less overhead
+outside the backend" is that *our frontend is already there* — 10 ms against
+clang's 260 ms of header parsing — and that the remaining time is backend time,
+which you pay in any compiler that optimizes. A tier that skips optimization
+buys latency by giving up the thing the other tier is for.

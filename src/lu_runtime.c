@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #endif
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,6 +166,100 @@ char *lu_arr_clone(const char *source) {
   memcpy(copy, source, bytes);
   return copy;
 }
+
+/* Array ownership for the Cranelift AOT tier (`lu build --fast`).
+
+   The LLVM tier copies eagerly through lu_arr_clone above. The Cranelift tier
+   instead shares storage at value-copy boundaries (lu_arr_share) and makes it
+   unique just before a mutation (lu_arr_cow), which is what keeps passing a
+   large record through inlined calls from copying its arrays repeatedly. This
+   mirrors `src/runtime.rs`, the JIT's runtime, symbol for symbol.
+
+   Counts intentionally overestimate: there are no destruction hooks, so an
+   allocation that goes out of scope keeps its count. That can cost one extra
+   copy; it can never produce aliasing. Generated programs run single-threaded
+   (main hands control to one pthread), so the table needs no locking. */
+static struct {
+  const char **keys;
+  long long *counts;
+  size_t capacity; /* always a power of two, or zero before first use */
+  size_t live;
+} g_arr_refs;
+
+static size_t arr_ref_slot(const char **keys, size_t capacity,
+                           const char *key) {
+  /* Fibonacci hashing on the pointer, then linear probing. */
+  size_t index = (size_t)(((uintptr_t)key >> 4) * 11400714819323198485ull) &
+                 (capacity - 1);
+  while (keys[index] && keys[index] != key) {
+    index = (index + 1) & (capacity - 1);
+  }
+  return index;
+}
+
+static void arr_refs_grow(void) {
+  size_t capacity = g_arr_refs.capacity ? g_arr_refs.capacity * 2 : 1024;
+  const char **keys = calloc(capacity, sizeof *keys);
+  long long *counts = calloc(capacity, sizeof *counts);
+  if (!keys || !counts) {
+    fprintf(stderr, "error: out of memory tracking array ownership\n");
+    exit(1);
+  }
+  for (size_t i = 0; i < g_arr_refs.capacity; i++) {
+    if (!g_arr_refs.keys[i]) continue;
+    size_t slot = arr_ref_slot(keys, capacity, g_arr_refs.keys[i]);
+    keys[slot] = g_arr_refs.keys[i];
+    counts[slot] = g_arr_refs.counts[i];
+  }
+  free(g_arr_refs.keys);
+  free(g_arr_refs.counts);
+  g_arr_refs.keys = keys;
+  g_arr_refs.counts = counts;
+  g_arr_refs.capacity = capacity;
+}
+
+/* Address of the count for `key`, inserting it at 1 when absent. */
+static long long *arr_ref_count(const char *key) {
+  if (g_arr_refs.live * 4 >= g_arr_refs.capacity * 3) arr_refs_grow();
+  size_t slot = arr_ref_slot(g_arr_refs.keys, g_arr_refs.capacity, key);
+  if (!g_arr_refs.keys[slot]) {
+    g_arr_refs.keys[slot] = key;
+    g_arr_refs.counts[slot] = 1;
+    g_arr_refs.live++;
+  }
+  return &g_arr_refs.counts[slot];
+}
+
+/* Share storage at a value-copy boundary; the copy happens in lu_arr_cow. */
+char *lu_arr_share(const char *source) {
+  if (!source) return 0;
+  (*arr_ref_count(source))++;
+  return (char *)source;
+}
+
+/* Return uniquely owned storage for an array that is about to be mutated. */
+char *lu_arr_cow(const char *source) {
+  if (!source) return 0;
+  long long *count = arr_ref_count(source);
+  if (*count == 1) return (char *)source;
+  (*count)--;
+  long long logical = ((const long long *)source)[0];
+  long long data_bytes = ((const long long *)source)[1];
+  char *copy = arr_alloc(logical, data_bytes);
+  memcpy(copy, source, 16 + (size_t)data_bytes);
+  *arr_ref_count(copy) = 1;
+  return copy;
+}
+
+/* Math entry points for the Cranelift tier. Its inline polynomial kernels are
+   the default (LU_MATH=call reverts to these), and atan2/pow/fmod always call
+   out. The LLVM tier declares libm directly and never references these. */
+double lu_sin(double x) { return sin(x); }
+double lu_cos(double x) { return cos(x); }
+double lu_acos(double x) { return acos(x); }
+double lu_atan2(double y, double x) { return atan2(y, x); }
+double lu_pow(double base, double exponent) { return pow(base, exponent); }
+double lu_fmod(double x, double y) { return fmod(x, y); }
 
 struct lu_owned_i64 {
   long long *data;

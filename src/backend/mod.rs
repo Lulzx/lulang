@@ -4,5 +4,6 @@
 
 pub mod abi;
 pub mod layout;
+pub mod link;
 pub mod optimization;
 pub mod simd;

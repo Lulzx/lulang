@@ -46,6 +46,7 @@ Requires a Rust toolchain, `clang` for AOT output, and optionally
 lu run     prog.lu              execute via the JIT
 lu interp  prog.lu              execute via the reference interpreter
 lu build   prog.lu              AOT compile through LLVM
+lu build --fast prog.lu         AOT compile through Cranelift (dev loop)
 lu test --runs 1000 prog.lu     run property tests
 lu check   prog.lu              typecheck only
 lu fmt [--check] prog.lu        canonical layout and Unicode operators
@@ -85,6 +86,17 @@ view is used only for record layout and ABI names. Shared component layout,
 the flattened calling convention, and optimization analysis live in
 `src/backend/`, separate from the two emission modules. `tests/conformance.rs`
 generates programs and diffs interpreter, JIT, AOT, and self-hosted output.
+
+The Cranelift code generator drives two tiers from one implementation: the
+in-memory JIT behind `lu run`, and object emission behind `lu build --fast`.
+They differ only in how a program's edges are resolved — the JIT bakes host
+addresses for string literals and resolves externs in process, while object
+output emits data symbols and leaves externs to the linker. `--fast` skips
+LLVM entirely and builds the self-hosted compiler about 3× faster
+(1.72 s → 0.57 s), at the cost of Cranelift's code quality rather than
+`clang -O3`'s: the benchmark kernels run 1.15–3.0× slower than a `lu build`
+binary. It is the dev-loop build; the measured numbers below come from
+`lu build`.
 
 The middle end produces a target-independent legality proof and expression
 plan for order-free `sum` reductions; the JIT and LLVM consume it as

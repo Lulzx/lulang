@@ -108,6 +108,7 @@ fn main() -> ExitCode {
     let mut build_shared = false;
     let mut build_target = None;
     let mut emit_llvm = false;
+    let mut build_fast = false;
     let mut output_name = None;
     let mut property_name = None;
     let mut bindgen_library = None;
@@ -139,6 +140,10 @@ fn main() -> ExitCode {
             }
             "--check" if mode == "fmt" => {
                 check_format = true;
+                i += 1;
+            }
+            "--fast" if mode == "build" => {
+                build_fast = true;
                 i += 1;
             }
             "--lib" if mode == "build" => {
@@ -310,6 +315,7 @@ fn main() -> ExitCode {
                 build_shared,
                 build_target_owned.as_deref(),
                 emit_llvm,
+                build_fast,
                 output_name_owned.as_deref(),
                 property_name_owned.as_deref(),
             )
@@ -521,6 +527,7 @@ fn run_pipeline(
     build_shared: bool,
     build_target: Option<&str>,
     emit_llvm: bool,
+    build_fast: bool,
     output_name: Option<&str>,
     property_name: Option<&str>,
 ) -> Result<bool, String> {
@@ -548,7 +555,18 @@ fn run_pipeline(
                 if build_shared && !build_library {
                     return Err("`--shared` requires `--lib`".into());
                 }
-                if emit_llvm {
+                if build_fast
+                    && (emit_llvm || build_target.is_some() || build_library || build_shared)
+                {
+                    return Err(
+                        "`--fast` cannot be combined with --emit-llvm, --target, --lib, or --shared"
+                            .into(),
+                    );
+                }
+                if build_fast {
+                    let out = jit::build_fast(&ir, path, output_name)?;
+                    eprintln!("built {}", out);
+                } else if emit_llvm {
                     let out = llvm::emit_llvm(&ir, path, output_name)?;
                     eprintln!("built {}", out);
                 } else if let Some(target) = build_target {

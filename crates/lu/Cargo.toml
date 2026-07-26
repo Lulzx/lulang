@@ -20,6 +20,10 @@ name = "frontend_perf"
 path = "../../tests/frontend_perf.rs"
 
 [[test]]
+name = "fast_build"
+path = "../../tests/fast_build.rs"
+
+[[test]]
 name = "interp_perf"
 path = "../../tests/interp_perf.rs"
 
