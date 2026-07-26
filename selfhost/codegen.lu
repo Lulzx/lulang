@@ -2216,14 +2216,14 @@ fn gcoerce(p: P, inout g: G, v: R, want: i64): R {
     let data = newt(g)
     eline(c4(data, " = getelementptr i8, ptr ", g.rs[v.o], ", i64 16"))
     let logical = newt(g)
-    eline(c4(logical, " = load i64, ptr ", g.rs[v.o], ""))
+    eline(c4(logical, " = load i64, ptr ", g.rs[v.o], ", !invariant.load !0"))
     return rpush2(g, want, data, logical)
   }
   if is_mut_slicet(want) and is_arrt(v.t) and mut_slice_elem(want) == elem_of(v.t) {
     let data = newt(g)
     eline(c4(data, " = getelementptr i8, ptr ", g.rs[v.o], ", i64 16"))
     let logical = newt(g)
-    eline(c4(logical, " = load i64, ptr ", g.rs[v.o], ""))
+    eline(c4(logical, " = load i64, ptr ", g.rs[v.o], ", !invariant.load !0"))
     return rpush2(g, want, data, logical)
   }
   return v
@@ -2356,7 +2356,7 @@ fn hoist_checks(p: P, inout g: G, ts: TS, v: str, lo: str, hi: str): i64 {
       let base = newt(g)
       eline(c4(base, " = load ptr, ptr ", g.ptrs[g.gpo[vi]], ""))
       let logical = newt(g)
-      eline(c4(logical, " = load i64, ptr ", base, ""))
+      eline(c4(logical, " = load i64, ptr ", base, ", !invariant.load !0"))
       let neg = newt(g)
       eline(c4(neg, " = icmp slt i64 ", lo, ", 0"))
       let over = newt(g)
@@ -2956,7 +2956,7 @@ fn elem_addrs(p: P, inout g: G, base: str, idx: str, elem: i64, tl: str): i64 {
   var logical = tl
   if tl == "" {
     logical = newt(g)
-    eline(c4(logical, " = load i64, ptr ", base, ""))
+    eline(c4(logical, " = load i64, ptr ", base, ", !invariant.load !0"))
     let bad = newt(g)
     eline(c6(bad, " = icmp uge i64 ", idx, ", ", logical, ""))
     let lb = newl(g)
@@ -3433,7 +3433,7 @@ fn emit_user_call(p: P, inout g: G, fi: i64, at: [i64], ao: [i64], argv: [i64]):
       let data = newt(g)
       eline(c4(data, " = getelementptr i8, ptr ", g.rs[v.o], ", i64 16"))
       let logical = newt(g)
-      eline(c4(logical, " = load i64, ptr ", g.rs[v.o], ""))
+      eline(c4(logical, " = load i64, ptr ", g.rs[v.o], ", !invariant.load !0"))
       parts = join2(parts, c2str("ptr ", data))
       parts = join2(parts, c2str("i64 ", logical))
     } else {
@@ -3655,7 +3655,7 @@ fn emit_call(p: P, inout g: G, e: i64): R {
     if at[0] == 3 { return rpush1(g, 0, g.rs[ao[0] + 1]) }
     if is_slicet(at[0]) or is_mut_slicet(at[0]) { return rpush1(g, 0, g.rs[ao[0] + 1]) }
     let n = newt(g)
-    eline(c4(n, " = load i64, ptr ", g.rs[ao[0]], ""))
+    eline(c4(n, " = load i64, ptr ", g.rs[ao[0]], ", !invariant.load !0"))
     return rpush1(g, 0, n)
   }
   if name == "substr" {
@@ -4358,6 +4358,8 @@ fn emit_module(p: P, inout g: G, triple: str) {
   puts("attributes #0 = { nounwind willreturn memory(none) }")
   putnl()
   puts("attributes #1 = { noreturn }")
+  putnl()
+  puts("!0 = !{}")
   putnl()
   putnl()
   var nextern = 0

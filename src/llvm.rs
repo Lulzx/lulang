@@ -568,7 +568,8 @@ fn build_output(
          declare void @lu_write_file(ptr, i64, ptr, i64)\n\
          declare ptr @lu_chr(i64)\ndeclare ptr @lu_concat(ptr, i64, ptr, i64)\n\
          attributes #0 = { nounwind willreturn memory(none) }\n\
-         attributes #1 = { noreturn }\n\n",
+         attributes #1 = { noreturn }\n\
+         !0 = !{}\n\n",
     );
     for declaration in &ir.externs {
         let ret = if declaration.ret == CType::Str {
@@ -1676,8 +1677,7 @@ impl<'a> Emit<'a> {
             let ty = function.locals[array as usize].ty.clone();
             let CType::Arr(_) = ty else { continue };
             let base = self.load_var(&Self::ir_local(array))?.regs[0].clone();
-            let logical = self.t();
-            self.line(format!("{} = load i64, ptr {}", logical, base));
+            let logical = self.load_array_len(&base);
             let negative = self.t();
             self.line(format!("{} = icmp slt i64 {}, 0", negative, lower));
             let over = self.t();
@@ -2335,8 +2335,7 @@ impl<'a> Emit<'a> {
                         "{} = getelementptr i8, ptr {}, i64 16",
                         data, value.regs[0]
                     ));
-                    let length = self.t();
-                    self.line(format!("{} = load i64, ptr {}", length, value.regs[0]));
+                    let length = self.load_array_len(&value.regs[0].clone());
                     parts.push(format!("ptr {}", data));
                     parts.push(format!("i64 {}", length));
                 }
@@ -2527,8 +2526,7 @@ impl<'a> Emit<'a> {
             | (CType::CMutSlice(want_element), CType::Arr(got_element))
                 if want_element == got_element =>
             {
-                let length = self.t();
-                self.line(format!("{} = load i64, ptr {}", length, value.regs[0]));
+                let length = self.load_array_len(&value.regs[0].clone());
                 let data = self.t();
                 self.line(format!(
                     "{} = getelementptr i8, ptr {}, i64 16",
@@ -2552,6 +2550,27 @@ impl<'a> Emit<'a> {
         })
     }
 
+    /// Load an array's logical length from its header.
+    ///
+    /// The length sits at offset 0 of the same allocation as the elements
+    /// (which start at offset 16), so without help LLVM must assume a store
+    /// through the element pointer might clobber it. In an indexed `while`
+    /// loop that cost a reload of the length *and* a repeat of the bounds
+    /// compare after every element store.
+    ///
+    /// `arr_alloc` writes the header once at construction and `lu_arr_clone`
+    /// memcpys into a fresh allocation; no path ever rewrites a live array's
+    /// length. `!invariant.load` states exactly that, which lets LLVM hoist
+    /// the load out of the loop and CSE the redundant checks.
+    fn load_array_len(&mut self, base: &str) -> String {
+        let out = self.t();
+        self.line(format!(
+            "{} = load i64, ptr {}, !invariant.load !0",
+            out, base
+        ));
+        out
+    }
+
     fn elem_addrs(
         &mut self,
         base: &str,
@@ -2563,8 +2582,7 @@ impl<'a> Emit<'a> {
         let logical = match trusted {
             Some(n) => n,
             None => {
-                let logical = self.t();
-                self.line(format!("{} = load i64, ptr {}", logical, base));
+                let logical = self.load_array_len(base);
                 let bad = self.t();
                 self.line(format!("{} = icmp uge i64 {}, {}", bad, idx, logical));
                 let lb = self.l();
@@ -3148,8 +3166,7 @@ impl<'a> Emit<'a> {
                     }
                     _ => return Err("`len` expects array".into()),
                 }
-                let n = self.t();
-                self.line(format!("{} = load i64, ptr {}", n, args[0].regs[0]));
+                let n = self.load_array_len(&args[0].regs[0].clone());
                 Ok(EV {
                     ty: CType::I64,
                     regs: vec![n],

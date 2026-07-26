@@ -470,3 +470,44 @@ fn approx_eq_stays_float_on_integer_operands() {
         b"true false true\n",
     );
 }
+
+/// Array lengths are loaded with `!invariant.load`, which lets LLVM hoist the
+/// length out of an indexed `while` loop and CSE the repeated bounds compares
+/// (the element store and the length live in one allocation, so without the
+/// metadata every store forced a reload and a re-check). The checks themselves
+/// must still fire — on reads, and on writes from a loop that walks off the
+/// end.
+#[test]
+fn bounds_checks_survive_the_invariant_length_load() {
+    let read = "\
+fn five(): i64 { return 5 }
+main {
+  var a = arr(3, 0)
+  print(a[five()])
+}
+";
+    let write = "\
+main {
+  var a = arr(3, 0)
+  var i = 0
+  while i < 20 {
+    a[i] = i
+    i = i + 1
+  }
+}
+";
+    for source in [read, write] {
+        for mode in ["interp", "run"] {
+            let output = run(mode, source);
+            assert!(
+                !output.status.success(),
+                "{mode} did not trap on an out-of-bounds access"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("out of bounds"),
+                "{mode} reported the wrong error: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
