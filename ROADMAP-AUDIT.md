@@ -71,6 +71,35 @@ never cross the boundary. The invariant is exercised by
   `tests/ffi_export.rs`, `tests/sdk.rs`, and the Python package tests cover
   generated-library callers and callback lifetime.
 
+## Compiler-owned layout evidence
+
+The boundary invariant buys freedom over internal layout, and that freedom is
+spent rather than merely asserted. Array storage packs components to their
+natural widths (`Component::bytes` in `src/backend/layout.rs`: 4 for `f32`, 8
+for `i64`/`f64`/pointers, 16 for explicit vector components) with each SoA
+plane separately 8-byte aligned, and the array header carries 16 bytes so the
+logical length is cached instead of recomputed by an `sdiv` on the element
+stride at every bounds check and slice coercion. Nothing about this is visible
+at the C boundary; no manifest or generated header changed.
+
+- Packed `f32` lanes are the payoff: `f32x4` joins `f64x2` and exact wrapping
+  `i64x2` in the shared SIMD plan, with per-component plane spans and
+  byte-offset addressing shared by both compiled backends through
+  `src/backend/simd.rs`.
+- `proves_packed_f32_array_reductions_for_simd` (`src/backend/optimization.rs`)
+  covers the legality proof; the retired guard
+  `keeps_f32_reductions_scalar_until_arrays_are_packed` is replaced by
+  `packed_f32_simd_reductions_handle_four_lane_vectors_and_scalar_tails` in
+  `tests/conformance.rs`, which exercises explicit vector values and
+  intrinsics for all three element types.
+- `tests/selfhost_sync.rs` byte-compares host and selfhost emission of packed
+  `f32x4` loads, so the migration moved both compilers together.
+- `tests/wasm.rs` sums a packed `f32` array of odd length through both wasm
+  targets, covering the SIMD128 scalar tail.
+- Issue 6 in [KNOWN-ISSUES.md](KNOWN-ISSUES.md) records the constraint this
+  closed, and its repro, so a regression to uniform 8-byte slots is
+  recognizable.
+
 ## M8 plan evidence
 
 - Slices A, B, and C are represented by four-tier import conformance,
@@ -135,6 +164,17 @@ python3 examples/run_embedded_notebook.py
 npm test && npm run lint                 # from playground/
 ```
 
+On 2026-07-26 the packed-layout migration passed the first three of those
+gates — 87 tests, a stage-1/2/3 byte-identical fixpoint, and four-tier
+agreement across the corpus, with the wasm suite executing rather than
+skipping. The notebook and playground gates were not rerun; neither observes
+internal array layout.
+
+Note for runtime changes: `selfhost/build.sh` caches its compiled runtime
+object at `$TMPDIR/lu_selfhost_runtime.o` and does not notice that
+`src/lu_runtime.c` changed. Delete it before bootstrapping or the gate
+silently tests a stale runtime.
+
 The release suite includes all four native tiers, generated C and Python
 interfaces, package/docs/editor/numerics/physics/autodiff tests, WASI/web
 targets when Zig is available, the M8 byte-identity checks, and full compiled
@@ -142,9 +182,9 @@ plus scaled reference-interpreter corpus agreement.
 
 ## Explicitly deferred by the roadmap
 
-Callbacks, owning zero-copy array export handles, reverse-mode AD, native WASM
-SIMD parity, a package registry, and the broader bindgen C surface remain
-later work. The browser's current
+Reverse-mode AD, a package registry, and the broader bindgen C surface remain
+later work. Typed callbacks, owning zero-copy array export handles, and wasm
+SIMD parity have since shipped and are evidenced above. The browser's current
 interpreter is local TypeScript; compiling the reference CFG evaluator to
 WASM plus property/IR panels and permalinks is the next playground increment.
 These are not silently claimed by the shipped v0.1/foundation slices.
