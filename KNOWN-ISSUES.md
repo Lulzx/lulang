@@ -2,9 +2,9 @@
 
 State of the compiler regressions and design constraints found while
 pre-flighting M8 and the shared SIMD middle-end. Fixed entries retain their
-repros so a reintroduction is recognizable. One entry is open: issue 8,
-nondeterministic LLVM emission, which predates the Cranelift AOT tier and costs
-byte-reproducible `lu build` output without affecting program behavior.
+repros so a reintroduction is recognizable. Nothing is currently open: the last
+entry (issue 8, nondeterministic emission) closed by walking loop bodies in
+block-index order instead of `HashSet` order.
 
 ## 1. FIXED — JIT assumed topological block order after IR inlining
 
@@ -219,7 +219,7 @@ reference tier in seconds (`bench_dot` 6.9 s, `bench_qnorm` 18.6 s,
 interprets mechanically scaled inputs to keep the correctness gate quick; that
 scaling is now a speed choice rather than a necessity.
 
-## 8. OPEN — the Rust LLVM emitter is not deterministic
+## 8. FIXED — emission was not deterministic
 
 **Symptom:** the same source, the same binary, the same environment, three
 different outputs:
@@ -241,23 +241,41 @@ two temporaries swap numbers and their uses follow:
 >   %t4892 = load ptr, ptr %t64
 ```
 
-**Cause:** not yet located. The shape (adjacent temporaries permuting) points
-at iteration over an unordered collection during emission — `src/llvm.rs`
-carries several `HashMap`/`HashSet`s, as does the shared `analyze_cfg`.
+**Cause:** `analyze_cfg` in `src/backend/optimization.rs` walked a loop body by
+iterating `natural`, the `HashSet<BlockId>` of blocks in the loop. The order
+decides which arrays the analysis discovers first, `arrays` order decides which
+loop-entry range checks are hoisted first, and those emit temporaries — so the
+process's hash seed reached the numbering of every temporary after them. It
+only shows up when two arrays are *first* indexed in different blocks of the
+body; with both first accesses in one block, instruction order settles it,
+which is why the corpus kernels looked stable and only the self-hosted compiler
+exposed it.
+
+This is shared middle-end code, so both compiled tiers had it: the LLVM tier
+through temporary numbering, the Cranelift tier through the same hoisted
+checks.
+
+**Fix (landed):** walk `0..blocks.len()` and skip blocks outside the loop.
+`if_convert`'s set of assigned locals had the same hazard and is now a
+`BTreeSet`; that one was ordered defensively rather than in response to a
+failure — the order does vary per run (measured), but the selects are
+independent and Cranelift's egraph pass re-canonicalizes them, so it never
+reached the output.
 
 **Scope:** found while confirming that `LU_INLINE` cannot reach the LLVM tier.
-Reproduced unchanged at commit `43ae1a2`, so it predates the Cranelift AOT
-work. Program behavior is unaffected — `tools/verify_corpus.py` agrees across
-all four tiers on every run — and the self-hosted bootstrap fixpoint is
-unaffected because it compares output from `selfhost/codegen.lu`, which is
-deterministic (the same file emitted through the JIT at inline budgets 256 and
-3000 is byte-identical). What it costs is byte-reproducible host `lu build`
-output, which the project otherwise takes seriously enough to gate the
-bootstrap on.
+Reproduced unchanged at commit `43ae1a2`, so it predated the Cranelift AOT
+work. Program behavior was never affected — `tools/verify_corpus.py` agreed
+across all four tiers either way — and the bootstrap fixpoint held throughout,
+because it compares output from `selfhost/codegen.lu` rather than the Rust
+emitter. What it cost was byte-reproducible `lu build` output.
 
-**Suggested fix:** switch the emission-order-visible maps to `BTreeMap`/
-`IndexMap`, or seed a deterministic hasher, then add a regression that emits
-the same module twice and compares bytes.
+**Guard:** `tests/determinism.rs` compiles a program whose two arrays are first
+indexed in different blocks of one loop, five times in five processes, and
+compares the bytes of both `--emit-llvm` and `--fast` output. Reverting the
+`analyze_cfg` fix fails both. Verified beyond the test: `--emit-llvm`,
+`lu build`, and `lu build --fast` each produce one distinct hash over four
+builds of every corpus program, `selfhost/interp.lu`, and
+`selfhost/codegen.lu`.
 
 ## Incident note: lost uncommitted jit.rs delta
 

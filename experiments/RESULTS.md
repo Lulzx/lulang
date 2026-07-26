@@ -458,15 +458,21 @@ Updated tier comparison at the new default:
 | bench_qnorm | 28.7 ms | 30.4 ms | 1.06× |
 | bench_slerp | 11.2 ms | 31.7 ms | 2.82× |
 
-## Note: the LLVM emitter is not deterministic
+## Note: emission was not deterministic (found here, fixed since)
 
 While confirming that `LU_INLINE` cannot reach the LLVM tier, `lu build
 --emit-llvm selfhost/codegen.lu` turned out to produce a different `.ll` on
 every run — three runs, three hashes, differing only in temporary numbering
 (`%t64`/`%t65` swapped and the uses that follow). Reproduced unchanged at
-commit `43ae1a2`, so it predates the Cranelift AOT work; the cause is
-presumably an unordered collection in emission. It does not affect program
-behavior, and the self-hosted bootstrap fixpoint is unaffected because that
-compares output from `selfhost/codegen.lu`, not the Rust emitter. It does mean
-host `lu build` output is not byte-reproducible. Filed as issue 8 in
-KNOWN-ISSUES.md.
+commit `43ae1a2`, so it predated the Cranelift AOT work.
+
+The cause was `analyze_cfg` walking a loop body by iterating its
+`HashSet<BlockId>`: that order decides which arrays are discovered first, which
+decides the order of the hoisted loop-entry range checks, which emit
+temporaries. Shared middle-end code, so both compiled tiers had it. It needs
+two arrays *first* indexed in different blocks of one body, which is why the
+corpus kernels looked stable and only the self-hosted compiler exposed it.
+Fixed by walking blocks in index order; issue 8 in KNOWN-ISSUES.md has the
+detail, and `tests/determinism.rs` guards it. All three artifacts
+(`--emit-llvm`, `lu build`, `lu build --fast`) are now byte-identical across
+repeated builds of every corpus program and both self-hosted compilers.

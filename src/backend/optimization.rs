@@ -429,7 +429,15 @@ pub fn analyze_cfg(function: &Function) -> CfgAnalysis {
 
             let mut arrays = Vec::new();
             let mut access_locations = Vec::new();
-            for &block_id in &natural {
+            // Walk the body in block-index order rather than iterating
+            // `natural` directly: it is a `HashSet`, and its order varies from
+            // run to run. `arrays` decides the order of the hoisted loop-entry
+            // range checks, so iterating it unordered makes emitted code differ
+            // between builds of the same source.
+            for block_id in 0..function.blocks.len() as BlockId {
+                if !natural.contains(&block_id) {
+                    continue;
+                }
                 for (index, inst) in function.blocks[block_id as usize]
                     .instructions
                     .iter()
@@ -1122,7 +1130,14 @@ pub fn if_convert(function: &mut Function) {
                 _ => moved.push(inst),
             }
         }
-        let locals: HashSet<_> = then_stores
+        // Ordered: the loop below appends `Load`/`Select`/`Store` instructions
+        // and allocates value ids as it goes, so an unordered set gives the same
+        // source different IR on each run. That was measured — a `HashSet` here
+        // permutes the locals every run — but it does not currently reach the
+        // output, because the selects are independent and Cranelift's egraph
+        // pass puts them back in a canonical order. Ordering it anyway keeps the
+        // IR itself reproducible for anything that inspects or serializes it.
+        let locals: std::collections::BTreeSet<_> = then_stores
             .keys()
             .chain(else_stores.keys())
             .copied()
