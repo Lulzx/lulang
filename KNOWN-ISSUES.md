@@ -1,8 +1,10 @@
-# Known issues (2026-07-23)
+# Known issues (2026-07-26)
 
 State of the compiler regressions and design constraints found while
-pre-flighting M8 and the shared SIMD middle-end. Fixed regressions retain their
-repros; open constraints document intentional fallbacks.
+pre-flighting M8 and the shared SIMD middle-end. Fixed entries retain their
+repros so a reintroduction is recognizable. Nothing is currently open: the last
+constraint (issue 6, uniform 8-byte array slots blocking f32 vectors) closed
+with the packed-layout migration.
 
 ## 1. FIXED — JIT assumed topological block order after IR inlining
 
@@ -130,21 +132,40 @@ arrays, and rebinding. Bootstrap again reaches a stage-1/2/3 byte-identical
 fixpoint. Fresh observatory medians put host and selfhost dot AOT at 16.102 ms
 and 15.746 ms respectively, replacing the unsound 64.053/13.677 comparison.
 
-## 6. OPEN — packed f32 SIMD requires an array-layout migration
+## 6. FIXED — packed f32 SIMD required an array-layout migration
 
-Scalar array components currently occupy uniform 8-byte storage slots,
-including `f32`. This keeps record flattening, SoA plane offsets, the C
-runtime, and both bootstrapped emitters on one simple addressing contract, but
-adjacent `f32` language elements are not adjacent 4-byte machine values.
-Loading `<4 x float>` from that storage would therefore mix values with slot
-padding and is incorrect.
-
-The shared SIMD plan deliberately accepts f64 and exact wrapping i64
-reductions while leaving f32 scalar. Enabling f32x4 requires a coordinated
-packed-layout change across allocation sizing, element addressing, SoA plane
-offsets, JIT, host LLVM, selfhost LLVM, exported array wrappers, and WASM.
-`keeps_f32_reductions_scalar_until_arrays_are_packed` guards against an unsafe
+Scalar array components used to occupy uniform 8-byte storage slots, including
+`f32`. That kept record flattening, SoA plane offsets, the C runtime, and both
+bootstrapped emitters on one simple addressing contract, but adjacent `f32`
+language elements were not adjacent 4-byte machine values, so loading
+`<4 x float>` from that storage would have mixed values with slot padding.
+The shared SIMD plan therefore accepted f64 and exact wrapping i64 reductions
+while leaving f32 scalar, and
+`keeps_f32_reductions_scalar_until_arrays_are_packed` guarded against an unsafe
 partial implementation.
+
+**Fix (landed):** the coordinated packed-layout migration. Element storage now
+uses packed component widths (`Component::bytes` in `src/backend/layout.rs`:
+4 for `f32`, 8 for `i64`/`f64`/pointers, 16 for the explicit vector
+components), with each SoA plane individually 8-byte aligned. The array header
+grew from 8 to 16 bytes and caches the logical length, so bounds checks and
+slice coercions no longer recompute it with an `sdiv` by the element stride.
+SIMD load/store in both backends addresses by byte offset with per-component
+plane spans, shared through `src/backend/simd.rs`.
+
+The guard test is replaced by
+`packed_f32_simd_reductions_handle_four_lane_vectors_and_scalar_tails`
+(explicit `f32x4` values and intrinsics alongside `f64x2`/`i64x2`),
+`proves_packed_f32_array_reductions_for_simd` in
+`src/backend/optimization.rs`, and a selfhost_sync assertion that host and
+selfhost emit packed `f32x4` loads byte-for-byte. WASM coverage sums a packed
+`f32` array. Verified: `cargo test --release` (87 tests),
+`selfhost/build.sh --bootstrap` at a stage-1/2/3 byte-identical fixpoint, and
+`tools/verify_corpus.py` four-tier agreement across the corpus.
+
+Note for anyone touching `src/lu_runtime.c`: `selfhost/build.sh` caches the
+compiled runtime object at `$TMPDIR/lu_selfhost_runtime.o` and does not notice
+that the source changed. Delete it before bootstrapping after a runtime edit.
 
 ## Incident note: lost uncommitted jit.rs delta
 

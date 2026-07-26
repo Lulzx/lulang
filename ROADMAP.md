@@ -19,6 +19,11 @@ arrays, flattened calling conventions, whole-program optimization). The FFI
 must therefore be a **boundary representation**: a deliberately small,
 checker-enforced set of C-compatible types crosses the boundary; ordinary
 lulang records and arrays keep unstable, compiler-controlled layout forever.
+That freedom is load-bearing and gets used: array storage now packs components
+to their natural widths (`f32` in 4 bytes) with individually aligned SoA
+planes, and the 16-byte array header caches the logical length so bounds checks
+and slice coercions skip an `sdiv` by the element stride. Both changes are
+invisible at the boundary and would have been impossible under a promised ABI.
 We never promise a stable internal ABI. Boundary-only types (`c_ptr[T]`,
 `c_slice[T]`, `@c_layout` records, opaque handles) are added as needed rather
 than exposing internals.
@@ -210,7 +215,8 @@ The second backend target after the C ABI — not GPU — now ships as `lu build
 --target wasm32-wasi` and `--target wasm32-web`. WASI produces a command
 module; the web target produces a reactor plus a dependency-free loader with a
 minimal byte-output host. Both are executable integration-tested, including
-SIMD128 f64 and exact wrapping i64 reductions with odd-length scalar tails.
+SIMD128 packed f32, f64, and exact wrapping i64 reductions with odd-length
+scalar tails.
 Native dynamic externs fail early because they have no portable wasm meaning.
 
 This enables browser kernels, serverless, JS embedding, portable benchmark
