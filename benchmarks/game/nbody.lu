@@ -1,0 +1,170 @@
+// The Computer Language Benchmarks Game — n-body
+//   https://benchmarksgame-team.pages.debian.net/benchmarksgame/description/nbody.html
+//
+// Jovian planets, symplectic-Euler integration, dt = 0.01.
+// Prints the system energy before and after N steps, to 9 decimals.
+//
+//   lu build benchmarks/game/nbody.lu && ./nbody 50000000
+//
+// Layout note: bodies are held as parallel arrays rather than an array of
+// records, because indexed field assignment (`b[i].vx = …`) is not in the
+// language. That is the SoA form the compiler would pick anyway.
+
+// The language has no top-level constants, so the body count is a function;
+// it inlines and const-folds away.
+fn n_bodies(): i64 { return 5 }
+
+// ---- fixed-decimal output (C `%.9f`) ------------------------------------
+
+fn put_f9(v: f64) {
+  var x = v
+  if x < 0.0 {
+    puts("-")
+    x = -x
+  }
+  let scaled = int(floor(x * 1000000000.0 + 0.5))
+  puti(scaled / 1000000000)
+  puts(".")
+  var div = 100000000
+  let frac = scaled % 1000000000
+  while div > 0 {
+    puti(frac / div % 10)
+    div = div / 10
+  }
+  putnl()
+}
+
+// ---- argument parsing ---------------------------------------------------
+
+fn parse_int(s: str): i64 {
+  var acc = 0
+  var i = 0
+  while i < len(s) {
+    let d = s[i] - '0'
+    if d >= 0 and d <= 9 {
+      acc = acc * 10 + d
+    }
+    i = i + 1
+  }
+  return acc
+}
+
+fn steps_from_args(): i64 {
+  if nargs() > 0 {
+    return parse_int(arg(0))
+  }
+  return 1000
+}
+
+// ---- energy -------------------------------------------------------------
+
+fn energy(px: [f64], py: [f64], pz: [f64], vx: [f64], vy: [f64], vz: [f64], mass: [f64]): f64 {
+  var e = 0.0
+  for i in 0..n_bodies() {
+    e = e + 0.5 * mass[i] * (vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i])
+    for j in i + 1..n_bodies() {
+      let dx = px[i] - px[j]
+      let dy = py[i] - py[j]
+      let dz = pz[i] - pz[j]
+      e = e - mass[i] * mass[j] / sqrt(dx * dx + dy * dy + dz * dz)
+    }
+  }
+  return e
+}
+
+main {
+  let pi = 3.141592653589793
+  let solar_mass = 4.0 * pi * pi
+  let days_per_year = 365.24
+
+  var px = arr(n_bodies(), 0.0)
+  var py = arr(n_bodies(), 0.0)
+  var pz = arr(n_bodies(), 0.0)
+  var vx = arr(n_bodies(), 0.0)
+  var vy = arr(n_bodies(), 0.0)
+  var vz = arr(n_bodies(), 0.0)
+  var mass = arr(n_bodies(), 0.0)
+
+  // 0: sun — position and velocity zero, corrected below
+  mass[0] = solar_mass
+
+  // 1: jupiter
+  px[1] = 4.84143144246472090
+  py[1] = -1.16032004402742839
+  pz[1] = -0.103622044471123109
+  vx[1] = 0.00166007664274403694 * days_per_year
+  vy[1] = 0.00769901118419740425 * days_per_year
+  vz[1] = -0.0000690460016972063023 * days_per_year
+  mass[1] = 0.000954791938424326609 * solar_mass
+
+  // 2: saturn
+  px[2] = 8.34336671824457987
+  py[2] = 4.12479856412430479
+  pz[2] = -0.403523417114321381
+  vx[2] = -0.00276742510726862411 * days_per_year
+  vy[2] = 0.00499852801234917238 * days_per_year
+  vz[2] = 0.0000230417297573763929 * days_per_year
+  mass[2] = 0.000285885980666130812 * solar_mass
+
+  // 3: uranus
+  px[3] = 12.8943695621391310
+  py[3] = -15.1111514016986312
+  pz[3] = -0.223307578892655734
+  vx[3] = 0.00296460137564761618 * days_per_year
+  vy[3] = 0.00237847173959480950 * days_per_year
+  vz[3] = -0.0000296589568540237556 * days_per_year
+  mass[3] = 0.0000436624404335156298 * solar_mass
+
+  // 4: neptune
+  px[4] = 15.3796971148509165
+  py[4] = -25.9193146099879641
+  pz[4] = 0.179258772950371181
+  vx[4] = 0.00268067772490389322 * days_per_year
+  vy[4] = 0.00162824170038242295 * days_per_year
+  vz[4] = -0.0000951592254519715870 * days_per_year
+  mass[4] = 0.0000515138902046611451 * solar_mass
+
+  // offset momentum so the system barycentre stays put
+  var ox = 0.0
+  var oy = 0.0
+  var oz = 0.0
+  for i in 0..n_bodies() {
+    ox = ox + vx[i] * mass[i]
+    oy = oy + vy[i] * mass[i]
+    oz = oz + vz[i] * mass[i]
+  }
+  vx[0] = -ox / solar_mass
+  vy[0] = -oy / solar_mass
+  vz[0] = -oz / solar_mass
+
+  put_f9(energy(px, py, pz, vx, vy, vz, mass))
+
+  let dt = 0.01
+  let steps = steps_from_args()
+  for _s in 0..steps {
+    for i in 0..n_bodies() {
+      for j in i + 1..n_bodies() {
+        let dx = px[i] - px[j]
+        let dy = py[i] - py[j]
+        let dz = pz[i] - pz[j]
+        let d2 = dx * dx + dy * dy + dz * dz
+        let mag = dt / (d2 * sqrt(d2))
+        let mi = mass[i] * mag
+        let mj = mass[j] * mag
+        vx[i] = vx[i] - dx * mj
+        vy[i] = vy[i] - dy * mj
+        vz[i] = vz[i] - dz * mj
+        vx[j] = vx[j] + dx * mi
+        vy[j] = vy[j] + dy * mi
+        vz[j] = vz[j] + dz * mi
+      }
+    }
+    for i in 0..n_bodies() {
+      px[i] = px[i] + dt * vx[i]
+      py[i] = py[i] + dt * vy[i]
+      pz[i] = pz[i] + dt * vz[i]
+    }
+  }
+
+  put_f9(energy(px, py, pz, vx, vy, vz, mass))
+}

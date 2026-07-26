@@ -1,0 +1,72 @@
+{
+  "machine": {
+    "platform": "macOS-26.6-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "processor": "arm",
+    "cpu_count": 12,
+    "clang": "Apple clang version 21.0.0 (clang-2100.1.1.101)"
+  },
+  "runs": 1,
+  "results": [
+    {
+      "program": "nbody",
+      "n": "500000",
+      "agree": true,
+      "output_sha256": "7fee18aa4de449f07aa173bae7a37df103ff0317ed8055566e6f3c9358c09b2c",
+      "times": {
+        "lulang-aot": 0.4748130000079982,
+        "lulang-jit": 0.4751400420209393,
+        "c-O3": 0.43920491699827835,
+        "c-O3-fastmath": 0.4478888330049813
+      }
+    },
+    {
+      "program": "spectralnorm",
+      "n": "500",
+      "agree": true,
+      "output_sha256": "8fdf61c16abc8435add5a81e7f774b75b689673474c916e8859ebe8f8a528277",
+      "times": {
+        "lulang-aot": 0.46965329098748043,
+        "lulang-jit": 0.017034417018294334,
+        "c-O3": 0.47746408300008625,
+        "c-O3-fastmath": 0.43414704099996015
+      }
+    },
+    {
+      "program": "fannkuchredux",
+      "n": "9",
+      "agree": true,
+      "output_sha256": "8240a83dc671a1906b1f4ce51a46866362bec862c62128f4429ec1f3e7bf1bb8",
+      "times": {
+        "lulang-aot": 0.5155072920024395,
+        "lulang-jit": 0.1670149170095101,
+        "c-O3": 0.44231295798090287,
+        "c-O3-fastmath": 0.5120701249979902
+      }
+    },
+    {
+      "program": "mandelbrot",
+      "n": "1000",
+      "agree": true,
+      "output_sha256": "227d5af646f69e966ecb8ac6fc65ef8b36ae9df2aa58623d10139b204cafddd8",
+      "times": {
+        "lulang-aot": 0.5372859589988366,
+        "lulang-jit": 0.09344075000262819,
+        "c-O3": 0.5201281670015305,
+        "c-O3-fastmath": 0.5109662910108455
+      }
+    },
+    {
+      "program": "binarytrees",
+      "n": "14",
+      "agree": true,
+      "output_sha256": "b0af3a8c1c6ccf57c7f99716bffd9c6f7365dac78fc307ef6c1903ba1a1b87a3",
+      "times": {
+        "lulang-aot": 0.42845066700829193,
+        "lulang-jit": 0.09415470800013281,
+        "c-O3": 0.4314735420048237,
+        "c-O3-fastmath": 0.428818082989892
+      }
+    }
+  ]
+}

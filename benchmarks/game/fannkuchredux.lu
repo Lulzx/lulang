@@ -1,0 +1,102 @@
+// The Computer Language Benchmarks Game — fannkuch-redux
+//   https://benchmarksgame-team.pages.debian.net/benchmarksgame/description/fannkuchredux.html
+//
+// Repeatedly flip the prefix of a permutation until it starts with 1, over
+// every permutation of n elements. Prints the checksum, then the maximum
+// flip count.
+//
+//   lu build benchmarks/game/fannkuchredux.lu && ./fannkuchredux 12
+//
+// The language has no `break`, so the permutation-advance loop below carries
+// explicit `advanced` / `done` flags instead of breaking out.
+
+fn parse_int(s: str): i64 {
+  var acc = 0
+  var i = 0
+  while i < len(s) {
+    let d = s[i] - '0'
+    if d >= 0 and d <= 9 { acc = acc * 10 + d }
+    i = i + 1
+  }
+  return acc
+}
+
+main {
+  var n = 7
+  if nargs() > 0 { n = parse_int(arg(0)) }
+
+  var perm1 = arr(n, 0)
+  for i in 0..n { perm1[i] = i }
+  var perm = arr(n, 0)
+  var count = arr(n + 1, 0)
+
+  var maxflips = 0
+  var checksum = 0
+  var permcount = 0
+  var r = n
+  var done = false
+
+  while not done {
+    while r != 1 {
+      count[r - 1] = r
+      r = r - 1
+    }
+
+    for i in 0..n { perm[i] = perm1[i] }
+
+    // flip the prefix until perm[0] is 0
+    var flips = 0
+    var k = perm[0]
+    while k != 0 {
+      var i = 0
+      var j = k
+      while i < j {
+        let t = perm[i]
+        perm[i] = perm[j]
+        perm[j] = t
+        i = i + 1
+        j = j - 1
+      }
+      flips = flips + 1
+      k = perm[0]
+    }
+
+    if flips > maxflips { maxflips = flips }
+    if permcount % 2 == 0 {
+      checksum = checksum + flips
+    } else {
+      checksum = checksum - flips
+    }
+    permcount = permcount + 1
+
+    // incremental generation of the next permutation
+    var advanced = false
+    while not advanced and not done {
+      if r == n {
+        done = true
+      } else {
+        let perm0 = perm1[0]
+        var i = 0
+        while i < r {
+          perm1[i] = perm1[i + 1]
+          i = i + 1
+        }
+        perm1[r] = perm0
+        count[r] = count[r] - 1
+        if count[r] > 0 {
+          advanced = true
+        } else {
+          r = r + 1
+        }
+      }
+    }
+  }
+
+  puti(checksum)
+  putnl()
+  puts("Pfannkuchen(")
+  puti(n)
+  puts(") = ")
+  puti(maxflips)
+  putnl()
+}

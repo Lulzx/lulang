@@ -1,0 +1,81 @@
+// The Computer Language Benchmarks Game — spectral-norm
+//   https://benchmarksgame-team.pages.debian.net/benchmarksgame/description/spectralnorm.html
+//
+// Largest eigenvalue of the infinite matrix A, by the power method:
+// 10 rounds of u <- AtA u, then sqrt(uAtAu / uu), printed to 9 decimals.
+//
+//   lu build benchmarks/game/spectralnorm.lu && ./spectralnorm 5500
+//
+// The inner products are written with `sum`, the order-free reduction
+// primitive — exactly the shape the language exists to vectorize.
+
+fn put_f9(v: f64) {
+  var x = v
+  if x < 0.0 {
+    puts("-")
+    x = -x
+  }
+  let scaled = int(floor(x * 1000000000.0 + 0.5))
+  puti(scaled / 1000000000)
+  puts(".")
+  var div = 100000000
+  let frac = scaled % 1000000000
+  while div > 0 {
+    puti(frac / div % 10)
+    div = div / 10
+  }
+  putnl()
+}
+
+fn parse_int(s: str): i64 {
+  var acc = 0
+  var i = 0
+  while i < len(s) {
+    let d = s[i] - '0'
+    if d >= 0 and d <= 9 { acc = acc * 10 + d }
+    i = i + 1
+  }
+  return acc
+}
+
+// A(i,j) = 1 / ((i+j)(i+j+1)/2 + i + 1)
+fn eval_a(i: i64, j: i64): f64 {
+  return 1.0 / float((i + j) * (i + j + 1) / 2 + i + 1)
+}
+
+fn mul_av(n: i64, v: [f64]): [f64] {
+  var out = arr(n, 0.0)
+  for i in 0..n {
+    out[i] = sum(j in 0..n) eval_a(i, j) * v[j]
+  }
+  return out
+}
+
+fn mul_atv(n: i64, v: [f64]): [f64] {
+  var out = arr(n, 0.0)
+  for i in 0..n {
+    out[i] = sum(j in 0..n) eval_a(j, i) * v[j]
+  }
+  return out
+}
+
+fn mul_atav(n: i64, v: [f64]): [f64] {
+  return mul_atv(n, mul_av(n, v))
+}
+
+main {
+  var n = 100
+  if nargs() > 0 { n = parse_int(arg(0)) }
+
+  var u = arr(n, 1.0)
+  var v = arr(n, 0.0)
+
+  for _round in 0..10 {
+    v = mul_atav(n, u)
+    u = mul_atav(n, v)
+  }
+
+  let vbv = sum(i in 0..n) u[i] * v[i]
+  let vv = sum(i in 0..n) v[i] * v[i]
+  put_f9(sqrt(vbv / vv))
+}

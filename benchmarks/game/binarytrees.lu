@@ -1,0 +1,119 @@
+// The Computer Language Benchmarks Game — binary-trees
+//   https://benchmarksgame-team.pages.debian.net/benchmarksgame/description/binarytrees.html
+//
+// Allocate and traverse many perfect binary trees.
+//
+//   lu build benchmarks/game/binarytrees.lu && ./binarytrees 21
+//
+// Allocation note: lulang has value semantics and no heap-allocated records,
+// so nodes live in a bump-allocated arena — two parallel `[i64]` arrays of
+// child indices, with index 0 as the null node. This is the same strategy as
+// the arena/pool-allocator entries the benchmark accepts in C. Trees are
+// still built and checked by real recursion over that arena; the scratch
+// arena's bump pointer is reset between trees instead of being freed.
+
+fn parse_int(s: str): i64 {
+  var acc = 0
+  var i = 0
+  while i < len(s) {
+    let d = s[i] - '0'
+    if d >= 0 and d <= 9 { acc = acc * 10 + d }
+    i = i + 1
+  }
+  return acc
+}
+
+fn shift_left(v: i64, k: i64): i64 {
+  var out = v
+  var i = 0
+  while i < k {
+    out = out * 2
+    i = i + 1
+  }
+  return out
+}
+
+// Nodes needed for a perfect tree of the given depth: 2^(depth+1) - 1.
+fn tree_nodes(depth: i64): i64 {
+  return shift_left(1, depth + 1) - 1
+}
+
+// Bump-allocate a perfect tree of `depth`, returning its root index.
+fn bottom_up_tree(depth: i64, inout left: [i64], inout right: [i64], inout next: i64): i64 {
+  let node = next
+  next = next + 1
+  if depth > 0 {
+    let l = bottom_up_tree(depth - 1, left, right, next)
+    let r = bottom_up_tree(depth - 1, left, right, next)
+    left[node] = l
+    right[node] = r
+  } else {
+    left[node] = 0
+    right[node] = 0
+  }
+  return node
+}
+
+// 1 for a leaf, otherwise 1 + both subtrees.
+fn check_tree(node: i64, inout left: [i64], inout right: [i64]): i64 {
+  let l = left[node]
+  if l == 0 {
+    return 1
+  }
+  return 1 + check_tree(l, left, right) + check_tree(right[node], left, right)
+}
+
+main {
+  var n = 10
+  if nargs() > 0 { n = parse_int(arg(0)) }
+
+  let min_depth = 4
+  var max_depth = min_depth + 2
+  if n > max_depth { max_depth = n }
+  let stretch_depth = max_depth + 1
+
+  // scratch arena: big enough for the stretch tree, reused for every tree
+  var s_left = arr(tree_nodes(stretch_depth) + 1, 0)
+  var s_right = arr(tree_nodes(stretch_depth) + 1, 0)
+  var s_next = 1
+
+  // long-lived arena: holds one tree of max_depth for the whole run
+  var l_left = arr(tree_nodes(max_depth) + 1, 0)
+  var l_right = arr(tree_nodes(max_depth) + 1, 0)
+  var l_next = 1
+
+  let stretch = bottom_up_tree(stretch_depth, s_left, s_right, s_next)
+  puts("stretch tree of depth ")
+  puti(stretch_depth)
+  puts("\t check: ")
+  puti(check_tree(stretch, s_left, s_right))
+  putnl()
+
+  let long_lived = bottom_up_tree(max_depth, l_left, l_right, l_next)
+
+  var depth = min_depth
+  while depth <= max_depth {
+    let iterations = shift_left(1, max_depth - depth + min_depth)
+    var check = 0
+    var i = 0
+    while i < iterations {
+      s_next = 1
+      let t = bottom_up_tree(depth, s_left, s_right, s_next)
+      check = check + check_tree(t, s_left, s_right)
+      i = i + 1
+    }
+    puti(iterations)
+    puts("\t trees of depth ")
+    puti(depth)
+    puts("\t check: ")
+    puti(check)
+    putnl()
+    depth = depth + 2
+  }
+
+  puts("long lived tree of depth ")
+  puti(max_depth)
+  puts("\t check: ")
+  puti(check_tree(long_lived, l_left, l_right))
+  putnl()
+}

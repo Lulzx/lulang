@@ -1,0 +1,12 @@
+# built binaries
+nbody
+spectralnorm
+fannkuchredux
+mandelbrot
+binarytrees
+c/nbody
+c/spectralnorm
+c/fannkuchredux
+c/mandelbrot
+c/binarytrees
+c/*-ffm
